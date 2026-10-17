@@ -1,0 +1,31 @@
+name: Bug report / 问题反馈
+description: Report a reproducible problem using disposable files.
+body:
+  - type: markdown
+    attributes:
+      value: "安全漏洞请阅读 SECURITY.md。请勿上传个人文件、凭据或完整磁盘路径。"
+  - type: input
+    id: version
+    attributes:
+      label: Rust Explorer version
+      placeholder: 0.6.2
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Windows version, DPI / zoom, theme and view mode
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: Use newly created test files. Include expected and actual behavior.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Screenshots or additional information
+      description: Remove personal paths and sensitive content before uploading.

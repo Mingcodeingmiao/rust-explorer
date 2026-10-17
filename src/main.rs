@@ -1,0 +1,98 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let result = match args.get(1).map(String::as_str) {
+        Some("--open-target") => (|| -> anyhow::Result<()> {
+            let path: std::path::PathBuf =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::open_target::resolve_open_target(&path)?)?
+            );
+            Ok(())
+        })(),
+        Some("--quick-access") => rust_explorer::quick_access::snapshot().and_then(|items| {
+            println!("{}", serde_json::to_string(&items)?);
+            Ok(())
+        }),
+        Some("--file-hint") => (|| -> anyhow::Result<()> {
+            let request: rust_explorer::file_hints::FileHintRequest = serde_json::from_str(
+                args.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("request missing"))?,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::file_hints::collect(&request.path)?)?
+            );
+            Ok(())
+        })(),
+        Some("--thumbnail-server") => rust_explorer::native_assets::thumbnail_server(),
+        Some("--tree-metadata") => (|| -> anyhow::Result<()> {
+            let request =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::volumes::children_with_attributes(request)?)?
+            );
+            Ok(())
+        })(),
+        Some("--volume-info") => (|| -> anyhow::Result<()> {
+            let path: std::path::PathBuf =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::volumes::info(&path))?
+            );
+            Ok(())
+        })(),
+        Some("--tree-children") => (|| -> anyhow::Result<()> {
+            let request =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::volumes::children(request)?)?
+            );
+            Ok(())
+        })(),
+        Some("--native-asset") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少原生图像请求"))
+            .and_then(|json| rust_explorer::native_assets::serve(json)),
+        Some("--everything-query") => {
+            rust_explorer::search::sdk_query(args.get(2).map(String::as_str).unwrap_or(""))
+                .and_then(|v| {
+                    println!("{}", serde_json::to_string(&v)?);
+                    Ok(())
+                })
+        }
+        Some("--shell-stdin") => rust_explorer::shell::read_request(std::io::stdin().lock())
+            .and_then(rust_explorer::shell::dispatch),
+        Some("--shell") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少 Shell 请求"))
+            .and_then(|v| serde_json::from_str(v).map_err(Into::into))
+            .and_then(rust_explorer::shell::dispatch),
+        _ => {
+            #[cfg(feature = "desktop")]
+            {
+                ui::run();
+                Ok(())
+            }
+            #[cfg(not(feature = "desktop"))]
+            {
+                Err(anyhow::anyhow!("使用 --features desktop 构建图形界面"))
+            }
+        }
+    };
+    if let Err(error) = result {
+        eprintln!("{error:#}");
+        std::process::exit(1);
+    }
+}
+#[cfg(feature = "desktop")]
+mod input;
+#[cfg(feature = "desktop")]
+mod ui;
+#[cfg(feature = "desktop")]
+mod visual;

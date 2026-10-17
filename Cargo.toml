@@ -1,0 +1,49 @@
+[package]
+name = "rust-explorer"
+version = "0.6.2"
+edition = "2024"
+license = "Apache-2.0"
+description = "A Windows file manager built with Rust and GPUI"
+repository = "https://github.com/Mingcodeingmiao/rust-explorer"
+readme = "README.md"
+keywords = ["windows", "file-manager", "explorer", "gpui"]
+categories = ["gui", "filesystem"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:gpui", "dep:unicode-segmentation", "dep:notify"]
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
+libloading = "0.8"
+image = { version = "0.25", default-features = false, features = ["png"] }
+gpui = { version = "=0.2.2", default-features = false, optional = true }
+unicode-segmentation = { version = "1", optional = true }
+notify = { version = "8", optional = true }
+windows-registry = "0.5"
+windows-core = "0.61"
+raw-window-handle = "0.6"
+
+[dependencies.windows]
+version = "0.61"
+features = ["Data_Pdf", "Storage", "Storage_Streams", "Graphics_Imaging", "Foundation", "Win32_System_WinRT", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse"]
+
+[[bin]]
+name = "rust-explorer"
+path = "src/main.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[profile.dev]
+debug = 0
+incremental = true
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

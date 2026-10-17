@@ -1,0 +1,3767 @@
+use crate::input::{self, InputEvent, TextInput};
+use crate::visual::{self, ui};
+use gpui::{prelude::*, *};
+use notify::Watcher;
+use rust_explorer::{
+    disk_usage::{self, Usage},
+    list_layout::{self, ListCell},
+    new_file,
+    settings::{Settings, ViewMode},
+    volume_label,
+    volumes::{self, Volume},
+};
+use rust_explorer::{
+    fs::{self, Entry, History, Sort},
+    native_assets::{self, PreviewKind},
+    preview::{self, Kind},
+    search, shell,
+    theme::Theme,
+};
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
+    time::Duration,
+};
+use std::{collections::HashMap, time::Instant};
+use unicode_segmentation::UnicodeSegmentation;
+#[path = "ui_extras.rs"]
+mod extras;
+#[path = "ui_navigation.rs"]
+mod navigation;
+use extras::*;
+
+actions!(
+    explorer,
+    [
+        Back,
+        Forward,
+        Up,
+        Refresh,
+        Address,
+        Search,
+        Open,
+        Copy,
+        Cut,
+        Paste,
+        Undo,
+        Redo,
+        Delete,
+        PermanentDelete,
+        Rename,
+        NewFolder,
+        SelectAll,
+        Next,
+        Previous,
+        TogglePreview,
+        NewTab,
+        CloseTab,
+        Escape,
+        ContextMenu,
+        Properties,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        NewWindow,
+        NextTab,
+        PreviousTab,
+        ToggleFocused,
+        SelectFocused,
+        ToggleDetails,
+        CycleFocus,
+        CycleFocusBack,
+        FullScreen,
+        ExpandCurrentTree
+    ]
+);
+
+#[derive(Clone, Debug, PartialEq)]
+enum NavigationStep {
+    Horizontal(isize),
+    Vertical(isize),
+    Page(isize),
+    First,
+    Last,
+}
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = explorer, no_json)]
+struct NavigateFiles {
+    step: NavigationStep,
+    extend: bool,
+    focus_only: bool,
+}
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = explorer, no_json)]
+struct ActivateNumberedTab {
+    index: usize,
+}
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = explorer, no_json)]
+struct ChangeNumberedView {
+    index: usize,
+}
+#[derive(Clone, Debug, PartialEq, Action)]
+#[action(namespace = explorer, no_json)]
+struct NavigateTree {
+    command: rust_explorer::nav_keyboard::Command,
+}
+
+#[derive(Clone)]
+struct Tab {
+    id: u64,
+    history: History,
+    query: String,
+    global: bool,
+}
+#[derive(Clone)]
+struct DragFiles {
+    paths: Vec<PathBuf>,
+}
+#[derive(Clone)]
+struct FileDragState {
+    paths: Vec<PathBuf>,
+    position: Point<Pixels>,
+    target: Option<PathBuf>,
+    mode: shell::TransferMode,
+}
+struct RightFileDrag {
+    index: usize,
+    paths: Vec<PathBuf>,
+    start: Point<Pixels>,
+    active: bool,
+}
+impl Render for DragFiles {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        // The root paints a pointer-following operation label with the actual
+        // destination. Keep GPUI's drag payload view transparent.
+        div()
+    }
+}
+enum Preview {
+    Empty,
+    Loading,
+    Text(Arc<Vec<String>>, bool),
+    Image(PathBuf),
+    Video(PathBuf),
+    Pdf {
+        path: PathBuf,
+        page: u32,
+        pages: u32,
+    },
+    Message(String),
+}
+enum Dialog {
+    NewFolder,
+    Shortcut,
+    Rename(PathBuf),
+    RenameVolume {
+        path: PathBuf,
+        initial: String,
+    },
+    Delete(Vec<PathBuf>),
+    PermanentDelete(Vec<PathBuf>),
+    Transfer {
+        paths: Vec<PathBuf>,
+        destination: PathBuf,
+        copy_only: bool,
+        mode: shell::TransferMode,
+    },
+}
+struct Marquee {
+    origin: Point<Pixels>,
+    current: Point<Pixels>,
+    base: BTreeSet<usize>,
+    indices: HashMap<PathBuf, usize>,
+    toggle: bool,
+    active: bool,
+}
+struct Explorer {
+    marquee: Option<Marquee>,
+    settings: Settings,
+    options: Option<Settings>,
+    options_page: usize,
+    options_scroll: ScrollHandle,
+    toolbar_overflow: Vec<&'static str>,
+    nested_submenu: Option<(String, f32)>,
+    popup: Option<(String, Point<Pixels>)>,
+    submenu: Option<(String, f32)>,
+    columns_resize: Option<(usize, f32, f32)>,
+    volume_columns_resize: Option<(usize, f32, f32)>,
+    sidebar_resize: Option<(f32, f32)>,
+    preview_resize: Option<(f32, f32)>,
+    scroll_drag: Option<(bool, f32, f32, f32)>,
+    aux_scroll_drag: Option<(ScrollHandle, f32, f32, f32)>,
+    aux_horizontal_drag: Option<(ScrollHandle, f32, f32, f32)>,
+    watch_pending: bool,
+    content_scroll: ScrollHandle,
+    home_scroll: ScrollHandle,
+    rows: Vec<DisplayRow>,
+    thumbnails: rust_explorer::thumbnails::Loader,
+    thumbnail_images: Entity<visual::ThumbnailImages>,
+    thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
+    thumbnail_sync_queued: std::cell::Cell<bool>,
+    view: ViewMode,
+    group: String,
+    filters: rust_explorer::file_filter::Filters,
+    filter_types: Vec<String>,
+    filter_folder: PathBuf,
+    group_members: std::collections::BTreeMap<String, Vec<usize>>,
+    collapsed_groups: BTreeSet<String>,
+    usage: HashMap<PathBuf, Usage>,
+    usage_cancel: Arc<AtomicBool>,
+    usage_rx: mpsc::Receiver<(u64, PathBuf, Usage)>,
+    usage_tx: mpsc::Sender<(u64, PathBuf, Usage)>,
+    usage_running: bool,
+    usage_enabled: bool,
+    inline_rename: Option<PathBuf>,
+    pending_select: Option<PathBuf>,
+    pending_rename: bool,
+    rename_token: u64,
+    selected_at: Instant,
+    templates: Vec<new_file::Template>,
+    drag_rx: mpsc::Receiver<TabDrop>,
+    drag_tx: mpsc::Sender<TabDrop>,
+    own_window: Option<AnyWindowHandle>,
+    tab_drag: Option<Arc<AtomicBool>>,
+    volumes: Vec<Volume>,
+    volume_busy: bool,
+    volume_tick: Instant,
+    volume_capacity_tick: Instant,
+    system_quick_access: Vec<rust_explorer::quick_access::Item>,
+    quick_access_tick: Instant,
+    quick_access_busy: bool,
+    computer_open: bool,
+    computer_name: String,
+    computer_name_tick: Instant,
+    computer_name_busy: bool,
+    tree_open: BTreeSet<PathBuf>,
+    tree_children: HashMap<PathBuf, Result<Vec<(String, PathBuf)>, String>>,
+    tree_loading: BTreeSet<PathBuf>,
+    tree_hidden: BTreeSet<PathBuf>,
+    nav_scroll: UniformListScrollHandle,
+    tab_scroll: ScrollHandle,
+    device_groups: BTreeSet<String>,
+    context_target: Option<PathBuf>,
+    theme: Theme,
+    tabs: Vec<Tab>,
+    active: usize,
+    entries: Arc<Vec<Entry>>,
+    selected: BTreeSet<usize>,
+    keyboard_cursor: Option<PathBuf>,
+    keyboard_focus_region: u8,
+    view_wheel_remainder: f32,
+    focus_item: Option<PathBuf>,
+    pending_selection_click: Option<usize>,
+    file_drag: Option<FileDragState>,
+    right_file_drag: Option<RightFileDrag>,
+    pending_right_drop: Option<(Vec<PathBuf>, PathBuf)>,
+    file_drop_bounds: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, Bounds<Pixels>, bool)>>>,
+    anchor: usize,
+    sort: Sort,
+    descending: bool,
+    hidden: bool,
+    loading: bool,
+    busy: bool,
+    system_menu_active: bool,
+    undo_stack: Vec<rust_explorer::file_history::Transaction>,
+    redo_stack: Vec<rust_explorer::file_history::Transaction>,
+    pending_history: Option<bool>,
+    status: String,
+    error: Option<String>,
+    focus: FocusHandle,
+    nav_focus: FocusHandle,
+    nav_keyboard_index: usize,
+    nav_expand_pending: Option<(PathBuf, usize)>,
+    address: Entity<TextInput>,
+    search: Entity<TextInput>,
+    dialog_input: Entity<TextInput>,
+    editing_address: bool,
+    list_scroll: ListState,
+    zoom: f32,
+    layout_width: f32,
+    layout_mode: Option<(ViewMode, bool)>,
+    window_width: f32,
+    layout_height: f32,
+    pdf_page: u32,
+    preview_cancel: Arc<AtomicBool>,
+    preview: Preview,
+    preview_open: bool,
+    preview_token: u64,
+    dialog: Option<Dialog>,
+    cancel: Arc<AtomicBool>,
+    generation: u64,
+    watcher: Option<notify::RecommendedWatcher>,
+    watch_rx: mpsc::Receiver<()>,
+    watch_tx: mpsc::Sender<()>,
+    places: Vec<(String, PathBuf)>,
+    _subscriptions: Vec<Subscription>,
+}
+impl Drop for Explorer {
+    fn drop(&mut self) {
+        self.usage_cancel.store(true, Ordering::Relaxed);
+        self.cancel.store(true, Ordering::Relaxed);
+        self.preview_cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+impl Explorer {
+    pub(super) fn begin_marquee(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.options.is_some() || self.dialog.is_some() || self.busy {
+            return;
+        }
+        self.rename_token += 1;
+        window.focus(&self.focus);
+        let base = if event.modifiers.control || event.modifiers.shift {
+            self.selected.clone()
+        } else {
+            BTreeSet::new()
+        };
+        let indices = self
+            .visible_file_indices()
+            .into_iter()
+            .filter_map(|index| self.entries.get(index).map(|e| (e.path.clone(), index)))
+            .collect();
+        self.marquee = Some(Marquee {
+            origin: event.position,
+            current: event.position,
+            base: base.clone(),
+            indices,
+            toggle: event.modifiers.control,
+            active: false,
+        });
+        self.selected = base;
+        self.clear_preview();
+        cx.notify();
+    }
+    fn update_marquee(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) {
+        let area = if self.is_home() {
+            self.home_scroll.bounds()
+        } else {
+            self.content_scroll.bounds()
+        };
+        let Some(drag) = &mut self.marquee else {
+            return;
+        };
+        drag.current = point(
+            position.x.clamp(area.left(), area.right()),
+            position.y.clamp(area.top(), area.bottom()),
+        );
+        if !drag.active && (drag.current - drag.origin).magnitude() < 3. {
+            return;
+        }
+        drag.active = true;
+        let left = drag.origin.x.min(drag.current.x);
+        let right = drag.origin.x.max(drag.current.x);
+        let top = drag.origin.y.min(drag.current.y);
+        let bottom = drag.origin.y.max(drag.current.y);
+        let hit: BTreeSet<_> = self
+            .file_drop_bounds
+            .borrow()
+            .iter()
+            .filter(|(_, bounds, _)| {
+                bounds.right() > left
+                    && bounds.left() < right
+                    && bounds.bottom() > top
+                    && bounds.top() < bottom
+                    && bounds.intersects(&area)
+            })
+            .filter_map(|(path, _, _)| drag.indices.get(path).copied())
+            .collect();
+        let selected = if drag.toggle {
+            drag.base.symmetric_difference(&hit).copied().collect()
+        } else {
+            drag.base.union(&hit).copied().collect()
+        };
+        if self.selected != selected {
+            self.selected = selected;
+            self.keyboard_cursor = None;
+            cx.notify();
+        }
+        cx.notify();
+    }
+    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let initial = std::env::args_os()
+            .nth(1)
+            .map(PathBuf::from)
+            .filter(|p| navigation::is_virtual(p) || p.is_dir())
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
+        let address =
+            cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
+        let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
+        let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
+        let mut subscriptions = vec![];
+        subscriptions.push(
+            cx.subscribe_in(
+                &address,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::Submit => {
+                        let text = input.read(cx).value();
+                        let path = match text.trim_matches('"') {
+                            "此电脑" => volumes::computer(),
+                            text if text == this.computer_name => volumes::computer(),
+                            "网络" => PathBuf::from("::Network"),
+                            "库" => PathBuf::from("::Libraries"),
+                            text => PathBuf::from(text),
+                        };
+                        this.editing_address = false;
+                        window.focus(&this.focus);
+                        this.navigate(path, cx);
+                    }
+                    InputEvent::Cancel => {
+                        this.editing_address = false;
+                        window.focus(&this.focus);
+                        cx.notify();
+                    }
+                    _ => {}
+                },
+            ),
+        );
+        subscriptions.push(
+            cx.subscribe_in(
+                &search,
+                window,
+                |this, input, event, window, cx| match event {
+                    InputEvent::Submit => {
+                        this.tabs[this.active].query = input.read(cx).value();
+                        window.focus(&this.focus);
+                        this.reload(cx);
+                    }
+                    InputEvent::Changed => {
+                        let query = input.read(cx).value();
+                        this.tabs[this.active].query = query.clone();
+                        this.cancel.store(true, Ordering::Relaxed);
+                        this.generation += 1;
+                        let generation = this.generation;
+                        cx.spawn(async move |view, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(250))
+                                .await;
+                            view.update(cx, |this, cx| {
+                                if this.generation == generation {
+                                    this.reload(cx);
+                                }
+                            })
+                            .ok();
+                        })
+                        .detach();
+                    }
+                    InputEvent::Cancel => {
+                        this.tabs[this.active].query.clear();
+                        this.search
+                            .update(cx, |v, cx| v.set_value(String::new(), cx));
+                        window.focus(&this.focus);
+                        this.reload(cx);
+                    }
+                },
+            ),
+        );
+        subscriptions.push(
+            cx.subscribe_in(
+                &dialog_input,
+                window,
+                |this, _, event, window, cx| match event {
+                    InputEvent::Submit => this.confirm_dialog(window, cx),
+                    InputEvent::Cancel => this.close_dialog(window, cx),
+                    InputEvent::Changed => {
+                        if this.inline_rename.is_some() {
+                            this.invalidate_list();
+                            cx.notify();
+                        }
+                    }
+                },
+            ),
+        );
+        let (watch_tx, watch_rx) = mpsc::channel();
+        let (usage_tx, usage_rx) = mpsc::channel();
+        let (drag_tx, drag_rx) = mpsc::channel();
+        let mut settings = Settings::load();
+        if !settings.quick_access_system_migrated {
+            // Earlier releases seeded these six paths. System Quick Access now
+            // supplies them; retain only folders the user added after that seed.
+            let old_seed: Vec<_> = shell::places().into_iter().map(|(_, p)| p).collect();
+            if settings.quick_access_initialized && settings.favorites.starts_with(&old_seed) {
+                settings.favorites.drain(..old_seed.len());
+            }
+            settings.quick_access_initialized = true;
+            settings.quick_access_system_migrated = true;
+            settings.enqueue_save();
+        }
+        let view = settings
+            .folder_views
+            .get(&initial)
+            .copied()
+            .filter(|_| settings.remember_views)
+            .unwrap_or(if volumes::is_computer(&initial) {
+                ViewMode::Tiles
+            } else {
+                settings.view
+            });
+        let this = Self {
+            marquee: None,
+            view,
+            options: None,
+            options_page: 0,
+            options_scroll: ScrollHandle::new(),
+            toolbar_overflow: vec![],
+            nested_submenu: None,
+            popup: None,
+            submenu: None,
+            columns_resize: None,
+            volume_columns_resize: None,
+            sidebar_resize: None,
+            preview_resize: None,
+            scroll_drag: None,
+            aux_scroll_drag: None,
+            aux_horizontal_drag: None,
+            watch_pending: false,
+            content_scroll: ScrollHandle::new(),
+            home_scroll: ScrollHandle::new(),
+            thumbnails: rust_explorer::thumbnails::Loader::new(),
+            thumbnail_images: visual::ThumbnailImages::new(cx),
+            thumbnail_viewport: std::cell::Cell::new(None),
+            thumbnail_sync_queued: std::cell::Cell::new(false),
+            rows: vec![],
+            filters: Default::default(),
+            filter_types: Vec::new(),
+            filter_folder: PathBuf::new(),
+            group_members: Default::default(),
+            collapsed_groups: Default::default(),
+            group: if volumes::is_computer(&initial) {
+                "kind".into()
+            } else {
+                String::new()
+            },
+            usage: HashMap::new(),
+            usage_cancel: Arc::new(AtomicBool::new(false)),
+            usage_rx,
+            usage_tx,
+            usage_running: false,
+            usage_enabled: false,
+            inline_rename: None,
+            pending_select: None,
+            pending_rename: false,
+            rename_token: 0,
+            selected_at: Instant::now(),
+            templates: vec![],
+            drag_rx,
+            drag_tx,
+            own_window: Some(window.window_handle()),
+            tab_drag: None,
+            volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
+            volume_busy: false,
+            volume_tick: Instant::now() - Duration::from_secs(10),
+            volume_capacity_tick: Instant::now() - Duration::from_secs(60),
+            system_quick_access: vec![],
+            quick_access_tick: Instant::now() - Duration::from_secs(30),
+            quick_access_busy: false,
+            computer_open: true,
+            computer_name: navigation::computer_name(),
+            computer_name_tick: Instant::now() - Duration::from_secs(60),
+            computer_name_busy: false,
+            tree_open: Default::default(),
+            tree_children: Default::default(),
+            tree_loading: Default::default(),
+            tree_hidden: Default::default(),
+            nav_scroll: UniformListScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
+            device_groups: BTreeSet::new(),
+            context_target: None,
+            hidden: settings.hidden,
+            preview_open: settings.preview,
+            theme: Theme::preference(&settings.theme),
+            settings,
+            tabs: vec![Tab {
+                id: next_tab_id(),
+                history: History::new(initial),
+                query: String::new(),
+                global: false,
+            }],
+            active: 0,
+            entries: Arc::new(vec![]),
+            selected: BTreeSet::new(),
+            keyboard_cursor: None,
+            keyboard_focus_region: 0,
+            view_wheel_remainder: 0.,
+            focus_item: None,
+            pending_selection_click: None,
+            file_drag: None,
+            right_file_drag: None,
+            pending_right_drop: None,
+            file_drop_bounds: Default::default(),
+            anchor: 0,
+            sort: Sort::Name,
+            descending: false,
+            loading: false,
+            busy: false,
+            system_menu_active: false,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            pending_history: None,
+            status: String::new(),
+            error: None,
+            focus: cx.focus_handle(),
+            nav_focus: cx.focus_handle(),
+            nav_keyboard_index: usize::MAX,
+            nav_expand_pending: None,
+            address,
+            search,
+            dialog_input,
+            editing_address: false,
+            list_scroll: ListState::new(0, ListAlignment::Top, px(160.)),
+            zoom: 1.,
+            layout_width: 0.,
+            layout_mode: None,
+            window_width: 1280.,
+            layout_height: 0.,
+            pdf_page: 0,
+            preview_cancel: Arc::new(AtomicBool::new(false)),
+            preview: Preview::Empty,
+            preview_token: 0,
+            dialog: None,
+            cancel: Arc::new(AtomicBool::new(false)),
+            generation: 0,
+            watcher: None,
+            watch_rx,
+            watch_tx,
+            places: shell::places(),
+            _subscriptions: subscriptions,
+        };
+        let weak = cx.entity().downgrade();
+        this.list_scroll.set_scroll_handler(move |_, _, cx| {
+            let _ = weak.update(cx, |_, cx| cx.notify());
+        });
+        window.focus(&this.focus);
+        cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(125))
+                    .await;
+                if view
+                    .update(cx, |this, cx| {
+                        this.refresh_quick_access(cx);
+                        this.refresh_computer_name(cx);
+                        if !this.volume_busy && this.volume_tick.elapsed() > Duration::from_secs(3)
+                        {
+                            this.refresh_volumes(cx);
+                        }
+                        let pending_tree: Vec<_> = this
+                            .tree_open
+                            .iter()
+                            .filter(|p| {
+                                !navigation::is_virtual(p)
+                                    && !this.tree_children.contains_key(*p)
+                                    && !this.tree_loading.contains(*p)
+                            })
+                            .take(4usize.saturating_sub(this.tree_loading.len()))
+                            .cloned()
+                            .collect();
+                        for path in pending_tree {
+                            this.load_tree(path, cx);
+                        }
+                        let mut usage_changed = false;
+                        for (generation, path, usage) in this.usage_rx.try_iter() {
+                            if generation == this.generation {
+                                this.usage.insert(path, usage);
+                                usage_changed = true;
+                            }
+                        }
+                        if usage_changed {
+                            this.usage_running = this.usage_running
+                                && this
+                                    .entries
+                                    .iter()
+                                    .any(|e| e.directory && !this.usage.contains_key(&e.path));
+                            this.rebuild_rows();
+                            cx.notify();
+                        }
+                        let ended: Vec<_> = this.drag_rx.try_iter().collect();
+                        for drop in ended {
+                            this.tab_drag = None;
+                            if !drop.accepted {
+                                this.finish_tab_drag(drop, cx);
+                            }
+                        }
+                        if visual::drain() | this.thumbnails.changed() {
+                            cx.notify();
+                        }
+                        this.watch_pending |= this.watch_rx.try_iter().count() > 0;
+                        if this.watch_pending
+                            && this.dialog.is_none()
+                            && this.options.is_none()
+                            && !this.loading
+                            && !this.busy
+                            && this.tabs[this.active].query.is_empty()
+                        {
+                            this.watch_pending = false;
+                            this.reload(cx);
+                        }
+                        let theme = Theme::preference(&this.settings.theme);
+                        if theme.dark != this.theme.dark {
+                            this.theme = theme;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+        let task = cx
+            .background_executor()
+            .spawn(async { new_file::templates() });
+        cx.spawn(async move |view, cx| {
+            let templates = task.await;
+            let _ = view.update(cx, |v, cx| {
+                v.templates = templates;
+                cx.notify();
+            });
+        })
+        .detach();
+        this
+    }
+    fn dir(&self) -> PathBuf {
+        self.tabs[self.active].history.current().to_path_buf()
+    }
+    fn is_home(&self) -> bool {
+        navigation::is_virtual(&self.dir()) && self.tabs[self.active].query.trim().is_empty()
+    }
+    fn invalidate_list(&self) {
+        let offset = self.list_scroll.logical_scroll_top();
+        self.list_scroll.reset(self.rows.len());
+        self.list_scroll.scroll_to(offset);
+    }
+    fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if path == PathBuf::from("shell:RecycleBinFolder") {
+            self.run_shell(shell::Request::Open { path }, cx);
+            return;
+        }
+        if self.settings.remember_views {
+            self.view = self.settings.folder_views.get(&path).copied().unwrap_or(
+                if volumes::is_computer(&path) {
+                    ViewMode::Tiles
+                } else {
+                    self.settings.view
+                },
+            );
+        }
+        if volumes::is_computer(&path) && !volumes::is_computer(&self.dir()) {
+            self.group = "kind".into();
+            if !self.settings.remember_views {
+                self.view = ViewMode::Tiles;
+            }
+        } else if volumes::is_computer(&self.dir()) && !volumes::is_computer(&path) {
+            self.group.clear();
+        }
+        self.tabs[self.active].history.push(path);
+        if self.settings.expand_current {
+            self.expand_to_current(cx);
+        }
+        self.tabs[self.active].query.clear();
+        self.search
+            .update(cx, |v, cx| v.set_value(String::new(), cx));
+        self.reload(cx);
+    }
+    fn reload(&mut self, cx: &mut Context<Self>) {
+        self.usage_cancel.store(true, Ordering::Relaxed);
+        self.usage_cancel = Arc::new(AtomicBool::new(false));
+        self.usage.clear();
+        self.usage_running = false;
+        self.usage_enabled = false;
+        self.inline_rename = None;
+        self.dialog = None;
+        self.popup = None;
+        self.rename_token += 1;
+        self.cancel.store(true, Ordering::Relaxed);
+        self.cancel = Arc::new(AtomicBool::new(false));
+        let cancel = self.cancel.clone();
+        self.generation += 1;
+        let generation = self.generation;
+        let path = self.dir();
+        self.address.update(cx, |v, cx| {
+            v.set_value(
+                if navigation::is_virtual(&path) {
+                    navigation::location_name(&path)
+                } else {
+                    path.display().to_string()
+                },
+                cx,
+            )
+        });
+        self.loading = true;
+        self.error = None;
+        self.selected.clear();
+        self.focus_item = None;
+        self.keyboard_cursor = None;
+        self.entries = Arc::new(vec![]);
+        self.clear_preview();
+        self.list_scroll.reset(0);
+        let query = self.tabs[self.active].query.clone();
+        if navigation::is_virtual(&path) && query.trim().is_empty() {
+            self.loading = false;
+            self.watcher = None;
+            self.sync_computer_entries();
+            if path == PathBuf::from("::QuickAccess") {
+                self.quick_access_tick = Instant::now() - Duration::from_secs(30);
+                self.refresh_quick_access(cx);
+                cx.notify();
+                return;
+            }
+            self.volume_capacity_tick = Instant::now() - Duration::from_secs(60);
+            self.refresh_volumes(cx);
+            cx.notify();
+            return;
+        }
+        let virtual_search = navigation::is_virtual(&path);
+        let path = if virtual_search {
+            PathBuf::from(format!(
+                "{}\\",
+                std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into())
+            ))
+        } else {
+            path
+        };
+        let global = self.tabs[self.active].global || virtual_search;
+        let hidden = self.hidden;
+        let protected = self.settings.protected;
+        let folders_first = self.settings.folders_first;
+        let sort = self.sort;
+        let descending = self.descending;
+        let tx = self.watch_tx.clone();
+        let task = cx.background_executor().spawn(async move {
+            let result = (|| -> anyhow::Result<_> {
+                let (mut entries, status) = if query.trim().is_empty() {
+                    let (items, skipped) = fs::read_directory(&path, &cancel)?;
+                    let n = items.len();
+                    (
+                        items,
+                        format!(
+                            "{n} 个项目{}",
+                            if skipped > 0 {
+                                format!(" · {skipped} 个项目无法读取")
+                            } else {
+                                String::new()
+                            }
+                        ),
+                    )
+                } else {
+                    let result = search::query(&query, &path, global, &cancel)?;
+                    let shown = result.entries.len();
+                    let status = format!(
+                        "{} · {} 个结果{}",
+                        result.engine,
+                        result.total,
+                        if result.total as usize > shown {
+                            format!(" · 显示前 {shown} 项，请缩小查询")
+                        } else {
+                            String::new()
+                        }
+                    );
+                    (result.entries, status)
+                };
+                if !hidden {
+                    entries.retain(|v| !v.hidden);
+                }
+                if !protected {
+                    entries.retain(|e| !e.system);
+                }
+                fs::sort(&mut entries, sort, descending);
+                if !folders_first {
+                    entries.sort_by(|a, b| compare_entries(a, b, sort, descending));
+                }
+                let watcher = notify::recommended_watcher(
+                    move |event: Result<notify::Event, notify::Error>| {
+                        if let Ok(event) = event {
+                            if !matches!(event.kind, notify::EventKind::Access(_)) {
+                                let _ = tx.send(());
+                            }
+                        }
+                    },
+                )
+                .ok()
+                .and_then(|mut w| {
+                    w.watch(&path, notify::RecursiveMode::NonRecursive)
+                        .ok()
+                        .map(|_| w)
+                });
+                Ok((entries, status, watcher))
+            })();
+            result
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            view.update(cx, |this, cx| {
+                if this.generation != generation {
+                    return;
+                }
+                this.loading = false;
+                match result {
+                    Ok((entries, status, watcher)) => {
+                        this.entries = Arc::new(entries);
+                        this.rebuild_rows();
+                        if let Some(path) = this.pending_select.take() {
+                            if let Some(index) = this
+                                .entries
+                                .iter()
+                                .position(|e| e.path == path)
+                                .filter(|index| this.visible_file_indices().contains(index))
+                            {
+                                this.selected.insert(index);
+                                this.pending_rename = true;
+                            }
+                        }
+                        this.status = status;
+                        this.watcher = watcher;
+                    }
+                    Err(e) => {
+                        this.error = Some(format!("{e:#}"));
+                        this.status = "加载失败 · F5 重试".into();
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+    fn clear_preview(&mut self) {
+        self.preview_token += 1;
+        self.preview = Preview::Empty;
+        self.preview_cancel.store(true, Ordering::Relaxed);
+        self.preview_cancel = Arc::new(AtomicBool::new(false));
+    }
+    fn paths(&self) -> Vec<PathBuf> {
+        let visible = self.visible_file_indices();
+        self.selected
+            .iter()
+            .filter(|index| visible.contains(index))
+            .filter_map(|i| self.entries.get(*i).map(|v| v.path.clone()))
+            .collect()
+    }
+    fn select(
+        &mut self,
+        index: usize,
+        ctrl: bool,
+        shift: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let order = self.visible_file_order();
+        if !order.contains(&index) {
+            return;
+        }
+        if self.inline_rename.is_some() {
+            self.confirm_dialog(window, cx);
+            if self.inline_rename.is_some() {
+                return;
+            }
+        }
+        window.focus(&self.focus);
+        self.rename_token += 1;
+        self.selected_at = Instant::now();
+        self.keyboard_cursor = None;
+        if shift {
+            self.selected = rust_explorer::file_filter::selection_range(&order, self.anchor, index)
+                .into_iter()
+                .collect();
+        } else if ctrl {
+            if !self.selected.remove(&index) {
+                self.selected.insert(index);
+            }
+            self.anchor = index;
+        } else {
+            self.selected.clear();
+            self.selected.insert(index);
+            self.anchor = index;
+        }
+        self.pdf_page = 0;
+        self.focus_item = self
+            .entries
+            .get(if self.selected.len() > 1 {
+                *self.selected.first().unwrap()
+            } else {
+                index
+            })
+            .map(|e| e.path.clone());
+        self.load_preview(cx);
+        cx.notify();
+    }
+    fn load_preview(&mut self, cx: &mut Context<Self>) {
+        self.clear_preview();
+        if !self.preview_open || self.selected.len() != 1 {
+            return;
+        }
+        let Some(entry) = self
+            .selected
+            .first()
+            .and_then(|i| self.entries.get(*i))
+            .cloned()
+        else {
+            return;
+        };
+        if entry.directory {
+            self.preview = Preview::Message("文件夹\n双击打开".into());
+            return;
+        }
+        let token = self.preview_token;
+        let cancel = self.preview_cancel.clone();
+        let page = self.pdf_page;
+        self.preview = Preview::Loading;
+        let task = cx.background_executor().spawn(async move {
+            let value = (|| -> anyhow::Result<Preview> {
+                let mut entry = entry;
+                entry.path = preview::resolve_source(&entry.path, &cancel)?;
+                let kind = preview::kind(&entry.path);
+                Ok(match kind {
+                    Kind::Text => {
+                        let text = preview::text(&entry.path)?;
+                        Preview::Text(Arc::new(text.lines), text.truncated)
+                    }
+                    Kind::Image => {
+                        let size = std::fs::metadata(&entry.path)?.len();
+                        if size > 64 * 1024 * 1024 {
+                            Preview::Message("图片超过 64 MB，请使用默认应用打开".into())
+                        } else {
+                            Preview::Image(entry.path)
+                        }
+                    }
+                    Kind::Video => {
+                        match native_assets::preview(
+                            &entry.path,
+                            PreviewKind::Video,
+                            0,
+                            640,
+                            &cancel,
+                        ) {
+                            Ok(asset) => Preview::Video(asset.path),
+                            Err(_) => {
+                                Preview::Message("此视频暂无可快速获取的系统单帧缩略图".into())
+                            }
+                        }
+                    }
+                    Kind::Pdf => {
+                        let asset = native_assets::preview(
+                            &entry.path,
+                            PreviewKind::Pdf,
+                            page,
+                            1280,
+                            &cancel,
+                        )?;
+                        Preview::Pdf {
+                            path: asset.path,
+                            page,
+                            pages: asset.pages,
+                        }
+                    }
+                    Kind::Font => {
+                        let asset = native_assets::preview(
+                            &entry.path,
+                            PreviewKind::Font,
+                            0,
+                            960,
+                            &cancel,
+                        )?;
+                        Preview::Image(asset.path)
+                    }
+                    Kind::Unsupported => {
+                        Preview::Message("此文件类型不提供预览\n支持文本、照片、视频和 PDF".into())
+                    }
+                })
+            })();
+            value.unwrap_or_else(|e| Preview::Message(format!("无法预览\n{e:#}")))
+        });
+        cx.spawn(async move |view, cx| {
+            let preview = task.await;
+            view.update(cx, |this, cx| {
+                if this.preview_token == token {
+                    this.preview = preview;
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self
+            .selected
+            .first()
+            .and_then(|i| self.entries.get(*i))
+            .cloned()
+        {
+            self.open_entry(entry, cx);
+        }
+    }
+    fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
+        if entry.directory && !entry.link {
+            if self.settings.separate_process {
+                let tab = Tab {
+                    id: next_tab_id(),
+                    history: History::new(entry.path),
+                    query: String::new(),
+                    global: false,
+                };
+                let _ = open_explorer(Some(tab), cx);
+            } else {
+                self.navigate(entry.path, cx);
+            }
+        } else if entry.link
+            || preview::is_shortcut(&entry.path)
+            || rust_explorer::open_target::is_font(&entry.path)
+        {
+            let source = entry.path;
+            let generation = self.generation;
+            let task = cx.background_executor().spawn(async move {
+                let json = serde_json::to_string(&source)?;
+                volumes::bounded::<rust_explorer::open_target::OpenTarget>(
+                    "--open-target",
+                    &json,
+                    Duration::from_millis(1500),
+                )
+            });
+            cx.spawn(async move |view, cx| {
+                let result = task.await;
+                let _ = view.update(cx, |v, cx| {
+                    if v.generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(rust_explorer::open_target::OpenTarget::Directory(path)) => {
+                            if v.settings.separate_process {
+                                let tab = Tab {
+                                    id: next_tab_id(),
+                                    history: History::new(path),
+                                    query: String::new(),
+                                    global: false,
+                                };
+                                let _ = open_explorer(Some(tab), cx);
+                            } else {
+                                v.navigate(path, cx);
+                            }
+                        }
+                        Ok(rust_explorer::open_target::OpenTarget::Font(path)) => {
+                            v.run_shell(shell::Request::FontPreview { path }, cx)
+                        }
+                        Ok(rust_explorer::open_target::OpenTarget::File(path)) => {
+                            v.run_shell(shell::Request::Open { path }, cx)
+                        }
+                        Err(error) => {
+                            v.error = Some(format!("{error:#}"));
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.run_shell(shell::Request::Open { path: entry.path }, cx);
+        }
+    }
+    fn replay_history(&mut self, redo: bool, cx: &mut Context<Self>) {
+        if self.busy || self.dialog.is_some() || self.options.is_some() {
+            return;
+        }
+        let stack = if redo {
+            &self.redo_stack
+        } else {
+            &self.undo_stack
+        };
+        if let Some(transaction) = stack.last().cloned() {
+            self.pending_history = Some(redo);
+            self.run_shell(shell::Request::History { transaction }, cx);
+        }
+    }
+    fn limit_history(&mut self) -> bool {
+        let mut released = false;
+        while self
+            .undo_stack
+            .iter()
+            .chain(self.redo_stack.iter())
+            .map(rust_explorer::file_history::Transaction::approximate_bytes)
+            .sum::<usize>()
+            > 64 * 1024 * 1024
+            || self.undo_stack.len() + self.redo_stack.len() > 32
+        {
+            if !self.undo_stack.is_empty() {
+                self.undo_stack.remove(0);
+            } else if !self.redo_stack.is_empty() {
+                self.redo_stack.remove(0);
+            } else {
+                break;
+            }
+            released = true;
+        }
+        released
+    }
+    fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
+        let passive = matches!(
+            &request,
+            shell::Request::Open { .. }
+                | shell::Request::FontPreview { .. }
+                | shell::Request::SystemProperties
+                | shell::Request::Share { .. }
+                | shell::Request::Properties { .. }
+                | shell::Request::PropertiesMany { .. }
+                | shell::Request::SharingAccess { .. }
+        );
+        if self.busy && !passive {
+            return;
+        }
+        let system_menu = matches!(
+            &request,
+            shell::Request::Menu { .. }
+                | shell::Request::ThemedMenu { .. }
+                | shell::Request::ComputerMenu { .. }
+        );
+        if system_menu {
+            self.system_menu_active = true;
+        }
+        if !passive {
+            self.busy = true;
+        }
+        self.error = None;
+        let refresh = !matches!(
+            &request,
+            shell::Request::Open { .. }
+                | shell::Request::FontPreview { .. }
+                | shell::Request::SystemProperties
+                | shell::Request::Share { .. }
+                | shell::Request::Properties { .. }
+                | shell::Request::PropertiesMany { .. }
+                | shell::Request::SharingAccess { .. }
+                | shell::Request::Menu { .. }
+                | shell::Request::ThemedMenu { .. }
+        );
+        let moving_paths = match &request {
+            shell::Request::Copy {
+                paths,
+                moving: true,
+                ..
+            } => Some(paths.clone()),
+            _ => None,
+        };
+        let menu_paths = if let shell::Request::Menu { paths, folder, .. }
+        | shell::Request::ThemedMenu { paths, folder, .. } = &request
+        {
+            if paths.is_empty() {
+                vec![folder.clone()]
+            } else {
+                paths.clone()
+            }
+        } else {
+            vec![]
+        };
+        let task = cx.background_executor().spawn(async move {
+            let result = shell::execute_output(request);
+            let mut history = result
+                .as_ref()
+                .ok()
+                .and_then(|output| rust_explorer::file_history::decode(output));
+            if let Some(response) = history.as_mut() {
+                if !response.inverse.actions.is_empty()
+                    && !response
+                        .inverse
+                        .request_bytes()
+                        .is_ok_and(|bytes| bytes <= shell::MAX_REQUEST_BYTES)
+                {
+                    response.inverse.actions.clear();
+                    response.warning =
+                        Some("操作完成，但撤销记录超过传输上限，无法保留本次历史".into());
+                }
+            }
+            (result, history)
+        });
+        cx.spawn(async move |view, cx| {
+            let (result, history) = task.await;
+            view.update(cx, |this, cx| {
+                if system_menu {
+                    this.system_menu_active = false;
+                }
+                if !passive {
+                    this.busy = false;
+                }
+                if let Some(response) = history {
+                    let direction = this.pending_history.take();
+                    if response.warning.is_some() {
+                        this.undo_stack.clear();
+                        this.redo_stack.clear();
+                    } else if let Some(redo) = direction {
+                        if response.error.is_none() || !response.inverse.actions.is_empty() {
+                            let source = if redo {
+                                &mut this.redo_stack
+                            } else {
+                                &mut this.undo_stack
+                            };
+                            source.pop();
+                            if let Some(remaining) = response.remaining {
+                                if !remaining.actions.is_empty() {
+                                    source.push(remaining);
+                                }
+                            }
+                        }
+                        if !response.inverse.actions.is_empty() {
+                            let destination = if redo {
+                                &mut this.undo_stack
+                            } else {
+                                &mut this.redo_stack
+                            };
+                            destination.push(response.inverse);
+                        }
+                    } else if !response.inverse.actions.is_empty() {
+                        this.redo_stack.clear();
+                        this.undo_stack.push(response.inverse);
+                    }
+                    let released_history = this.limit_history();
+                    if response.error.is_none() {
+                        if let Some(paths) = &moving_paths {
+                            if shell::paste_from_clipboard()
+                                .is_ok_and(|(current, cut)| cut && current == *paths)
+                            {
+                                shell::clear_clipboard();
+                            }
+                        }
+                    }
+                    this.reload(cx);
+                    this.status = response.warning.unwrap_or_else(|| {
+                        if direction == Some(true) {
+                            "已重做"
+                        } else if direction == Some(false) {
+                            "已撤销"
+                        } else {
+                            "操作完成，可按 Ctrl+Z 撤销"
+                        }
+                        .into()
+                    });
+                    if released_history {
+                        this.status.push_str("；部分撤销记录已达到内存上限并释放");
+                    }
+                    if let Some(error) = response.error {
+                        this.error = Some(error);
+                    }
+                    cx.notify();
+                    return;
+                }
+                if result.is_err() {
+                    this.pending_history = None;
+                }
+                if let Some(name) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.strip_prefix("computer-name:"))
+                {
+                    this.apply_computer_name(name.trim(), cx);
+                    return;
+                }
+                if let Some(command) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|s| s.strip_prefix("command:"))
+                {
+                    if command == "file-open" {
+                        if let Some(path) = menu_paths.first().cloned() {
+                            let task = cx
+                                .background_executor()
+                                .spawn(async move { Entry::from_path(path) });
+                            cx.spawn(async move |view, cx| {
+                                let result = task.await;
+                                let _ = view.update(cx, |v, cx| match result {
+                                    Ok(entry) => v.open_entry(entry, cx),
+                                    Err(error) => {
+                                        v.error = Some(error.to_string());
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                        }
+                        return;
+                    }
+                    let command = command.to_owned();
+                    let entity = cx.entity().downgrade();
+                    let own = this.own_window;
+                    cx.defer(move |cx| {
+                        if let Some(own) = own {
+                            let _ = own.update(cx, |_, w, cx| {
+                                let _ = entity.update(cx, |v, cx| v.menu_command(&command, w, cx));
+                            });
+                        }
+                    });
+                    cx.notify();
+                    return;
+                }
+                if result.as_ref().is_ok_and(|s| s == "rename") {
+                    if let Some(path) = menu_paths.first() {
+                        if let Some(index) = this.entries.iter().position(|e| &e.path == path) {
+                            this.selected.clear();
+                            this.selected.insert(index);
+                        } else if let Some(parent) = path.parent() {
+                            this.pending_select = Some(path.clone());
+                            this.navigate(parent.to_path_buf(), cx);
+                            return;
+                        }
+                    }
+                    this.pending_rename = true;
+                    cx.notify();
+                    return;
+                }
+                if result.as_ref().is_ok_and(|s| s == "properties") {
+                    let mut paths = menu_paths.clone();
+                    if paths.is_empty() {
+                        paths.push(this.dir());
+                    }
+                    this.run_shell(shell::Request::PropertiesMany { paths }, cx);
+                    cx.notify();
+                    return;
+                }
+                if let Err(e) = result {
+                    this.error = Some(e.to_string());
+                    cx.notify();
+                } else {
+                    if let Some(paths) = moving_paths {
+                        if shell::paste_from_clipboard()
+                            .is_ok_and(|(current, cut)| cut && current == paths)
+                        {
+                            shell::clear_clipboard();
+                        }
+                    }
+                    if refresh {
+                        this.reload(cx);
+                    } else {
+                        cx.notify();
+                    }
+                }
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+    fn menu(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        if self
+            .paths()
+            .iter()
+            .any(|path| volume_label::is_drive_root(path))
+        {
+            self.system_menu(cx);
+            return;
+        }
+        if self.settings.full_system_menu
+            && !(navigation::is_virtual(&self.dir()) && self.selected.is_empty())
+        {
+            self.system_menu(cx);
+            return;
+        }
+        self.popup = Some((
+            if self.selected.is_empty() {
+                if self.dir() == PathBuf::from("::QuickAccess") {
+                    "quick-background-menu"
+                } else if navigation::is_virtual(&self.dir()) {
+                    "computer-menu"
+                } else {
+                    "background-menu"
+                }
+            } else {
+                "file-menu"
+            }
+            .into(),
+            point(px(240.), px(200.)),
+        ));
+        self.submenu = None;
+        cx.notify();
+    }
+    fn system_menu(&mut self, cx: &mut Context<Self>) {
+        if volumes::is_computer(&self.dir()) && self.selected.is_empty() {
+            let (x, y) = shell::cursor();
+            self.context_target = Some(volumes::computer());
+            self.run_shell(
+                shell::Request::ComputerMenu {
+                    x,
+                    y,
+                    dark: self.theme.dark,
+                    expanded: self.computer_open,
+                },
+                cx,
+            );
+            return;
+        }
+        if navigation::is_virtual(&self.dir()) && self.selected.is_empty() {
+            self.popup = Some((
+                if self.dir() == PathBuf::from("::QuickAccess") {
+                    "quick-background-menu"
+                } else {
+                    "computer-menu"
+                }
+                .into(),
+                point(px(250.), px(220.)),
+            ));
+            self.submenu = None;
+            cx.notify();
+            return;
+        }
+        let (x, y) = shell::cursor();
+        self.run_shell(
+            shell::Request::ThemedMenu {
+                paths: self.paths(),
+                folder: self.dir(),
+                x,
+                y,
+                dark: self.theme.dark,
+                view: ViewMode::ALL
+                    .iter()
+                    .position(|(view, _)| *view == self.view)
+                    .unwrap_or(5) as u8,
+                sort: match self.sort {
+                    Sort::Name => "name",
+                    Sort::Modified => "modified",
+                    Sort::Kind => "kind",
+                    Sort::Size => "size",
+                    Sort::Created => "created",
+                }
+                .into(),
+                descending: self.descending,
+                group: self.group.clone(),
+                undo: !self.undo_stack.is_empty(),
+                redo: !self.redo_stack.is_empty(),
+            },
+            cx,
+        );
+    }
+    fn copy(&mut self, cut: bool, cx: &mut Context<Self>) {
+        match shell::copy_to_clipboard(&self.paths(), cut) {
+            Ok(()) => {
+                self.status = if cut {
+                    "已剪切 · Ctrl+V 移动到目标文件夹"
+                } else {
+                    "已复制 · Ctrl+V 粘贴"
+                }
+                .into()
+            }
+            Err(e) => self.error = Some(e.to_string()),
+        }
+        cx.notify();
+    }
+    fn paste(&mut self, cx: &mut Context<Self>) {
+        if navigation::is_virtual(&self.dir()) {
+            return;
+        }
+        match shell::paste_from_clipboard() {
+            Ok((paths, moving)) => self.run_shell(
+                shell::Request::Copy {
+                    paths,
+                    destination: self.dir(),
+                    moving,
+                },
+                cx,
+            ),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                cx.notify();
+            }
+        }
+    }
+    fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        if navigation::is_virtual(&self.dir())
+            && (self.is_home() || matches!(dialog, Dialog::NewFolder | Dialog::Shortcut))
+        {
+            return;
+        }
+        let name = match &dialog {
+            Dialog::RenameVolume { initial, .. } => initial.clone(),
+            Dialog::Rename(path) => path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            Dialog::NewFolder => "新建文件夹".into(),
+            Dialog::Shortcut => String::new(),
+            Dialog::Delete(_) | Dialog::PermanentDelete(_) | Dialog::Transfer { .. } => {
+                String::new()
+            }
+        };
+        if let Dialog::Rename(path) = &dialog {
+            self.inline_rename = Some(path.clone());
+        }
+        self.dialog = Some(dialog);
+        let directory = if let Some(Dialog::Rename(path)) = &self.dialog {
+            self.entries
+                .iter()
+                .find(|e| &e.path == path)
+                .is_some_and(|e| e.directory)
+        } else {
+            false
+        };
+        self.dialog_input.update(cx, |v, cx| {
+            v.compact = matches!(&self.dialog, Some(Dialog::Rename(_)));
+            v.set_value(name, cx);
+            if matches!(&self.dialog, Some(Dialog::Rename(_))) {
+                v.focus_filename(window, cx, directory);
+            } else {
+                v.focus_select_all(window, cx);
+            }
+        });
+        cx.notify();
+    }
+    fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dialog = None;
+        self.inline_rename = None;
+        window.focus(&self.focus);
+        cx.notify();
+    }
+    fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let name = self.dialog_input.read(cx).value();
+        if matches!(self.dialog, Some(Dialog::RenameVolume { .. })) {
+            if let Err(error) = volume_label::validate(&name, "") {
+                self.error = Some(error.to_string());
+                cx.notify();
+                return;
+            }
+        }
+        if !matches!(
+            self.dialog,
+            Some(
+                Dialog::Delete(_)
+                    | Dialog::PermanentDelete(_)
+                    | Dialog::Shortcut
+                    | Dialog::Transfer { .. }
+                    | Dialog::RenameVolume { .. }
+            )
+        ) {
+            if let Err(e) = fs::valid_name(&name) {
+                self.error = Some(e.to_string());
+                cx.notify();
+                return;
+            }
+        }
+        let Some(dialog) = self.dialog.take() else {
+            return;
+        };
+        self.close_dialog(window, cx);
+        match dialog {
+            Dialog::Shortcut => {
+                let target = PathBuf::from(name.trim_matches('"'));
+                let name = target.file_stem().unwrap_or_default().to_string_lossy();
+                let destination = (0..10000)
+                    .map(|i| {
+                        self.dir().join(if i == 0 {
+                            format!("{name} - 快捷方式.lnk")
+                        } else {
+                            format!("{name} - 快捷方式 ({i}).lnk")
+                        })
+                    })
+                    .find(|p| !p.exists());
+                if let Some(destination) = destination {
+                    self.run_shell(
+                        shell::Request::Shortcut {
+                            target,
+                            destination,
+                        },
+                        cx,
+                    );
+                }
+            }
+            Dialog::Delete(paths) => self.run_shell(shell::Request::Delete { paths }, cx),
+            Dialog::PermanentDelete(paths) => {
+                self.run_shell(shell::Request::PermanentDelete { paths }, cx)
+            }
+            Dialog::Transfer {
+                paths,
+                destination,
+                copy_only,
+                mode,
+            } => self.run_shell(
+                shell::Request::Transfer {
+                    paths,
+                    destination,
+                    copy_only,
+                    mode,
+                },
+                cx,
+            ),
+            Dialog::Rename(path) => {
+                if path
+                    .file_name()
+                    .is_some_and(|original| original == std::ffi::OsStr::new(&name))
+                {
+                    return;
+                }
+                self.run_shell(shell::Request::Rename { path, name }, cx)
+            }
+            Dialog::RenameVolume { path, initial } => {
+                if name != initial {
+                    self.run_shell(shell::Request::RenameVolume { path, label: name }, cx);
+                }
+            }
+            Dialog::NewFolder => {
+                let path = self.dir().join(name);
+                let created = path.clone();
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { std::fs::create_dir(path) });
+                cx.spawn(async move |view, cx| {
+                    let result = task.await;
+                    view.update(cx, |this, cx| match result {
+                        Ok(()) => {
+                            this.run_shell(shell::Request::RecordCreated { path: created }, cx)
+                        }
+                        Err(e) => {
+                            this.error = Some(e.to_string());
+                            cx.notify();
+                        }
+                    })
+                    .ok();
+                })
+                .detach();
+            }
+        }
+    }
+    fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.selected.len() == 1 {
+            if let Some(path) = self.paths().first().cloned() {
+                if volume_label::is_drive_root(&path) {
+                    if self.busy || self.dialog.is_some() || self.options.is_some() {
+                        return;
+                    }
+                    self.busy = true;
+                    let request = shell::Request::VolumeLabel { path: path.clone() };
+                    let task = cx.background_executor().spawn(async move {
+                        volumes::bounded::<volume_label::VolumeLabel>(
+                            "--shell",
+                            &serde_json::to_string(&request)?,
+                            Duration::from_secs(5),
+                        )
+                    });
+                    cx.spawn(async move |view, cx| {
+                        let result = task.await;
+                        let _ = view.update(cx, |v, cx| {
+                            v.busy = false;
+                            match result {
+                                Ok(label) if !label.read_only => {
+                                    let entity = cx.entity().downgrade();
+                                    let own = v.own_window;
+                                    cx.defer(move |cx| {
+                                        if let Some(own) = own {
+                                            let _ = own.update(cx, |_, w, cx| {
+                                                let _ = entity.update(cx, |v, cx| {
+                                                    if v.dialog.is_none() && v.options.is_none() {
+                                                        v.show_dialog(
+                                                            Dialog::RenameVolume {
+                                                                path,
+                                                                initial: label.label,
+                                                            },
+                                                            w,
+                                                            cx,
+                                                        );
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                                }
+                                Ok(_) => v.error = Some("此驱动器是只读的".into()),
+                                Err(error) => v.error = Some(error.to_string()),
+                            }
+                            cx.notify();
+                        });
+                    })
+                    .detach();
+                    cx.notify();
+                } else {
+                    self.show_dialog(Dialog::Rename(path), window, cx);
+                }
+            }
+        }
+    }
+    fn delete_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = self.paths();
+        if !paths.is_empty() {
+            self.show_dialog(Dialog::Delete(paths), window, cx);
+        }
+    }
+    fn new_tab(&mut self, cx: &mut Context<Self>) {
+        self.tabs.push(Tab {
+            id: next_tab_id(),
+            history: History::new(self.dir()),
+            query: String::new(),
+            global: false,
+        });
+        self.switch_tab(self.tabs.len() - 1, cx);
+    }
+    fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let was_computer = volumes::is_computer(&self.dir());
+        self.active = index;
+        if self.settings.remember_views {
+            self.view = self
+                .settings
+                .folder_views
+                .get(&self.dir())
+                .copied()
+                .unwrap_or(if volumes::is_computer(&self.dir()) {
+                    ViewMode::Tiles
+                } else {
+                    self.settings.view
+                });
+        }
+        if !was_computer && volumes::is_computer(&self.dir()) {
+            self.group = "kind".into();
+        } else if was_computer && !volumes::is_computer(&self.dir()) {
+            self.group.clear();
+        }
+        self.tab_scroll.scroll_to_item(index);
+        let query = self.tabs[index].query.clone();
+        self.search.update(cx, |v, cx| v.set_value(query, cx));
+        self.reload(cx);
+    }
+    fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if self.tabs.len() == 1 {
+            if let Some(handle) = self.own_window {
+                cx.defer(move |cx| {
+                    let _ = handle.update(cx, |_, w, _| w.remove_window());
+                });
+            }
+            return;
+        }
+        self.tabs.remove(index);
+        if index < self.active {
+            self.active -= 1;
+        }
+        self.active = self.active.min(self.tabs.len() - 1);
+        self.switch_tab(self.active, cx);
+    }
+    fn key_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        self.key_navigate(NavigationStep::Vertical(delta), false, false, window, cx);
+    }
+    fn key_navigate(
+        &mut self,
+        step: NavigationStep,
+        extend: bool,
+        focus_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.entries.is_empty()
+            || self.options.is_some()
+            || self.dialog.is_some()
+            || self.popup.is_some()
+            || !self.focus.is_focused(window)
+        {
+            return;
+        }
+        let order = self.visible_file_order();
+        let visible: std::collections::HashSet<_> = order.iter().copied().collect();
+        if order.is_empty() {
+            return;
+        }
+        let current = self
+            .keyboard_cursor
+            .as_ref()
+            .or(self.focus_item.as_ref())
+            .and_then(|path| self.entries.iter().position(|entry| &entry.path == path))
+            .filter(|index| visible.contains(index))
+            .or_else(|| {
+                self.selected
+                    .iter()
+                    .rev()
+                    .copied()
+                    .find(|index| visible.contains(index))
+            });
+        let has_current = current.is_some();
+        let current = current.unwrap_or(order[0]);
+        let columns = match self.view {
+            ViewMode::ExtraLarge => (self.layout_width / 224.).floor().max(1.) as usize,
+            ViewMode::Large => (self.layout_width / 164.).floor().max(1.) as usize,
+            ViewMode::Medium => (self.layout_width / 124.).floor().max(1.) as usize,
+            ViewMode::Small => (self.layout_width / 210.).floor().max(1.) as usize,
+            ViewMode::Tiles => (self.layout_width / 290.).floor().max(1.) as usize,
+            _ => 1,
+        };
+        let delta = match step {
+            NavigationStep::Horizontal(delta) => {
+                if self.view == ViewMode::List {
+                    delta * self.rows.len().max(1) as isize
+                } else if matches!(self.view, ViewMode::Details | ViewMode::Content) {
+                    0
+                } else {
+                    delta
+                }
+            }
+            NavigationStep::Vertical(delta) => {
+                if self.view == ViewMode::List {
+                    delta
+                } else {
+                    delta * columns as isize
+                }
+            }
+            NavigationStep::Page(delta) => {
+                delta
+                    * ((self.layout_height / self.estimated_row_height())
+                        .floor()
+                        .max(1.) as isize)
+                    * if self.view == ViewMode::List {
+                        1
+                    } else {
+                        columns as isize
+                    }
+            }
+            _ => 0,
+        };
+        let mut index = match step {
+            NavigationStep::First => order[0],
+            NavigationStep::Last => *order.last().unwrap(),
+            _ => rust_explorer::file_filter::step_in_order(
+                &order,
+                has_current.then_some(current),
+                delta,
+            )
+            .unwrap_or(order[0]),
+        };
+        // Follow the rendered grid, including grouped List columns whose
+        // heading rows make arithmetic on raw entry indices inaccurate.
+        let location = self
+            .rows
+            .iter()
+            .enumerate()
+            .find_map(|(row, items)| match items {
+                DisplayRow::Items(items) => items
+                    .iter()
+                    .position(|item| *item == current)
+                    .map(|column| (row, column)),
+                DisplayRow::List(items) => items
+                    .iter()
+                    .position(|item| matches!(item, ListCell::File(value) if *value == current))
+                    .map(|column| (row, column)),
+                _ => None,
+            });
+        let cell = |row: usize, column: usize| -> Option<usize> {
+            match self.rows.get(row)? {
+                DisplayRow::Items(items) => items
+                    .get(column.min(items.len().saturating_sub(1)))
+                    .copied(),
+                DisplayRow::List(items) => match items.get(column)? {
+                    ListCell::File(index) => Some(*index),
+                    _ => None,
+                },
+                _ => None,
+            }
+        };
+        if let Some((row, column)) = location.filter(|_| has_current) {
+            let geometry = match step {
+                NavigationStep::Vertical(direction) | NavigationStep::Page(direction) => {
+                    let distance = if matches!(step, NavigationStep::Page(_)) {
+                        (self.layout_height / self.estimated_row_height())
+                            .floor()
+                            .max(1.) as isize
+                    } else {
+                        1
+                    };
+                    let start = (row as isize + distance * direction)
+                        .clamp(0, self.rows.len().saturating_sub(1) as isize)
+                        as usize;
+                    if direction > 0 {
+                        (start..self.rows.len()).find_map(|row| cell(row, column))
+                    } else {
+                        (0..=start).rev().find_map(|row| cell(row, column))
+                    }
+                }
+                NavigationStep::Horizontal(direction) if self.view == ViewMode::List => {
+                    let target = column as isize + direction;
+                    if target < 0 {
+                        Some(current)
+                    } else {
+                        cell(row, target as usize)
+                            .or_else(|| {
+                                (0..self.rows.len())
+                                    .min_by_key(|candidate| {
+                                        if cell(*candidate, target as usize).is_some() {
+                                            candidate.abs_diff(row)
+                                        } else {
+                                            usize::MAX
+                                        }
+                                    })
+                                    .and_then(|row| cell(row, target as usize))
+                            })
+                            .or(Some(current))
+                    }
+                }
+                _ => None,
+            };
+            if let Some(target) = geometry {
+                index = target;
+            }
+        }
+        if !visible.contains(&index) {
+            index = current;
+        }
+        if focus_only {
+            self.focus_item = Some(self.entries[index].path.clone());
+            window.focus(&self.focus);
+        } else {
+            self.select(index, false, extend, window, cx);
+        }
+        self.keyboard_cursor = Some(self.entries[index].path.clone());
+        if let Some(row) = self
+            .rows
+            .iter()
+            .position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index))
+                || matches!(r, DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i == index))))
+        {
+            let top = self.list_scroll.logical_scroll_top().item_ix;
+            let visible_rows = (self.layout_height / self.estimated_row_height()).ceil() as usize + 1;
+            // GPUI's reveal operation uses measured heights. Rows outside the
+            // viewport have no height yet, so anchor distant jumps by index.
+            if row < top || row >= top.saturating_add(visible_rows) {
+                self.list_scroll.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+            } else {
+                self.list_scroll.scroll_to_reveal_item(row);
+            }
+            if let DisplayRow::List(cells) = &self.rows[row] {
+                if let Some(column) = cells.iter().position(|c| matches!(c,ListCell::File(i) if *i == index)) {
+                    let left = column as f32 * 230. * self.zoom;
+                    let viewport = self.layout_width * self.zoom;
+                    let mut p = self.content_scroll.offset();
+                    if left < -f32::from(p.x) {p.x = px(-left);}
+                    else if left + 230. * self.zoom > -f32::from(p.x) + viewport { p.x = px(viewport - left - 230. * self.zoom); }
+                    self.content_scroll.set_offset(p);
+                }
+            }
+        }
+        cx.notify();
+    }
+    fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_address = true;
+        self.address
+            .update(cx, |v, cx| v.focus_select_all(window, cx));
+        cx.notify();
+    }
+
+    fn change_zoom(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let offset = self.list_scroll.logical_scroll_top();
+        self.zoom = if delta == 0. {
+            1.
+        } else {
+            (self.zoom + delta).clamp(0.75, 2.)
+        };
+        window.set_rem_size(px(16. * self.zoom));
+        self.invalidate_list();
+        self.list_scroll.scroll_to(offset);
+        cx.notify();
+    }
+    fn pdf_step(&mut self, delta: i32, cx: &mut Context<Self>) {
+        if let Preview::Pdf { page, pages, .. } = &self.preview {
+            let page = (*page as i32 + delta).clamp(0, *pages as i32 - 1) as u32;
+            self.pdf_page = page;
+            self.load_preview(cx);
+            cx.notify();
+        }
+    }
+}
+
+fn icon(glyph: &str, color: u32) -> AnyElement {
+    visual::icon(
+        match glyph {
+            "\u{e8b7}" => "folder",
+            "\u{e721}" => "search",
+            _ => "file",
+        },
+        color,
+    )
+}
+
+fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, t: Theme) -> Stateful<Div> {
+    let label: SharedString = label.into();
+    let native = visual::button_name(label.as_ref());
+    let symbolic = matches!(
+        label.as_ref(),
+        "←" | "→" | "↑" | "⟳" | "＋" | "×" | "‹" | "›"
+    );
+    let label: SharedString = match label.as_ref() {
+        "⊕ 新建" => "新建".into(),
+        "⌂ 主文件夹" => "主文件夹".into(),
+        "▣ 预览" | "□ 预览" => "预览".into(),
+        _ => label,
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .gap_2()
+        .px_3()
+        .h(ui(32.))
+        .rounded(ui(4.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(t.hover)))
+        .when_some(native, |d, name| d.child(visual::icon(name, t.text)))
+        .when(!symbolic, |d| d.child(label))
+}
+
+impl Render for Explorer {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.file_drop_bounds.borrow_mut().clear();
+        window.set_rem_size(px(16. * self.zoom));
+        visual::set_pixels((16. * self.zoom * window.scale_factor()).ceil() as u32);
+        visual::set_theme(self.theme.dark);
+        let width: f32 = window.viewport_size().width.into();
+        let logical_width = width / self.zoom;
+        self.window_width = logical_width;
+        let sidebar_width = self
+            .settings
+            .sidebar_width
+            .clamp(140., (logical_width * 0.48).min(600.).max(140.));
+        let preview_width = self
+            .settings
+            .preview_width
+            .clamp(180., (logical_width * 0.55).max(180.));
+        let available = logical_width
+            - sidebar_width
+            - 5.
+            - if self.preview_open || self.settings.details_pane {
+                preview_width + 5.
+            } else {
+                0.
+            };
+        if self.pending_rename {
+            self.pending_rename = false;
+            self.rename_dialog(window, cx);
+        }
+        if self.settings.full_path {
+            window.set_window_title(&if navigation::is_virtual(&self.dir()) {
+                navigation::location_name(&self.dir())
+            } else {
+                self.dir().display().to_string()
+            });
+        } else {
+            window.set_window_title("Rust Explorer 0.6.2");
+        }
+        let list_height = (f32::from(window.viewport_size().height) / self.zoom - 188.).max(100.);
+        if (available - self.layout_width).abs() > 0.5
+            || (list_height - self.layout_height).abs() > 0.5
+            || self.layout_mode != Some((self.view, self.settings.compact))
+        {
+            let offset = self.list_scroll.logical_scroll_top();
+            self.layout_width = available;
+            self.layout_height = list_height;
+            self.layout_mode = Some((self.view, self.settings.compact));
+            self.rebuild_rows();
+            self.list_scroll.scroll_to(offset);
+        }
+        self.sync_thumbnails();
+        self.toolbar_overflow = rust_explorer::settings::toolbar_overflow(
+            logical_width,
+            self.view == ViewMode::Details && !navigation::is_virtual(&self.dir()),
+        );
+        let t = self.theme;
+        let mut root = div()
+            .id("explorer")
+            .capture_any_mouse_down(cx.listener(|v, _: &MouseDownEvent, _, cx| {
+                if v.system_menu_active {
+                    cx.stop_propagation();
+                }
+            }))
+            .key_context("Explorer")
+            .size_full()
+            .flex()
+            .flex_col()
+            .relative()
+            .font_family("Microsoft YaHei UI")
+            .text_size(ui(13.))
+            .line_height(ui(20.))
+            .text_color(rgb(t.text))
+            .bg(rgb(t.background))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|v, _, w, cx| {
+                    if v.inline_rename.is_some() {
+                        v.confirm_dialog(w, cx);
+                    }
+                }),
+            )
+            .on_action(cx.listener(|v, action: &NavigateFiles, w, cx| {
+                v.key_navigate(action.step.clone(), action.extend, action.focus_only, w, cx);
+            }))
+            .on_action(cx.listener(|v, action: &ActivateNumberedTab, _, cx| {
+                if v.options.is_none() && v.dialog.is_none() && !v.tabs.is_empty() {
+                    let index = action.index;
+                    if index < v.tabs.len() {
+                        v.switch_tab(index, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|v, action: &ChangeNumberedView, w, cx| {
+                if v.options.is_none() && v.dialog.is_none() && action.index < ViewMode::ALL.len() {
+                    v.view = ViewMode::ALL[action.index].0;
+                    v.settings.view = v.view;
+                    if v.settings.remember_views {
+                        v.settings.folder_views.insert(v.dir(), v.view);
+                    }
+                    v.content_scroll.set_offset(point(px(0.), px(0.)));
+                    v.invalidate_list();
+                    v.save_settings(cx);
+                    w.focus(&v.focus);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ToggleFocused, w, cx| {
+                if v.options.is_some()
+                    || v.dialog.is_some()
+                    || v.popup.is_some()
+                    || !v.focus.is_focused(w)
+                {
+                    return;
+                }
+                let visible = v.visible_file_indices();
+                let cursor = v
+                    .keyboard_cursor
+                    .as_ref()
+                    .or(v.focus_item.as_ref())
+                    .and_then(|path| v.entries.iter().position(|entry| &entry.path == path))
+                    .filter(|index| visible.contains(index))
+                    .or_else(|| {
+                        v.selected
+                            .iter()
+                            .copied()
+                            .find(|index| visible.contains(index))
+                    })
+                    .or_else(|| v.visible_file_order().first().copied());
+                if let Some(index) = cursor {
+                    v.select(index, true, false, w, cx);
+                    v.keyboard_cursor = Some(v.entries[index].path.clone());
+                }
+            }))
+            .on_action(cx.listener(|v, _: &SelectFocused, w, cx| {
+                if v.options.is_some()
+                    || v.dialog.is_some()
+                    || v.popup.is_some()
+                    || !v.focus.is_focused(w)
+                {
+                    return;
+                }
+                let visible = v.visible_file_indices();
+                let cursor = v
+                    .keyboard_cursor
+                    .as_ref()
+                    .or(v.focus_item.as_ref())
+                    .and_then(|path| v.entries.iter().position(|entry| &entry.path == path))
+                    .filter(|index| visible.contains(index))
+                    .or_else(|| v.visible_file_order().first().copied());
+                if let Some(index) = cursor {
+                    v.select(index, false, false, w, cx);
+                    v.keyboard_cursor = Some(v.entries[index].path.clone());
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ToggleDetails, w, cx| {
+                if v.options.is_none() && v.dialog.is_none() {
+                    v.settings.details_pane = !v.settings.details_pane;
+                    if v.settings.details_pane {
+                        v.preview_open = false;
+                        v.settings.preview = false;
+                    }
+                    v.clear_preview();
+                    v.save_settings(cx);
+                    w.focus(&v.focus);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|v, _: &CycleFocus, w, cx| {
+                if v.options.is_some() || v.dialog.is_some() {
+                    return;
+                }
+                v.keyboard_focus_region = (v.keyboard_focus_region + 1) % 4;
+                match v.keyboard_focus_region {
+                    1 => v.focus_address(w, cx),
+                    2 => {
+                        v.editing_address = false;
+                        v.search
+                            .update(cx, |input, cx| input.focus_select_all(w, cx));
+                    }
+                    3 => v.focus_navigation(w, cx),
+                    _ => {
+                        v.editing_address = false;
+                        w.focus(&v.focus);
+                    }
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &CycleFocusBack, w, cx| {
+                if v.options.is_some() || v.dialog.is_some() {
+                    return;
+                }
+                v.keyboard_focus_region = (v.keyboard_focus_region + 3) % 4;
+                match v.keyboard_focus_region {
+                    1 => v.focus_address(w, cx),
+                    2 => {
+                        v.editing_address = false;
+                        v.search
+                            .update(cx, |input, cx| input.focus_select_all(w, cx));
+                    }
+                    3 => v.focus_navigation(w, cx),
+                    _ => {
+                        v.editing_address = false;
+                        w.focus(&v.focus);
+                    }
+                }
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &FullScreen, w, _| {
+                if v.options.is_none() && v.dialog.is_none() {
+                    w.toggle_fullscreen();
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ExpandCurrentTree, _, cx| {
+                if v.options.is_none() && v.dialog.is_none() {
+                    v.computer_open = true;
+                    v.expand_to_current(cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Back, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                if v.tabs[v.active].history.back() {
+                    v.reload(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Forward, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                if v.tabs[v.active].history.forward() {
+                    v.reload(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Up, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                if !navigation::is_virtual(&v.dir()) {
+                    let path = v
+                        .dir()
+                        .parent()
+                        .map(|p| p.to_path_buf())
+                        .unwrap_or_else(volumes::computer);
+                    v.navigate(path, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ZoomIn, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.change_zoom(0.1, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ZoomOut, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.change_zoom(-0.1, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ZoomReset, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.change_zoom(0., w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Refresh, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.reload(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Address, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.focus_address(w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Search, w, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                v.search.update(cx, |v, cx| v.focus_select_all(w, cx))
+            }))
+            .on_action(cx.listener(|v, _: &Open, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.open_selected(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Undo, window, cx| {
+                if v.focus.is_focused(window) || v.nav_focus.is_focused(window) {
+                    v.replay_history(false, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Redo, window, cx| {
+                if v.focus.is_focused(window) || v.nav_focus.is_focused(window) {
+                    v.replay_history(true, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Copy, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.copy(false, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Cut, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.copy(true, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Paste, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.paste(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &PermanentDelete, w, cx| {
+                if v.options.is_none()
+                    && v.dialog.is_none()
+                    && v.popup.is_none()
+                    && v.focus.is_focused(w)
+                    && !v.busy
+                {
+                    let paths = v.paths();
+                    if !paths.is_empty() {
+                        v.show_dialog(Dialog::PermanentDelete(paths), w, cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Delete, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.delete_dialog(w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Rename, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.rename_dialog(w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &NewFolder, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.show_dialog(Dialog::NewFolder, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &SelectAll, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                v.selected = v.visible_file_indices();
+                v.clear_preview();
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &Next, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.key_move(1, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Previous, w, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.key_move(-1, w, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &TogglePreview, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                v.preview_open = !v.preview_open;
+                v.load_preview(cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|v, _: &NewTab, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.new_tab(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &NewWindow, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                let _ = open_explorer(
+                    Some(Tab {
+                        id: next_tab_id(),
+                        history: History::new(v.dir()),
+                        query: String::new(),
+                        global: false,
+                    }),
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|v, _: &NextTab, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                v.switch_tab((v.active + 1) % v.tabs.len(), cx)
+            }))
+            .on_action(cx.listener(|v, _: &PreviousTab, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                v.switch_tab((v.active + v.tabs.len() - 1) % v.tabs.len(), cx)
+            }))
+            .on_action(cx.listener(|v, _: &CloseTab, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.close_tab(v.active, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &ContextMenu, _, cx| {
+                if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
+                    v.menu(cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &Properties, _, cx| {
+                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                    return;
+                }
+                let mut paths = v.paths();
+                if paths.is_empty() {
+                    if navigation::is_virtual(&v.dir()) {
+                        v.run_shell(shell::Request::SystemProperties, cx);
+                        return;
+                    }
+                    paths.push(v.dir());
+                }
+                v.run_shell(shell::Request::PropertiesMany { paths }, cx);
+            }))
+            .on_action(cx.listener(|v, _: &Escape, w, cx| {
+                v.marquee = None;
+                if v.popup.take().is_some() {
+                    v.submenu = None;
+                    v.nested_submenu = None;
+                    v.pending_right_drop = None;
+                    cx.notify();
+                    return;
+                }
+                v.file_drag = None;
+                v.right_file_drag = None;
+                v.pending_right_drop = None;
+                v.pending_selection_click = None;
+                if let Some(flag) = v.tab_drag.take() {
+                    flag.store(true, Ordering::Relaxed);
+                    cx.stop_active_drag(w);
+                } else if cx.has_active_drag() {
+                    cx.stop_active_drag(w);
+                }
+                v.popup = None;
+                v.submenu = None;
+                v.options = None;
+                v.rename_token += 1;
+                if v.dialog.is_some() {
+                    v.close_dialog(w, cx);
+                } else {
+                    v.selected.clear();
+                    v.clear_preview();
+                    cx.notify();
+                }
+            }));
+
+        root = root
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, _| {
+                v.marquee = None;
+                v.pending_selection_click = None;
+                v.right_file_drag = None;
+                v.file_drag = None;
+                if e.button == MouseButton::Left {
+                    v.columns_resize = None;
+                    v.volume_columns_resize = None;
+                    v.sidebar_resize = None;
+                    v.preview_resize = None;
+                    v.aux_scroll_drag = None;
+                    v.aux_horizontal_drag = None;
+                    if v.scroll_drag.take().is_some() {
+                        v.list_scroll.scrollbar_drag_ended();
+                    }
+                }
+            }))
+            .on_drag_move(cx.listener(|v, event: &DragMoveEvent<DragFiles>, _, cx| {
+                if let Some(drag) = event.dragged_item().downcast_ref::<DragFiles>() {
+                    v.update_file_drag(
+                        drag.paths.clone(),
+                        event.event.position,
+                        event.event.modifiers,
+                        cx,
+                    );
+                }
+            }))
+            .on_mouse_move(cx.listener(|v, event: &MouseMoveEvent, w, cx| {
+                if event.pressed_button == Some(MouseButton::Left) && v.marquee.is_some() {
+                    v.update_marquee(event.position, cx);
+                }
+                if event.pressed_button == Some(MouseButton::Right) {
+                    let right = v
+                        .right_file_drag
+                        .as_ref()
+                        .map(|r| (r.index, r.paths.clone(), r.start, r.active));
+                    if let Some((index, paths, start, active)) = right {
+                        if active || (event.position - start).magnitude() > 4. {
+                            if !active {
+                                if !v.selected.contains(&index) {
+                                    v.select(index, false, false, w, cx);
+                                }
+                                if let Some(right) = &mut v.right_file_drag {
+                                    right.active = true;
+                                }
+                            }
+                            v.update_file_drag(paths, event.position, event.modifiers, cx);
+                        }
+                    }
+                }
+                if let Some((start, width)) = v.preview_resize {
+                    if event.dragging() {
+                        v.settings.preview_width = (width
+                            - (f32::from(event.position.x) - start) / v.zoom)
+                            .clamp(180., 900.);
+                        cx.notify();
+                    }
+                }
+                if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
+                    let mut p = handle.offset();
+                    p.y = px((*offset - (f32::from(event.position.y) - *start) * *ratio)
+                        .clamp(-f32::from(handle.max_offset().height), 0.));
+                    handle.set_offset(p);
+                    cx.notify();
+                }
+                if let Some((handle, start, offset, ratio)) = &v.aux_horizontal_drag {
+                    let mut p = handle.offset();
+                    p.x = px((*offset - (f32::from(event.position.x) - *start) * *ratio)
+                        .clamp(-f32::from(handle.max_offset().width), 0.));
+                    handle.set_offset(p);
+                    cx.notify();
+                }
+                if let Some((horizontal, start, offset, ratio)) = v.scroll_drag {
+                    let delta = if horizontal {
+                        f32::from(event.position.x)
+                    } else {
+                        f32::from(event.position.y)
+                    } - start;
+                    if horizontal {
+                        let mut point = v.content_scroll.offset();
+                        point.x = px(offset - delta * ratio);
+                        v.content_scroll.set_offset(point);
+                    } else {
+                        v.set_list_scroll_row(offset + delta * ratio);
+                    }
+                    cx.notify();
+                }
+                if let Some((start, width)) = v.sidebar_resize {
+                    if event.dragging() {
+                        v.settings.sidebar_width = (width
+                            + (f32::from(event.position.x) - start) / v.zoom)
+                            .clamp(140., 600.);
+                        cx.notify();
+                    }
+                }
+                if let Some((index, start, width)) = v.volume_columns_resize {
+                    if event.dragging() {
+                        if let Some((_, column_width)) = v.settings.volume_columns.get_mut(index) {
+                            *column_width = (width
+                                + (f32::from(event.position.x) - start) / v.zoom)
+                                .clamp(64., 1200.);
+                        }
+                        cx.notify();
+                    }
+                }
+                if let Some((index, start, width)) = v.columns_resize {
+                    if event.dragging() {
+                        v.settings.columns[index].1 = (width
+                            + (f32::from(event.position.x) - start) / v.zoom)
+                            .clamp(64., 1200.);
+                        v.invalidate_list();
+                        cx.notify();
+                    }
+                }
+            }))
+            .capture_any_mouse_up(cx.listener(|v, e: &MouseUpEvent, w, cx| {
+                if e.button == MouseButton::Left {
+                    if let Some(drag) = v.marquee.take() {
+                        if drag.active {
+                            v.focus_item = v
+                                .selected
+                                .first()
+                                .and_then(|i| v.entries.get(*i))
+                                .map(|e| e.path.clone());
+                            v.load_preview(cx);
+                        }
+                        cx.notify();
+                    }
+                }
+                if e.button == MouseButton::Right {
+                    if let Some(right) = v.right_file_drag.take() {
+                        if right.active {
+                            v.update_file_drag(right.paths.clone(), e.position, e.modifiers, cx);
+                            if let Some(target) =
+                                v.file_drag.as_ref().and_then(|d| d.target.clone())
+                            {
+                                v.pending_right_drop = Some((right.paths, target));
+                                v.popup = Some(("drop-menu".into(), e.position));
+                                v.submenu = None;
+                            }
+                            v.file_drag = None;
+                            cx.notify();
+                            cx.stop_propagation();
+                        }
+                    }
+                    return;
+                }
+                if e.button != MouseButton::Left {
+                    return;
+                }
+                if let Some(paths) = v.file_drag.as_ref().map(|d| d.paths.clone()) {
+                    v.update_file_drag(paths, e.position, e.modifiers, cx);
+                }
+                if let Some(index) = v.pending_selection_click.take() {
+                    if !cx.has_active_drag() && (v.selected.len() > 1 || e.modifiers.control) {
+                        v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
+                    }
+                }
+                // Drop listeners still need the modifier-selected operation.
+                cx.defer_in(w, |v, _, cx| {
+                    v.file_drag = None;
+                    cx.notify();
+                });
+                if v.volume_columns_resize.take().is_some() {
+                    v.save_settings(cx);
+                }
+                if v.columns_resize.take().is_some() {
+                    v.save_settings(cx);
+                }
+                if v.preview_resize.take().is_some() {
+                    v.save_settings(cx);
+                }
+                v.aux_scroll_drag = None;
+                v.aux_horizontal_drag = None;
+                if v.scroll_drag.take().is_some() {
+                    v.list_scroll.scrollbar_drag_ended();
+                    cx.notify();
+                }
+                if v.sidebar_resize.take().is_some() {
+                    v.save_settings(cx);
+                }
+            }))
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|v, _, _, cx| {
+                    let changed = v.volume_columns_resize.take().is_some()
+                        | v.columns_resize.take().is_some()
+                        | v.sidebar_resize.take().is_some()
+                        | v.preview_resize.take().is_some();
+                    v.aux_scroll_drag = None;
+                    v.aux_horizontal_drag = None;
+                    if v.scroll_drag.take().is_some() {
+                        v.list_scroll.scrollbar_drag_ended();
+                        cx.notify();
+                    }
+                    if changed {
+                        v.save_settings(cx);
+                    }
+                }),
+            );
+        root = root.child(self.render_tabs(window, cx));
+
+        let mut nav = div()
+            .h(ui(54.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .bg(rgb(t.chrome));
+        for (id, label) in [
+            ("back", "←"),
+            ("forward", "→"),
+            ("up", "↑"),
+            ("refresh", "⟳"),
+        ] {
+            nav = nav.child(button(id, label, t).on_click(cx.listener(
+                move |v, _, _, cx| match id {
+                    "back" => {
+                        if v.tabs[v.active].history.back() {
+                            v.reload(cx);
+                        }
+                    }
+                    "forward" => {
+                        if v.tabs[v.active].history.forward() {
+                            v.reload(cx);
+                        }
+                    }
+                    "up" => {
+                        if !navigation::is_virtual(&v.dir()) {
+                            let path = v
+                                .dir()
+                                .parent()
+                                .map(|p| p.to_path_buf())
+                                .unwrap_or_else(volumes::computer);
+                            v.navigate(path, cx);
+                        }
+                    }
+                    _ => v.reload(cx),
+                },
+            )));
+        }
+        let address = if self.editing_address {
+            div()
+                .flex_1()
+                .child(self.address.clone())
+                .into_any_element()
+        } else {
+            self.render_breadcrumbs((logical_width - 492.).max(80.), window, cx)
+        };
+        nav = nav.child(address).child(
+            div()
+                .w(ui(260.))
+                .h(ui(32.))
+                .flex()
+                .items_center()
+                .px_2()
+                .gap_2()
+                .bg(rgb(t.input))
+                .rounded(ui(4.))
+                .child(icon("\u{e721}", t.muted))
+                .child(self.search.clone()),
+        );
+        root = root.child(nav);
+
+        let mut toolbar = div()
+            .id("commands")
+            .overflow_hidden()
+            .flex_shrink_0()
+            .h(ui(48.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .border_b_1()
+            .border_color(rgb(t.border));
+        for (id, label) in [
+            ("new-folder", "⊕ 新建"),
+            ("cut", "剪切"),
+            ("copy", "复制"),
+            ("paste", "粘贴"),
+            ("rename", "重命名"),
+            ("share", "共享"),
+            ("delete", "删除"),
+        ] {
+            if self.toolbar_overflow.contains(&id) {
+                continue;
+            }
+            let command = if id == "new-folder" {
+                button(id, label, t).child(visual::icon("chevron-down", t.muted))
+            } else {
+                button(id, "", t).child(visual::icon(id, t.text))
+            };
+            let enabled = match id {
+                "new-folder" | "paste" => !navigation::is_virtual(&self.dir()),
+                "rename" => self.selected.len() == 1 && !self.is_home(),
+                "share" => {
+                    self.selected.len() == 1
+                        && self
+                            .selected
+                            .first()
+                            .is_some_and(|i| !self.entries[*i].directory)
+                }
+                _ => !self.selected.is_empty(),
+            };
+            toolbar = toolbar.child(
+                command
+                    .w(ui(if id == "new-folder" { 94. } else { 40. }))
+                    .flex_shrink_0()
+                    .when(!enabled, |d| d.opacity(0.4).cursor_default())
+                    .on_click(cx.listener(move |v, _, w, cx| {
+                        if !enabled {
+                            return;
+                        }
+                        match id {
+                            "new-folder" => {
+                                v.popup = Some((
+                                    "new-menu".into(),
+                                    point(px(12. * v.zoom), px(132. * v.zoom)),
+                                ));
+                                cx.notify();
+                            }
+                            "cut" => v.copy(true, cx),
+                            "copy" => v.copy(false, cx),
+                            "paste" => v.paste(cx),
+                            "rename" => v.rename_dialog(w, cx),
+                            "share" => {
+                                if v.selected.len() == 1
+                                    && v.selected.first().is_some_and(|i| !v.entries[*i].directory)
+                                {
+                                    v.run_shell(shell::Request::Share { paths: v.paths() }, cx);
+                                }
+                            }
+                            _ => v.delete_dialog(w, cx),
+                        }
+                    })),
+            );
+            if id == "new-folder" {
+                toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
+            }
+        }
+        toolbar = toolbar.child(div().w(ui(1.)).h(ui(20.)).mx_2().bg(rgb(t.border)));
+        for (id, label) in [
+            ("sort-menu", "排序"),
+            ("view-menu", "查看"),
+            ("more-menu", ""),
+        ] {
+            if self.toolbar_overflow.contains(&id) {
+                continue;
+            }
+            if id == "more-menu" {
+                toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
+            }
+            toolbar = toolbar.child(
+                button(id, "", t)
+                    .w(ui(if id == "more-menu" { 40. } else { 96. }))
+                    .flex_shrink_0()
+                    .child(visual::icon(
+                        match id {
+                            "sort-menu" => "sort",
+                            "view-menu" => "view",
+                            _ => "more",
+                        },
+                        t.text,
+                    ))
+                    .when(!label.is_empty(), |d| {
+                        d.child(label).child(visual::icon("chevron-down", t.muted))
+                    })
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, event: &MouseDownEvent, _, cx| {
+                            v.popup = Some((
+                                id.into(),
+                                point(event.position.x, event.position.y + px(23. * v.zoom)),
+                            ));
+                            cx.notify();
+                        }),
+                    ),
+            );
+        }
+        toolbar = toolbar
+            .child(
+                button(
+                    "usage",
+                    if self.usage_running {
+                        "停止统计"
+                    } else {
+                        "统计大小"
+                    },
+                    t,
+                )
+                .when(
+                    self.view != ViewMode::Details
+                        || navigation::is_virtual(&self.dir())
+                        || self.toolbar_overflow.contains(&"usage"),
+                    |d| d.hidden(),
+                )
+                .w(ui(104.))
+                .flex_shrink_0()
+                .on_click(cx.listener(|v, _, _, cx| v.start_usage(cx))),
+            )
+            .child(
+                button(
+                    "global",
+                    if self.tabs[self.active].global {
+                        "全盘搜索"
+                    } else {
+                        "文件夹内搜索"
+                    },
+                    t,
+                )
+                .w(ui(120.))
+                .flex_shrink_0()
+                .when(self.toolbar_overflow.contains(&"global"), |d| d.hidden())
+                .on_click(cx.listener(|v, _, _, cx| {
+                    v.tabs[v.active].global = !v.tabs[v.active].global;
+                    if !v.tabs[v.active].query.is_empty() {
+                        v.reload(cx);
+                    }
+                    cx.notify();
+                })),
+            )
+            .child(div().flex_1())
+            .child(
+                button("preview-toggle", "预览", t)
+                    .w(ui(72.))
+                    .flex_shrink_0()
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        v.preview_open = !v.preview_open;
+                        v.settings.preview = v.preview_open;
+                        v.save_settings(cx);
+                        v.load_preview(cx);
+                        cx.notify();
+                    })),
+            );
+        root = root.child(toolbar);
+
+        let sidebar = self.render_sidebar(sidebar_width, cx);
+
+        let mut content = div()
+            .id("file-content")
+            .overflow_hidden()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .flex()
+            .flex_col()
+            .relative();
+        if self.is_home() {
+            content = content
+                .child(
+                    div()
+                        .relative()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(self.render_computer(cx))
+                        .child(self.auxiliary_scrollbar(
+                            self.home_scroll.clone(),
+                            "home-scrollbar",
+                            cx,
+                        )),
+                )
+                .when(
+                    matches!(self.view, ViewMode::Details | ViewMode::List),
+                    |d| {
+                        d.child(self.auxiliary_horizontal_scrollbar(
+                            self.home_scroll.clone(),
+                            "home-horizontal-scrollbar",
+                            cx,
+                        ))
+                    },
+                );
+        } else {
+            let table_width = if self.view == ViewMode::Details {
+                self.settings.columns.iter().map(|(_, w)| *w).sum::<f32>()
+            } else if self.view == ViewMode::List {
+                self.layout_width.max(
+                    self.rows
+                        .iter()
+                        .filter_map(|r| {
+                            if let DisplayRow::List(i) = r {
+                                Some(i.len() as f32 * 230.)
+                            } else {
+                                None
+                            }
+                        })
+                        .fold(0., f32::max),
+                )
+            } else {
+                available
+            };
+            let mut table = div()
+                .id("table-viewport")
+                .overflow_x_scroll()
+                .track_scroll(&self.content_scroll)
+                .flex_1()
+                .min_h_0()
+                .flex()
+                .flex_col();
+            table.style().restrict_scroll_to_axis = Some(true);
+            if self.view == ViewMode::Details {
+                table = table.child(self.render_header(available, cx));
+            }
+            let list = list(
+                self.list_scroll.clone(),
+                cx.processor(move |this, index: usize, window, cx| {
+                    this.render_list_row(index, window, cx)
+                }),
+            )
+            .flex_1()
+            .min_h_0();
+            table = table.child(
+                div()
+                    .id("list-area")
+                    .w(ui(table_width.max(available)))
+                    .flex_shrink_0()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|v, e: &MouseDownEvent, w, cx| {
+                            if v.inline_rename.is_some() {
+                                v.confirm_dialog(w, cx);
+                                if v.inline_rename.is_some() {
+                                    return;
+                                }
+                            }
+                            v.begin_marquee(e, w, cx);
+                        }),
+                    )
+                    .on_drop(cx.listener(|v, drag: &ExternalPaths, _, cx| {
+                        v.confirm_drop(drag.paths().to_vec(), v.dir(), false, cx);
+                    }))
+                    .on_drop(cx.listener(|v, drag: &DragFiles, w, cx| {
+                        v.confirm_drop(drag.paths.clone(), v.dir(), w.modifiers().control, cx);
+                    }))
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|v, e: &MouseDownEvent, w, cx| {
+                            cx.stop_propagation();
+                            v.selected.clear();
+                            v.clear_preview();
+                            w.focus(&v.focus);
+                            v.menu(cx);
+                            if let Some((_, p)) = &mut v.popup {
+                                *p = e.position;
+                            }
+                        }),
+                    )
+                    .relative()
+                    .child(list)
+                    .child(self.list_wheel_guard(cx)),
+            );
+            content =
+                content
+                    .child(table)
+                    .child(self.horizontal_scrollbar(available, table_width, cx));
+            content = content.child(self.vertical_scrollbar(cx));
+            if self.entries.is_empty() {
+                content = content.child(
+                    div()
+                        .absolute()
+                        .top(ui(85.))
+                        .left_0()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .text_color(rgb(t.muted))
+                        .child(if self.loading {
+                            "正在加载…"
+                        } else if self.error.is_some() {
+                            "无法读取此位置"
+                        } else {
+                            "此文件夹为空，或没有匹配的结果"
+                        }),
+                );
+            }
+        }
+        let mut body = div()
+            // GPUI's automatic focus handler prevents the default Win32
+            // non-client action. Keep it below the native caption hit regions.
+            .track_focus(&self.focus)
+            .flex_1()
+            .min_h_0()
+            .flex()
+            .child(sidebar)
+            .child(
+                div()
+                    .id("resize-sidebar")
+                    .w(ui(5.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(move |s| s.bg(rgb(t.accent)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.sidebar_resize = Some((e.position.x.into(), sidebar_width));
+                        }),
+                    ),
+            )
+            .child(content);
+
+        if self.preview_open || self.settings.details_pane {
+            body = body.child(
+                div()
+                    .id("resize-preview")
+                    .w(ui(5.))
+                    .h_full()
+                    .flex_shrink_0()
+                    .cursor(CursorStyle::ResizeLeftRight)
+                    .hover(move |s| s.bg(rgb(t.accent)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.preview_resize = Some((e.position.x.into(), preview_width));
+                        }),
+                    ),
+            );
+            let title = self
+                .selected
+                .first()
+                .and_then(|i| self.entries.get(*i))
+                .map(|v| v.name.clone())
+                .unwrap_or("预览".into());
+            let mut pane = div()
+                .w(ui(preview_width))
+                .flex_shrink_0()
+                .h_full()
+                .border_l_1()
+                .border_color(rgb(t.border))
+                .bg(rgb(t.panel))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .min_h(ui(34.))
+                        .py_2()
+                        .flex_shrink_0()
+                        .px_4()
+                        .flex()
+                        .items_center()
+                        .overflow_hidden()
+                        .border_b_1()
+                        .border_color(rgb(t.border))
+                        .child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .whitespace_normal()
+                                .line_height(ui(20.))
+                                .child(title.graphemes(true).collect::<Vec<_>>().join("\u{200b}")),
+                        ),
+                );
+            let element =
+                match &self.preview {
+                    Preview::Empty => div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .items_center()
+                        .justify_center()
+                        .gap_3()
+                        .text_color(rgb(t.muted))
+                        .child(icon("\u{e8a5}", t.muted))
+                        .child(if self.selected.len() > 1 {
+                            format!("已选择 {} 个项目", self.selected.len())
+                        } else {
+                            "选择文件以预览".into()
+                        })
+                        .into_any_element(),
+                    Preview::Loading => div()
+                        .p_5()
+                        .text_color(rgb(t.muted))
+                        .child("正在准备预览…")
+                        .into_any_element(),
+                    Preview::Message(message) => div()
+                        .p_5()
+                        .text_color(rgb(t.muted))
+                        .child(message.clone())
+                        .into_any_element(),
+                    Preview::Image(path) | Preview::Video(path) => div()
+                        .flex_1()
+                        .min_h_0()
+                        .p_3()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Contain))
+                        .into_any_element(),
+                    Preview::Text(lines, truncated) => {
+                        let lines = lines.clone();
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .flex()
+                            .flex_col()
+                            .when(*truncated, |d| {
+                                d.child(
+                                    div()
+                                        .px_3()
+                                        .py_2()
+                                        .text_color(rgb(t.accent))
+                                        .child("预览已截断（最多 256 KB / 6000 行）"),
+                                )
+                            })
+                            .child(
+                                uniform_list("text-preview", lines.len(), move |range, _, _| {
+                                    range
+                                        .map(|i| {
+                                            div()
+                                                .h(ui(22.))
+                                                .px_3()
+                                                .font_family("Consolas")
+                                                .text_size(ui(12.))
+                                                .overflow_hidden()
+                                                .child(lines[i].clone())
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .flex_1()
+                                .min_h_0(),
+                            )
+                            .into_any_element()
+                    }
+                    Preview::Pdf { path, page, pages } => div()
+                        .flex_1()
+                        .min_h_0()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(ui(36.))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .child(
+                                    button("pdf-prev", "←", t)
+                                        .on_click(cx.listener(|v, _, _, cx| v.pdf_step(-1, cx))),
+                                )
+                                .child(format!("{} / {}", page + 1, pages))
+                                .child(
+                                    button("pdf-next", "→", t)
+                                        .on_click(cx.listener(|v, _, _, cx| v.pdf_step(1, cx))),
+                                ),
+                        )
+                        .child(
+                            div().flex_1().min_h_0().p_3().child(
+                                img(path.clone()).size_full().object_fit(ObjectFit::Contain),
+                            ),
+                        )
+                        .into_any_element(),
+                };
+            let element = if self.settings.details_pane {
+                let selected: Vec<_> = self
+                    .selected
+                    .iter()
+                    .filter_map(|i| self.entries.get(*i))
+                    .collect();
+                let mut data = div()
+                    .p_4()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .text_color(rgb(t.muted));
+                if selected.len() == 1 {
+                    let entry = selected[0];
+                    data = data
+                        .child(format!("类型：{}", entry.kind))
+                        .child(format!("大小：{}", self.entry_size_text(entry)))
+                        .child(format!("修改日期：{}", entry.date()))
+                        .child(format!("创建日期：{}", extras::format_date(entry.created)))
+                        .child(
+                            div()
+                                .whitespace_normal()
+                                .child(entry.path.display().to_string()),
+                        );
+                } else {
+                    data = data
+                        .child(format!("已选择 {} 个项目", selected.len()))
+                        .child(format!(
+                            "文件：{} 个",
+                            selected.iter().filter(|e| !e.directory).count()
+                        ))
+                        .child(format!(
+                            "文件夹：{} 个",
+                            selected.iter().filter(|e| e.directory).count()
+                        ));
+                }
+                data.into_any_element()
+            } else {
+                element
+            };
+            pane = pane.child(element);
+            body = body.child(pane);
+        }
+        root = root.child(body);
+        let status = if self.busy {
+            "正在处理系统操作…".to_owned()
+        } else if self.loading {
+            "正在加载…".to_owned()
+        } else {
+            format!(
+                "{}{}",
+                self.status,
+                if self.selected.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · 已选择 {} 项", self.selected.len())
+                }
+            )
+        };
+        root = root.child(
+            div()
+                .h(ui(32.))
+                .flex_shrink_0()
+                .px_4()
+                .flex()
+                .items_center()
+                .justify_between()
+                .border_t_1()
+                .border_color(rgb(t.border))
+                .bg(rgb(t.chrome))
+                .text_size(ui(12.))
+                .text_color(rgb(t.muted))
+                .child(status)
+                .child(format!(
+                    "{:.0}% · Ctrl +/− 缩放 · Ctrl+0 重置",
+                    self.zoom * 100.
+                )),
+        );
+        if let Some(error) = &self.error {
+            root = root.child(
+                div()
+                    .absolute()
+                    .bottom(ui(44.))
+                    .left(ui(220.))
+                    .right(ui(25.))
+                    .rounded(ui(6.))
+                    .p_3()
+                    .bg(rgb(if t.dark { 0x493030 } else { 0xffe5e5 }))
+                    .border_1()
+                    .border_color(rgb(0x9b5555))
+                    .flex()
+                    .gap_3()
+                    .child(div().flex_1().child(error.clone()))
+                    .child(
+                        button("dismiss-error", "×", t).on_click(cx.listener(|v, _, _, cx| {
+                            v.error = None;
+                            cx.notify();
+                        })),
+                    ),
+            );
+        }
+        if let Some(dialog) = &self.dialog {
+            if self.inline_rename.is_none() {
+                let (title, description, delete) = match dialog {
+                    Dialog::NewFolder => ("新建文件夹", "输入新文件夹的名称".to_owned(), false),
+                    Dialog::Shortcut => (
+                        "创建快捷方式",
+                        "输入目标文件或文件夹的完整路径".to_owned(),
+                        false,
+                    ),
+                    Dialog::Rename(_) => ("重命名", "输入新的名称".to_owned(), false),
+                    Dialog::RenameVolume { path, .. } => (
+                        "重命名驱动器",
+                        format!(
+                            "为 {} 输入卷标；确认后保存，留空可清除卷标。",
+                            path.display()
+                        ),
+                        false,
+                    ),
+                    Dialog::Transfer {
+                        paths,
+                        destination,
+                        copy_only,
+                        mode,
+                    } => (
+                        if *mode == shell::TransferMode::Link {
+                            "确认创建快捷方式"
+                        } else if *mode == shell::TransferMode::Move {
+                            "确认移动"
+                        } else if *copy_only || *mode == shell::TransferMode::Copy {
+                            "确认复制"
+                        } else {
+                            "确认拖放操作"
+                        },
+                        format!(
+                            "将 {} 个项目放入：{}\n{}",
+                            paths.len(),
+                            destination.display(),
+                            if *mode == shell::TransferMode::Link {
+                                "在目标文件夹创建这些项目的快捷方式。"
+                            } else if *mode == shell::TransferMode::Move {
+                                "将项目移动到目标文件夹。"
+                            } else if *copy_only || *mode == shell::TransferMode::Copy {
+                                "复制到目标文件夹。"
+                            } else {
+                                "同一文件系统内移动，不同文件系统间复制；无法识别的卷按复制处理。"
+                            }
+                        ),
+                        true,
+                    ),
+                    Dialog::Delete(paths) => (
+                        "删除文件",
+                        format!(
+                            "将 {} 个项目移至回收站？不能回收的项目会由 Windows 再次确认。",
+                            paths.len()
+                        ),
+                        true,
+                    ),
+                    Dialog::PermanentDelete(paths) => (
+                        "永久删除 — 无法撤销",
+                        format!(
+                            "确定永久删除这 {} 个项目吗？\n不会移至回收站，无法通过本程序撤销。\n\n{}{}",
+                            paths.len(),
+                            paths
+                                .iter()
+                                .take(3)
+                                .map(|path| path.display().to_string())
+                                .collect::<Vec<_>>()
+                                .join("\n"),
+                            if paths.len() > 3 { "\n……" } else { "" }
+                        ),
+                        true,
+                    ),
+                };
+                root = root.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .bg(rgba(0x00000070))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w(ui(440.))
+                                .rounded(ui(10.))
+                                .p_6()
+                                .bg(rgb(t.panel))
+                                .border_1()
+                                .border_color(rgb(t.border))
+                                .shadow_lg()
+                                .flex()
+                                .flex_col()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .text_size(ui(19.))
+                                        .when(
+                                            matches!(dialog, Dialog::PermanentDelete(_)),
+                                            |element| element.text_color(rgb(0xe24b4b)),
+                                        )
+                                        .child(title),
+                                )
+                                .child(description)
+                                .when(!delete, |d| {
+                                    d.child(
+                                        div()
+                                            .bg(rgb(t.input))
+                                            .rounded(ui(4.))
+                                            .p_1()
+                                            .child(self.dialog_input.clone()),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_end()
+                                        .gap_2()
+                                        .child(button("cancel-dialog", "取消", t).on_click(
+                                            cx.listener(|v, _, w, cx| v.close_dialog(w, cx)),
+                                        ))
+                                        .child(
+                                            button(
+                                                "confirm-dialog",
+                                                if matches!(dialog, Dialog::PermanentDelete(_)) {
+                                                    "永久删除"
+                                                } else if matches!(dialog, Dialog::Delete(_)) {
+                                                    "移至回收站"
+                                                } else {
+                                                    "确定"
+                                                },
+                                                t,
+                                            )
+                                            .bg(rgb(t.selection))
+                                            .when(
+                                                matches!(dialog, Dialog::PermanentDelete(_)),
+                                                |element| {
+                                                    element
+                                                        .bg(rgb(0xa62929))
+                                                        .text_color(rgb(0xffffff))
+                                                },
+                                            )
+                                            .on_click(
+                                                cx.listener(|v, _, w, cx| v.confirm_dialog(w, cx)),
+                                            ),
+                                        ),
+                                ),
+                        ),
+                );
+            }
+        }
+        if self.popup.is_some() {
+            root = root.child(self.render_popup(window, cx));
+        }
+        if let Some(drag) = self.marquee.as_ref().filter(|drag| drag.active) {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(drag.origin.x.min(drag.current.x))
+                    .top(drag.origin.y.min(drag.current.y))
+                    .w((drag.current.x - drag.origin.x).abs())
+                    .h((drag.current.y - drag.origin.y).abs())
+                    .border_1()
+                    .border_color(rgb(t.accent))
+                    .bg(rgba(if t.dark { 0x76b9ed30 } else { 0x0078d430 })),
+            );
+        }
+        if self.options.is_some() {
+            root = root.child(self.render_options(cx));
+        }
+
+        if let Some(drag) = &self.file_drag {
+            root = root.child(
+                div()
+                    .absolute()
+                    .left(drag.position.x + px(16. * self.zoom))
+                    .top(drag.position.y + px(20. * self.zoom))
+                    .max_w(ui(460.))
+                    .px_3()
+                    .py_1()
+                    .rounded(ui(4.))
+                    .shadow_md()
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .bg(rgb(t.panel))
+                    .text_color(rgb(t.text))
+                    .whitespace_nowrap()
+                    .overflow_hidden()
+                    .text_ellipsis()
+                    .child(self.file_drag_label(drag)),
+            );
+        }
+
+        root
+    }
+}
+
+pub fn run() {
+    rust_explorer::fluent_icons::initialize();
+    Application::new()
+        .with_assets(rust_explorer::fluent_icons::Assets)
+        .run(|cx: &mut App| {
+            input::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("alt-left", Back, Some("Explorer")),
+                KeyBinding::new("alt-right", Forward, Some("Explorer")),
+                KeyBinding::new("alt-up", Up, Some("Explorer")),
+                KeyBinding::new("ctrl-+", ZoomIn, None),
+                KeyBinding::new("ctrl-=", ZoomIn, None),
+                KeyBinding::new("ctrl-shift-=", ZoomIn, None),
+                KeyBinding::new("ctrl--", ZoomOut, None),
+                KeyBinding::new("ctrl-0", ZoomReset, None),
+                KeyBinding::new("f5", Refresh, Some("Explorer")),
+                KeyBinding::new("ctrl-l", Address, Some("Explorer")),
+                KeyBinding::new("ctrl-f", Search, Some("Explorer")),
+                KeyBinding::new("enter", Open, Some("Explorer")),
+                KeyBinding::new("ctrl-c", Copy, Some("Explorer")),
+                KeyBinding::new("ctrl-x", Cut, Some("Explorer")),
+                KeyBinding::new("ctrl-v", Paste, Some("Explorer")),
+                KeyBinding::new("ctrl-z", Undo, Some("Explorer")),
+                KeyBinding::new("ctrl-y", Redo, Some("Explorer")),
+                KeyBinding::new("delete", Delete, Some("Explorer")),
+                KeyBinding::new("shift-delete", PermanentDelete, Some("Explorer")),
+                KeyBinding::new("f2", Rename, Some("Explorer")),
+                KeyBinding::new("ctrl-shift-n", NewFolder, Some("Explorer")),
+                KeyBinding::new("ctrl-a", SelectAll, Some("Explorer")),
+                KeyBinding::new("down", Next, Some("Explorer")),
+                KeyBinding::new("up", Previous, Some("Explorer")),
+                KeyBinding::new("alt-p", TogglePreview, Some("Explorer")),
+                KeyBinding::new("ctrl-t", NewTab, Some("Explorer")),
+                KeyBinding::new("ctrl-n", NewWindow, Some("Explorer")),
+                KeyBinding::new("ctrl-tab", NextTab, None),
+                KeyBinding::new("ctrl-shift-tab", PreviousTab, None),
+                KeyBinding::new("ctrl-w", CloseTab, Some("Explorer")),
+                KeyBinding::new("escape", Escape, Some("Explorer")),
+                KeyBinding::new("shift-f10", ContextMenu, Some("Explorer")),
+                KeyBinding::new("alt-enter", Properties, Some("Explorer")),
+                KeyBinding::new("alt-d", Address, Some("Explorer")),
+                KeyBinding::new("f4", Address, Some("Explorer")),
+                KeyBinding::new("ctrl-e", Search, Some("Explorer")),
+                KeyBinding::new("f3", Search, Some("Explorer")),
+                KeyBinding::new("ctrl-r", Refresh, Some("Explorer")),
+                KeyBinding::new("backspace", Back, Some("Explorer")),
+                KeyBinding::new("ctrl-d", Delete, Some("Explorer")),
+                KeyBinding::new("ctrl-f4", CloseTab, Some("Explorer")),
+                KeyBinding::new("alt-shift-p", ToggleDetails, Some("Explorer")),
+                KeyBinding::new("ctrl-space", ToggleFocused, Some("Explorer")),
+                KeyBinding::new("space", SelectFocused, Some("Explorer")),
+                KeyBinding::new("f6", CycleFocus, Some("Explorer")),
+                KeyBinding::new("shift-f6", CycleFocusBack, Some("Explorer")),
+                KeyBinding::new("f11", FullScreen, Some("Explorer")),
+                KeyBinding::new("ctrl-shift-e", ExpandCurrentTree, Some("Explorer")),
+            ]);
+            for (key, command) in [
+                ("up", rust_explorer::nav_keyboard::Command::Up),
+                ("down", rust_explorer::nav_keyboard::Command::Down),
+                ("home", rust_explorer::nav_keyboard::Command::First),
+                ("end", rust_explorer::nav_keyboard::Command::Last),
+                ("left", rust_explorer::nav_keyboard::Command::Left),
+                ("right", rust_explorer::nav_keyboard::Command::Right),
+                ("+", rust_explorer::nav_keyboard::Command::Expand),
+                ("-", rust_explorer::nav_keyboard::Command::Collapse),
+                ("*", rust_explorer::nav_keyboard::Command::ExpandLevel),
+                ("shift-8", rust_explorer::nav_keyboard::Command::ExpandLevel),
+                ("enter", rust_explorer::nav_keyboard::Command::Activate),
+                ("space", rust_explorer::nav_keyboard::Command::Activate),
+                (
+                    "shift-f10",
+                    rust_explorer::nav_keyboard::Command::ContextMenu,
+                ),
+                ("menu", rust_explorer::nav_keyboard::Command::ContextMenu),
+            ] {
+                cx.bind_keys([KeyBinding::new(
+                    key,
+                    NavigateTree { command },
+                    Some("NavigationTree"),
+                )]);
+            }
+            for index in 0..9 {
+                cx.bind_keys([KeyBinding::new(
+                    &format!("ctrl-{}", index + 1),
+                    ActivateNumberedTab { index },
+                    Some("Explorer"),
+                )]);
+            }
+            for index in 0..8 {
+                cx.bind_keys([KeyBinding::new(
+                    &format!("ctrl-shift-{}", index + 1),
+                    ChangeNumberedView { index },
+                    Some("Explorer"),
+                )]);
+                // Windows GPUI translates Shift+digits to punctuation before
+                // matching; retain digit bindings for other keyboard layouts.
+                cx.bind_keys([KeyBinding::new(
+                    &format!("ctrl-{}", ["!", "@", "#", "$", "%", "^", "&", "*"][index]),
+                    ChangeNumberedView { index },
+                    Some("Explorer"),
+                )]);
+            }
+            for (key, step) in [
+                ("left", NavigationStep::Horizontal(-1)),
+                ("right", NavigationStep::Horizontal(1)),
+                ("up", NavigationStep::Vertical(-1)),
+                ("down", NavigationStep::Vertical(1)),
+                ("home", NavigationStep::First),
+                ("end", NavigationStep::Last),
+                ("pageup", NavigationStep::Page(-1)),
+                ("pagedown", NavigationStep::Page(1)),
+            ] {
+                // Later bindings replace the original Up/Down aliases with the
+                // same navigation semantics plus explicit modifier selection.
+                cx.bind_keys([KeyBinding::new(
+                    key,
+                    NavigateFiles {
+                        step: step.clone(),
+                        extend: false,
+                        focus_only: false,
+                    },
+                    Some("Explorer"),
+                )]);
+                cx.bind_keys([KeyBinding::new(
+                    &format!("shift-{key}"),
+                    NavigateFiles {
+                        step: step.clone(),
+                        extend: true,
+                        focus_only: false,
+                    },
+                    Some("Explorer"),
+                )]);
+                cx.bind_keys([KeyBinding::new(
+                    &format!("ctrl-{key}"),
+                    NavigateFiles {
+                        step: step.clone(),
+                        extend: false,
+                        focus_only: true,
+                    },
+                    Some("Explorer"),
+                )]);
+            }
+            open_explorer(None, cx).expect("无法创建窗口");
+            cx.activate(true);
+        });
+}

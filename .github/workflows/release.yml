@@ -1,0 +1,34 @@
+name: Build Windows release
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Install stable Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Download optional Everything SDK
+        shell: pwsh
+        run: ./scripts/bootstrap.ps1
+      - name: Build MSVC release
+        shell: pwsh
+        run: ./scripts/build.ps1 -Release
+      - name: Package binary, notices and checksum
+        shell: pwsh
+        run: ./scripts/package.ps1
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: RustExplorer-windows-x64
+          path: |
+            artifacts/RustExplorer-*-windows-x64.zip
+            artifacts/SHA256SUMS.txt
+          if-no-files-found: error

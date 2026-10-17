@@ -1,0 +1,30 @@
+1 24 "resources/app.manifest"
+101 ICON "resources/app-icon/rust-explorer.ico"
+
+1 VERSIONINFO
+ FILEVERSION 0,6,2,0
+ PRODUCTVERSION 0,6,2,0
+ FILEFLAGSMASK 0x3fL
+ FILEFLAGS 0x0L
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+ BLOCK "StringFileInfo"
+ BEGIN
+  BLOCK "040904b0"
+  BEGIN
+   VALUE "CompanyName", "Rust Explorer"
+   VALUE "FileDescription", "Rust Explorer Native File Manager"
+   VALUE "FileVersion", "0.6.2.0"
+   VALUE "InternalName", "rust-explorer"
+   VALUE "OriginalFilename", "rust-explorer.exe"
+   VALUE "ProductName", "Rust Explorer"
+   VALUE "ProductVersion", "0.6.2"
+  END
+ END
+ BLOCK "VarFileInfo"
+ BEGIN
+  VALUE "Translation", 0x0409, 1200
+ END
+END

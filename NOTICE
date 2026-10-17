@@ -1,0 +1,18 @@
+Rust Explorer
+Copyright 2026 Mingcodeingmiao and Rust Explorer contributors
+
+This project is licensed under the Apache License, Version 2.0.
+
+The text input implementation in src/input.rs is adapted and modified from
+the GPUI input example by Zed Industries, Inc., licensed under Apache-2.0.
+Original attribution: Copyright 2022 - 2025 Zed Industries, Inc.
+
+GPUI and other dependencies remain the work of their respective authors.
+See THIRD_PARTY_NOTICES.md and the accompanying license notices.
+
+Windows and Microsoft are trademarks of Microsoft Corporation.
+Rust Explorer is an independent project and is not affiliated with or
+endorsed by Microsoft or the Rust Foundation. No Microsoft system artwork
+is distributed in the source repository; Shell assets are loaded at runtime
+from the user's installation. The application icon is original AI-assisted
+artwork; its creation notes are retained in resources/app-icon/.
