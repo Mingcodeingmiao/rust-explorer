@@ -339,13 +339,19 @@ pub fn thumbnail_or_icon(
     logical: f32,
     thumbnail: Option<PathBuf>,
     dimensions: (u32, u32),
+    folder_thumbnail: bool,
     cache: &Entity<ThumbnailImages>,
     cx: &mut App,
 ) -> AnyElement {
     if let Some(thumbnail) = thumbnail {
         let scale = ICONS.with(|v| v.borrow().pixels as f32 / 16.);
-        let edge =
-            rust_explorer::icon_layout::thumbnail_edge(logical, dimensions.0, dimensions.1, scale);
+        let edge = rust_explorer::icon_layout::thumbnail_edge(
+            logical,
+            dimensions.0,
+            dimensions.1,
+            scale,
+            folder_thumbnail,
+        );
         let long = dimensions.0.max(dimensions.1).max(1) as f32;
         let (image_width, image_height) = if dimensions.0 > 0 && dimensions.1 > 0 {
             (

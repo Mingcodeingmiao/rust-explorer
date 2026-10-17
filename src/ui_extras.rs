@@ -291,7 +291,7 @@ pub(super) fn open_explorer(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Rust Explorer 0.6.2".into()),
+                title: Some("Rust Explorer 0.6.3".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -1014,8 +1014,9 @@ impl Explorer {
             ) / self.zoom
                 + 40.
         };
-        let required: f32 = parts.iter().map(|(name, _)| measure(name)).sum();
-        let collapsed = required > available;
+        let widths: Vec<_> = parts.iter().map(|(name, _)| measure(name)).collect();
+        let hidden = rust_explorer::breadcrumb_layout::hidden_prefix(&widths, available, 108.);
+        *self.hidden_breadcrumbs.borrow_mut() = parts.drain(..hidden).collect();
         let mut crumbs = div()
             .id("breadcrumbs")
             .flex_1()
@@ -1030,8 +1031,7 @@ impl Explorer {
             .overflow_hidden()
             .cursor_pointer()
             .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
-        if collapsed && parts.len() > 1 {
-            let current = parts.pop().unwrap();
+        if hidden > 0 {
             crumbs = crumbs
                 .child(
                     div()
@@ -1062,7 +1062,6 @@ impl Explorer {
                         ),
                 )
                 .child(visual::icon("chevron-right", t.muted));
-            parts = vec![current];
         }
         let n = parts.len();
         for (index, (label, path)) in parts.into_iter().enumerate() {
@@ -2470,6 +2469,7 @@ impl Explorer {
                     self.view.icon_size(),
                     thumbnail,
                     (presentation.width, presentation.height),
+                    entry.directory || presentation.directory,
                     &self.thumbnail_images,
                     cx,
                 ))
@@ -2849,21 +2849,12 @@ impl Explorer {
                 MenuItem::new("drop:cancel", "取消"),
             ],
             "crumbs-menu" => self
-                .dir()
-                .ancestors()
-                .skip(1)
+                .hidden_breadcrumbs
+                .borrow()
+                .iter()
                 .enumerate()
-                .map(|(i, p)| {
-                    MenuItem::new(
-                        format!("crumb:{i}"),
-                        self.volumes
-                            .iter()
-                            .find(|v| v.path == p)
-                            .map(|v| v.label.clone())
-                            .unwrap_or_else(|| navigation::location_name(p)),
-                    )
-                })
-                .chain([MenuItem::new("crumb:computer", navigation::computer_name())])
+                .rev()
+                .map(|(i, (label, _))| MenuItem::new(format!("hidden-crumb:{i}"), label.clone()))
                 .collect(),
             "file-menu" => {
                 let folder = self.selected.len() == 1
@@ -3384,6 +3375,23 @@ impl Explorer {
             cx.notify();
             return;
         }
+        if let Some(index) = id
+            .strip_prefix("hidden-crumb:")
+            .and_then(|id| id.parse::<usize>().ok())
+        {
+            let path = self
+                .hidden_breadcrumbs
+                .borrow()
+                .get(index)
+                .map(|(_, path)| path.clone());
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+            if let Some(path) = path {
+                self.navigate(path, cx);
+            }
+            return;
+        }
         if let Some(id) = id.strip_prefix("crumb:") {
             let path = if id == "computer" {
                 Some(volumes::computer())
@@ -3869,6 +3877,7 @@ impl Explorer {
         let settings = self.options.as_ref().unwrap();
         let mut tabs = div()
             .flex()
+            .flex_shrink_0()
             .gap_1()
             .border_b_1()
             .border_color(rgb(t.border));
@@ -3887,6 +3896,8 @@ impl Explorer {
             .track_scroll(&self.options_scroll)
             .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()))
             .flex_1()
+            .w_full()
+            .min_w_0()
             .min_h_0()
             .overflow_y_scroll()
             .flex()
@@ -3958,14 +3969,20 @@ impl Explorer {
         }
         if self.options_page == 1 {
             let source = rust_explorer::fluent_icons::resource_status();
-            body = body.child(div().text_size(ui(12.)).whitespace_normal().child(format!(
+            body = body.child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(format!(
                 "界面资源：{}（SVG {}，系统资源模块 {}）。仅引用本机文件，不复制到程序目录。",
                 source.source.map(|p| p.display().to_string()).unwrap_or_else(|| "当前系统".into()), source.svg_count, source.native_module_count
-            ))).child(div().flex().gap_2()
+            ))).child(div().w_full().min_w_0().flex().flex_wrap().flex_shrink_0().gap_2()
                 .child(button("resource-file", "选择 DLL / EXE / MUN", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(false, cx))))
                 .child(button("resource-folder", "选择资源目录", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(true, cx))))
                 .child(button("resource-reset", "使用当前系统", t).on_click(cx.listener(|v, _, _, cx| v.load_resources(None, cx)))));
-            let mut themes = div().flex().items_center().gap_2().child("外观");
+            let mut themes = div()
+                .flex()
+                .flex_wrap()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .child("外观");
             for (id, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
             {
                 themes = themes.child(
@@ -3988,6 +4005,9 @@ impl Explorer {
                 div()
                     .id(SharedString::from(format!("setting-{id}")))
                     .min_h(ui(32.))
+                    .min_w_0()
+                    .w_full()
+                    .flex_shrink_0()
                     .px_2()
                     .py_1()
                     .rounded(ui(4.))
@@ -3997,7 +4017,7 @@ impl Explorer {
                     .items_center()
                     .gap_2()
                     .child(visual::checkbox(checked, t.muted))
-                    .child(label)
+                    .child(div().flex_1().min_w_0().whitespace_normal().child(label))
                     .on_click(cx.listener(move |v, _, _, cx| {
                         if let Some(s) = &mut v.options {
                             match id {
@@ -4035,12 +4055,15 @@ impl Explorer {
             );
         }
         if self.options_page == 2 {
-            body=body.child(div().py_2().child("搜索引擎：Everything（已安装时自动调用）")).child(div().text_color(rgb(t.muted)).line_height(ui(24.)).child("支持 Everything 查询语法。搜索框旁可切换当前文件夹 / 全盘范围。索引器不可用时，只筛选当前文件夹名称。目录内容、压缩包内容及系统索引服务集成未启用，避免后台扫描。"));
+            body = body
+                .child(div().w_full().min_w_0().flex_shrink_0().py_2().whitespace_normal().child("搜索引擎：Everything（已安装时自动调用）"))
+                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).line_height(ui(24.)).child("支持 Everything 查询语法。搜索框旁可切换当前文件夹 / 全盘范围。索引器不可用时，只筛选当前文件夹名称。目录内容、压缩包内容及系统索引服务集成未启用，避免后台扫描。"));
         }
         div()
             .absolute()
             .inset_0()
             .occlude()
+            .p_4()
             .on_mouse_move(cx.listener(|v, event: &MouseMoveEvent, _, cx| {
                 if event.pressed_button == Some(MouseButton::Left) {
                     if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
@@ -4061,8 +4084,11 @@ impl Explorer {
             .child(
                 div()
                     .w(ui(580.))
+                    .min_w_0()
+                    .max_w_full()
                     .h(ui(540.))
                     .max_h_full()
+                    .overflow_hidden()
                     .p_5()
                     .rounded(ui(9.))
                     .bg(rgb(t.panel))
@@ -4090,7 +4116,9 @@ impl Explorer {
                         div()
                             .relative()
                             .flex_1()
+                            .min_w_0()
                             .min_h_0()
+                            .overflow_hidden()
                             .flex()
                             .child(body.pr_4())
                             .child(self.auxiliary_scrollbar(
@@ -4101,6 +4129,10 @@ impl Explorer {
                     )
                     .child(
                         div()
+                            .w_full()
+                            .min_w_0()
+                            .flex_shrink_0()
+                            .whitespace_normal()
                             .text_size(ui(12.))
                             .text_color(rgb(t.muted))
                             .child("设置仅作用于 Rust Explorer，不修改系统资源管理器。"),
@@ -4108,6 +4140,9 @@ impl Explorer {
                     .child(
                         div()
                             .flex()
+                            .flex_wrap()
+                            .flex_shrink_0()
+                            .gap_2()
                             .justify_between()
                             .child(button("options-defaults", "还原默认值", t).on_click(
                                 cx.listener(|v, _, _, cx| {
@@ -4118,6 +4153,7 @@ impl Explorer {
                             .child(
                                 div()
                                     .flex()
+                                    .flex_wrap()
                                     .gap_2()
                                     .child(
                                         button("options-ok", "确定", t)

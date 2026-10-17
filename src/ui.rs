@@ -204,6 +204,7 @@ struct Explorer {
     thumbnail_images: Entity<visual::ThumbnailImages>,
     thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
     thumbnail_sync_queued: std::cell::Cell<bool>,
+    hidden_breadcrumbs: std::cell::RefCell<Vec<(String, PathBuf)>>,
     view: ViewMode,
     group: String,
     filters: rust_explorer::file_filter::Filters,
@@ -530,6 +531,7 @@ impl Explorer {
             thumbnail_images: visual::ThumbnailImages::new(cx),
             thumbnail_viewport: std::cell::Cell::new(None),
             thumbnail_sync_queued: std::cell::Cell::new(false),
+            hidden_breadcrumbs: std::cell::RefCell::new(Vec::new()),
             rows: vec![],
             filters: Default::default(),
             filter_types: Vec::new(),
@@ -2145,7 +2147,7 @@ impl Render for Explorer {
                 self.dir().display().to_string()
             });
         } else {
-            window.set_window_title("Rust Explorer 0.6.2");
+            window.set_window_title("Rust Explorer 0.6.3");
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 188.).max(100.);
         if (available - self.layout_width).abs() > 0.5

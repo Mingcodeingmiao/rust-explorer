@@ -106,6 +106,7 @@ struct Cached {
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Presentation {
+    pub directory: bool,
     pub shortcut: bool,
     pub video: bool,
     pub width: u32,
@@ -266,6 +267,7 @@ impl Loader {
                                 .to_string_lossy()
                                 .to_ascii_lowercase();
                             Presentation {
+                                directory: key.directory,
                                 width: 0,
                                 height: 0,
                                 shortcut: matches!(extension.as_str(), "lnk" | "url"),

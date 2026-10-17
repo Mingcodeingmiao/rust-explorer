@@ -1,6 +1,9 @@
 //! Pure geometry for small provider images inside Explorer's fixed icon slots.
-pub fn thumbnail_edge(logical: f32, width: u32, height: u32, scale: f32) -> f32 {
-    if width == 0 || height == 0 {
+pub fn thumbnail_edge(logical: f32, width: u32, height: u32, scale: f32, folder: bool) -> f32 {
+    // Shell can return a 48px cached folder composition for a jumbo request.
+    // Its bitmap resolution must not change the folder's visual slot size.
+    // Photos and other document thumbnails still retain their native-size rule.
+    if folder || width == 0 || height == 0 {
         return logical;
     }
     (width.max(height) as f32 / scale.max(0.5)).clamp(logical / 3., logical)
@@ -118,10 +121,18 @@ mod tests {
     use super::*;
     #[test]
     fn thumbnail_scale_respects_native_size_and_minimum_area() {
-        assert_eq!(thumbnail_edge(150., 8, 12, 1.), 50.);
-        assert_eq!(thumbnail_edge(150., 96, 60, 1.), 96.);
-        assert_eq!(thumbnail_edge(150., 400, 200, 1.), 150.);
-        assert_eq!(thumbnail_edge(150., 192, 120, 2.), 96.);
+        assert_eq!(thumbnail_edge(150., 8, 12, 1., false), 50.);
+        assert_eq!(thumbnail_edge(150., 96, 60, 1., false), 96.);
+        assert_eq!(thumbnail_edge(150., 400, 200, 1., false), 150.);
+        assert_eq!(thumbnail_edge(150., 192, 120, 2., false), 96.);
+    }
+    #[test]
+    fn cached_folder_resolution_does_not_shrink_jumbo_folder() {
+        for scale in [1., 1.5, 2.] {
+            assert_eq!(thumbnail_edge(240., 48, 48, scale, true), 240.);
+            assert_eq!(thumbnail_edge(240., 256, 256, scale, true), 240.);
+        }
+        assert_eq!(thumbnail_edge(240., 48, 48, 1., false), 80.);
     }
     #[test]
     fn legacy_artwork_is_centered_and_full_size_art_is_untouched() {

@@ -323,11 +323,20 @@ fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap>
         cx: extent,
         cy: extent,
     };
+    // Folder compositions are icons, not small photos. Ask the Shell to use
+    // larger cached artwork when available and to fill the requested size.
+    let flags = if folder_alpha {
+        SIIGBF_THUMBNAILONLY
+            | windows::Win32::UI::Shell::SIIGBF_BIGGERSIZEOK
+            | windows::Win32::UI::Shell::SIIGBF_SCALEUP
+    } else {
+        SIIGBF_THUMBNAILONLY
+    };
     let bitmap = OwnedBitmap(
         unsafe {
             factory
-                .GetImage(bounds, SIIGBF_THUMBNAILONLY | SIIGBF_INCACHEONLY)
-                .or_else(|_| factory.GetImage(bounds, SIIGBF_THUMBNAILONLY))
+                .GetImage(bounds, flags | SIIGBF_INCACHEONLY)
+                .or_else(|_| factory.GetImage(bounds, flags))
         }
         .context("系统未提供此文件的缩略图")?,
     );

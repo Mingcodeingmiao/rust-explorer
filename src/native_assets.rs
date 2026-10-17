@@ -127,7 +127,7 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
 }
 
 fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v2");
+    let root = cache_root().join("thumbnails-v3");
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
@@ -361,7 +361,7 @@ pub fn serve(json: &str) -> Result<()> {
                 shortcut_epoch: item.shortcut_epoch,
             };
             let output = if shortcut {
-                let root = cache_root().join("thumbnails-v2");
+                let root = cache_root().join("thumbnails-v3");
                 std::fs::create_dir_all(&root)?;
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 (&item, &resolved).hash(&mut hash);
@@ -431,6 +431,7 @@ pub fn serve(json: &str) -> Result<()> {
                 .to_ascii_lowercase();
             let (width, height) = png_dimensions(&output)?;
             let presentation = crate::thumbnails::Presentation {
+                directory: resolved.directory,
                 shortcut,
                 width,
                 height,

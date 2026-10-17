@@ -1,3 +1,4 @@
+pub mod breadcrumb_layout;
 pub mod disk_usage;
 pub mod file_filter;
 pub mod file_hints;

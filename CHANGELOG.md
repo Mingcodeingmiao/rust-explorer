@@ -4,6 +4,18 @@ Notable changes are recorded here. Versions before 1.0 may change behavior and c
 
 ## [Unreleased]
 
+## [0.6.3] - 2026-10-17
+
+### Fixed
+
+- Folder Options search descriptions now wrap inside the dialog instead of overflowing horizontally.
+- Options content and viewport allow width shrinking; resource descriptions, setting labels and footer text wrap, and action rows wrap in narrow layouts.
+- The dialog fits the available window with outer spacing and retains vertical scrolling for long content.
+- Folder compositions no longer shrink when the Shell returns a low-resolution cached thumbnail for a jumbo request; regular image thumbnails retain their native-size behavior.
+- Breadcrumb overflow hides the minimum leading ancestors one by one and keeps the fitting suffix visible; its menu lists only the hidden ancestors.
+
+## Repository preparation
+
 - Prepare the public repository: contribution and security policies, issue/PR templates, Windows CI, packaging workflow and third-party attribution.
 
 ## [0.6.2] - 2026-10-17
