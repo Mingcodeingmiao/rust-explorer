@@ -1024,6 +1024,7 @@ impl Explorer {
         let small = matches!(mode, ViewMode::Small | ViewMode::List);
         let details = mode == ViewMode::Details;
         let content = mode == ViewMode::Content;
+        let tiles = mode == ViewMode::Tiles;
         let size = if grid {
             mode.icon_size()
         } else if small {
@@ -1032,6 +1033,8 @@ impl Explorer {
             20.
         } else if content {
             64.
+        } else if tiles {
+            40.
         } else {
             48.
         };
@@ -1078,7 +1081,14 @@ impl Explorer {
             .rounded(ui(3.))
             .flex()
             .items_center()
-            .when(!details, |d| d.p_2().gap_2())
+            .when(!details && !tiles, |d| d.p_2().gap_2())
+            .when(tiles, |d| {
+                d.h(ui(rust_explorer::layout_metrics::DRIVE_TILE_HEIGHT))
+                    .px_2()
+                    .py_1()
+                    .gap_2()
+                    .overflow_hidden()
+            })
             .when(details, |d| {
                 d.h(ui(if self.settings.compact { 26. } else { 34. }))
             })
@@ -1086,7 +1096,7 @@ impl Explorer {
             .when(small, |d| {
                 d.h(ui(if self.settings.compact { 28. } else { 34. }))
             })
-            .when(!grid && !small && !details, |d| {
+            .when(!grid && !small && !details && !tiles, |d| {
                 d.min_h(ui(if content {
                     if self.settings.compact { 80. } else { 92. }
                 } else if self.settings.compact {
@@ -1200,6 +1210,7 @@ impl Explorer {
                 .flex()
                 .flex_col()
                 .gap_1()
+                .when(tiles, |d| d.gap(ui(1.)).line_height(ui(16.)))
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
                 .child(if grid {
@@ -1231,7 +1242,13 @@ impl Explorer {
                 if capacity {
                     text = text.child(
                         div()
-                            .h(ui(if content { 20. } else { 16. }))
+                            .h(ui(if content {
+                                20.
+                            } else if tiles {
+                                12.
+                            } else {
+                                16.
+                            }))
                             .w_full()
                             .border_1()
                             .border_color(rgb(0xbcbcbc))
@@ -1243,7 +1260,12 @@ impl Explorer {
                             }))),
                     );
                 }
-                text = text.child(label(space).text_size(ui(12.)).text_color(rgb(t.muted)));
+                text = text.child(
+                    label(space)
+                        .text_size(ui(12.))
+                        .text_color(rgb(t.muted))
+                        .when(tiles, |d| d.line_height(ui(14.))),
+                );
                 if content || volume.kind == 5 {
                     text = text.child(
                         label(format!(
@@ -1256,6 +1278,7 @@ impl Explorer {
                             }
                         ))
                         .text_size(ui(12.))
+                        .when(tiles, |d| d.line_height(ui(14.)))
                         .text_color(rgb(t.muted)),
                     );
                 }
@@ -1470,7 +1493,7 @@ impl Explorer {
                 } else if self.view == ViewMode::Small {
                     260.
                 } else if self.view == ViewMode::Tiles {
-                    300.
+                    rust_explorer::layout_metrics::DRIVE_TILE_WIDTH
                 } else {
                     group_width
                 };
@@ -1481,6 +1504,8 @@ impl Explorer {
                 };
                 let width = if self.view == ViewMode::Content || details || list {
                     group_width
+                } else if self.view == ViewMode::Tiles {
+                    rust_explorer::layout_metrics::DRIVE_TILE_WIDTH
                 } else {
                     (available / columns).floor()
                 };

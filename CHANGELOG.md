@@ -4,6 +4,14 @@ Notable changes are recorded here. Versions before 1.0 may change behavior and c
 
 ## [Unreleased]
 
+## [0.6.4] - 2026-10-17
+
+### Fixed
+
+- This PC tiles now retain a fixed 250×55 logical-pixel size while the window changes width, corresponding to approximately 438×96 physical pixels at 175% DPI and 100% application zoom.
+- Detail-view filter menus use the same 26 logical-pixel item height as compact file rows, with matching popup-height calculations and single-line truncated labels.
+- Shortcut resolution tests compare canonical target paths so Windows runner 8.3 TEMP aliases do not cause false failures.
+
 ## [0.6.3] - 2026-10-17
 
 ### Fixed

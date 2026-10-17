@@ -6,6 +6,7 @@ pub mod file_history;
 pub mod fluent_icons;
 pub mod fs;
 pub mod icon_layout;
+pub mod layout_metrics;
 pub mod list_layout;
 pub mod native_assets;
 pub mod native_preview;

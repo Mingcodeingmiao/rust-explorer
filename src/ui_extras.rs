@@ -291,7 +291,7 @@ pub(super) fn open_explorer(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Rust Explorer 0.6.3".into()),
+                title: Some("Rust Explorer 0.6.4".into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -531,7 +531,7 @@ impl Explorer {
                 self.view.icon_size() + 56.
             }
             ViewMode::Tiles | ViewMode::Content => 74.,
-            _ if self.settings.compact => 26.,
+            _ if self.settings.compact => rust_explorer::layout_metrics::COMPACT_FILE_ROW,
             _ => 34.,
         }
     }
@@ -2192,14 +2192,18 @@ impl Explorer {
             } else if rich {
                 74.
             } else if self.settings.compact {
-                26.
+                rust_explorer::layout_metrics::COMPACT_FILE_ROW
             } else {
                 34.
             }))
             .py_1()
             .when(details, |d| {
-                d.h(ui(if self.settings.compact { 26. } else { 34. }))
-                    .py_0()
+                d.h(ui(if self.settings.compact {
+                    rust_explorer::layout_metrics::COMPACT_FILE_ROW
+                } else {
+                    34.
+                }))
+                .py_0()
             })
             .flex()
             .items_center()
@@ -3129,6 +3133,11 @@ impl Explorer {
     ) -> AnyElement {
         let t = self.theme;
         let mut offset = 8.;
+        let item_height = if kind.starts_with("filter-menu:") {
+            rust_explorer::layout_metrics::COMPACT_FILE_ROW
+        } else {
+            34.
+        };
         let mut panel = div()
             .id(("popup-panel", level))
             .absolute()
@@ -3157,7 +3166,7 @@ impl Explorer {
             let id = item.id;
             let hover_id = id.clone();
             let item_offset = offset;
-            offset += 34.;
+            offset += item_height;
             let icon = menu_icon(&id);
             panel = panel.child(
                 div()
@@ -3169,7 +3178,7 @@ impl Explorer {
                         },
                         index,
                     ))
-                    .min_h(ui(34.))
+                    .h(ui(item_height))
                     .flex_shrink_0()
                     .px_2()
                     .rounded(ui(4.))
@@ -3193,6 +3202,9 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .when(kind.starts_with("filter-menu:"), |d| {
+                                d.whitespace_nowrap().overflow_hidden().text_ellipsis()
+                            })
                             .child(item.label.trim_end_matches('›').trim().to_string()),
                     )
                     .when(id.starts_with("submenu:"), |d| {
@@ -3239,7 +3251,15 @@ impl Explorer {
         let height = self
             .menu_items(&kind)
             .iter()
-            .map(|i| if i.id == "-" { 9. } else { 34. })
+            .map(|i| {
+                if i.id == "-" {
+                    9.
+                } else if kind.starts_with("filter-menu:") {
+                    rust_explorer::layout_metrics::COMPACT_FILE_ROW
+                } else {
+                    34.
+                }
+            })
             .sum::<f32>()
             * self.zoom
             + 16. * self.zoom;

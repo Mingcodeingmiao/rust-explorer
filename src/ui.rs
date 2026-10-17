@@ -2147,7 +2147,7 @@ impl Render for Explorer {
                 self.dir().display().to_string()
             });
         } else {
-            window.set_window_title("Rust Explorer 0.6.3");
+            window.set_window_title("Rust Explorer 0.6.4");
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 188.).max(100.);
         if (available - self.layout_width).abs() > 0.5

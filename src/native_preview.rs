@@ -277,7 +277,12 @@ mod shortcut_tests {
         unsafe {
             persist.Save(PCWSTR(destination_wide.as_ptr()), true)?;
         }
-        assert_eq!(shortcut_target(&destination)?, target);
+        // Windows may expand the runner's 8.3 TEMP alias (RUNNER~1) when
+        // resolving a Shell link. Compare actual targets, not path spelling.
+        assert_eq!(
+            std::fs::canonicalize(shortcut_target(&destination)?)?,
+            std::fs::canonicalize(&target)?
+        );
         let internet = root.join("photo.url");
         let uri = format!(
             "[InternetShortcut]\r\nURL=file:///{}\r\n",
@@ -287,7 +292,10 @@ mod shortcut_tests {
                 .replace(' ', "%20")
         );
         std::fs::write(&internet, uri)?;
-        assert_eq!(shortcut_target(&internet)?, target);
+        assert_eq!(
+            std::fs::canonicalize(shortcut_target(&internet)?)?,
+            std::fs::canonicalize(&target)?
+        );
         std::fs::write(
             &internet,
             "[InternetShortcut]\r\nURL=https://example.com/image.png\r\n",
