@@ -1,4 +1,5 @@
 pub mod breadcrumb_layout;
+pub mod content_layout;
 pub mod disk_usage;
 pub mod file_filter;
 pub mod file_hints;
@@ -19,6 +20,7 @@ pub mod quick_access;
 pub mod search;
 pub mod settings;
 pub mod shell;
+pub mod shell_folder;
 pub mod system_icons;
 pub mod theme;
 pub mod thumbnails;

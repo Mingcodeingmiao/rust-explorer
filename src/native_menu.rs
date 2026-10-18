@@ -60,6 +60,9 @@ pub(super) struct Options {
     pub group: String,
     pub undo: bool,
     pub redo: bool,
+    pub folder: bool,
+    pub folder_insert: u32,
+    pub can_paste: bool,
 }
 struct Builder {
     commands: Vec<String>,
@@ -139,6 +142,19 @@ pub(super) unsafe fn augment(
             commands: Vec::new(),
         };
         let mut position = 0;
+        if !background && options.folder {
+            let start = options.folder_insert;
+            builder.root(menu, start, "在新标签页中打开", "open-new-tab", true)?;
+            builder.root(menu, start + 1, "在新窗口中打开", "open-new-window", true)?;
+            InsertMenuW(
+                menu,
+                start + 2,
+                MF_BYPOSITION | MF_SEPARATOR,
+                0,
+                PCWSTR::null(),
+            )?;
+            position = start + 3;
+        }
         if background {
             let views = Builder::submenu(menu, position, "查看(&V)")?;
             position += 1;
@@ -202,6 +218,14 @@ pub(super) unsafe fn augment(
                 )?;
             }
             builder.root(menu, position, "刷新(&E)", "refresh-folder", true)?;
+            position += 1;
+            builder.root(
+                menu,
+                position,
+                "粘贴(&P)\tCtrl+V",
+                "paste",
+                options.can_paste,
+            )?;
             position += 1;
         }
         if background || options.undo || options.redo {

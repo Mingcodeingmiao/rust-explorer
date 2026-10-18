@@ -229,6 +229,8 @@ pub fn sdk_query(query: &str) -> Result<SearchResult> {
                 hidden: get_attrs(i) & 2 != 0,
                 system: get_attrs(i) & 4 != 0,
                 size: size.max(0) as u64,
+                total: None,
+                free: None,
                 modified,
                 created: None,
                 kind,

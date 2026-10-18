@@ -98,6 +98,22 @@ fn decode_text(bytes: &[u8], truncated: bool) -> Result<(String, &'static str)> 
             if little { "UTF-16 LE" } else { "UTF-16 BE" },
         ));
     }
+    if bytes.contains(&0) && bytes.len() >= 8 {
+        let pairs = bytes.len() / 2;
+        let even = bytes.iter().step_by(2).filter(|b| **b == 0).count();
+        let odd = bytes.iter().skip(1).step_by(2).filter(|b| **b == 0).count();
+        let little = odd * 4 > pairs * 3 && even * 8 < pairs;
+        let big = even * 4 > pairs * 3 && odd * 8 < pairs;
+        if little || big {
+            let mut marked = if little {
+                vec![0xff, 0xfe]
+            } else {
+                vec![0xfe, 0xff]
+            };
+            marked.extend_from_slice(bytes);
+            return decode_text(&marked, truncated);
+        }
+    }
     if bytes.contains(&0)
         || bytes
             .iter()
@@ -136,11 +152,38 @@ fn decode_text(bytes: &[u8], truncated: bool) -> Result<(String, &'static str)> 
             return Ok((String::from_utf16(&output)?, "GBK / GB2312（推测）"));
         }
     }
-    bail!("无法可靠识别文本编码；支持 UTF-8、带 BOM 的 UTF-16，以及 GBK/GB2312")
+    // Keep the contributor's GB18030 support, but reject replacement characters
+    // instead of silently accepting damaged input. A bounded read may cut a
+    // four-byte sequence, so retry only the final three bytes.
+    for trim in 0..=if truncated { 3 } else { 0 } {
+        if let Some(end) = bytes.len().checked_sub(trim) {
+            if let Some(text) = encoding_rs::GB18030
+                .decode_without_bom_handling_and_without_replacement(&bytes[..end])
+            {
+                return Ok((text.into_owned(), "GB18030（推测）"));
+            }
+        }
+    }
+    bail!("无法可靠识别文本编码；支持 UTF-8、UTF-16、GBK/GB2312 和 GB18030")
 }
+#[cfg(test)]
+fn decode_for_test(bytes: &[u8]) -> Result<String> {
+    decode_text(bytes, false).map(|v| v.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn integrated_decoder_keeps_gb18030_and_bomless_utf16_strict() {
+        let text = "ASCII text with a UTF-16 signature pattern";
+        let bytes: Vec<_> = text.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        assert_eq!(decode_text(&bytes, false).unwrap().0, text);
+        let (bytes, _, errors) = encoding_rs::GB18030.encode("𠀀");
+        assert!(!errors);
+        assert_eq!(decode_text(&bytes, false).unwrap().0, "𠀀");
+        assert!(decode_text(&[0xef, 0xbb, 0xbf, 0xff], false).is_err());
+    }
     #[test]
     fn chinese_encodings_and_unicode_boms() {
         assert_eq!(
@@ -224,5 +267,20 @@ mod tests {
         assert_eq!(kind(Path::new("x.svg")), Kind::Unsupported);
         assert_eq!(kind(Path::new("x.OTF")), Kind::Font);
         assert_eq!(kind(Path::new("x.ttc")), Kind::Font);
+    }
+
+    #[test]
+    fn decodes_utf8_utf16_and_gb2312() {
+        assert_eq!(decode_for_test("纯文本".as_bytes()).unwrap(), "纯文本");
+        assert_eq!(
+            decode_for_test(&[0xff, 0xfe, 0x2d, 0x4e, 0x87, 0x65]).unwrap(),
+            "中文"
+        );
+        // "中文测试" in GB2312/GBK.
+        assert_eq!(
+            decode_for_test(&[0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]).unwrap(),
+            "中文测试"
+        );
+        assert!(decode_for_test(&[0x00, 0x01, 0x02, 0x00]).is_err());
     }
 }

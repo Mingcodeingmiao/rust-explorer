@@ -18,7 +18,7 @@ use windows::{
         System::{LibraryLoader::*, SystemInformation::GetSystemDirectoryW},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
-    core::PCWSTR,
+    core::{Interface, PCWSTR},
 };
 
 #[derive(Clone, Debug)]
@@ -57,11 +57,51 @@ impl Drop for Module {
     }
 }
 
+/// Folders can define a custom class/icon in desktop.ini (for example
+/// `C:\Windows\Offline Web Pages`). Only those folders need a per-item Shell
+/// lookup; ordinary folders keep the cheap cached stock folder icon.
+pub fn folder_has_custom_icon(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path.join("desktop.ini")) else {
+        return false;
+    };
+    let ascii = String::from_utf8_lossy(&data).to_ascii_lowercase();
+    if ["iconresource", "iconfile", "clsid="]
+        .iter()
+        .any(|needle| ascii.contains(needle))
+    {
+        return true;
+    }
+    if data.len() % 2 == 0 {
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let utf16 = String::from_utf16_lossy(&units).to_ascii_lowercase();
+        return ["iconresource", "iconfile", "clsid="]
+            .iter()
+            .any(|needle| utf16.contains(needle));
+    }
+    false
+}
+
 /// Obtain Explorer's associated file-type icon without reading normal files.
 /// Executables, shortcuts and .ico files retain their per-item Shell icon.
 pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
+    let shell_root = path.to_string_lossy().starts_with("mtp-root:");
     if directory {
+        if shell_root {
+            // Request the portable-device icon only for the device root; child
+            // folders use the stock folder icon below.
+            if let Ok(icon) = shell_image(path, true, size, false) {
+                return Ok(icon);
+            }
+        }
+        if path.is_absolute() && folder_has_custom_icon(path) {
+            if let Ok(icon) = shell_image(path, true, size, false) {
+                return Ok(icon);
+            }
+        }
         if path.parent().is_none() && path.has_root() {
             // Let the Shell supply the current Windows/BitLocker/optical overlays.
             if let Ok(icon) = shell_image(path, true, size, false) {
@@ -83,8 +123,9 @@ pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> 
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    let per_item =
-        path.is_absolute() && matches!(extension.as_str(), "exe" | "lnk" | "url" | "ico" | "cur");
+    let per_item = shell_root
+        || (path.is_absolute()
+            && matches!(extension.as_str(), "exe" | "lnk" | "url" | "ico" | "cur"));
     let lookup = if per_item {
         path.to_path_buf()
     } else {
@@ -180,8 +221,65 @@ pub fn associated_app_icon(path: &Path, size: u32) -> Result<IconBitmap> {
     file_icon(&executable, false, size)
 }
 
+fn shell_item_icon(path: &Path, size: u32) -> Result<IconBitmap> {
+    use windows::Win32::{
+        Foundation::SIZE,
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+        UI::Shell::{IShellItemImageFactory, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY},
+    };
+    let initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
+    let result = (|| {
+        let item = crate::shell_folder::item(path)?;
+        let factory: IShellItemImageFactory = item.cast()?;
+        let hbitmap = unsafe {
+            factory.GetImage(
+                SIZE {
+                    cx: size as i32,
+                    cy: size as i32,
+                },
+                SIIGBF_ICONONLY | SIIGBF_BIGGERSIZEOK,
+            )?
+        };
+        let mut metrics = BITMAP::default();
+        let copied = unsafe {
+            GetObjectW(
+                HGDIOBJ(hbitmap.0),
+                size_of::<BITMAP>() as i32,
+                Some(&mut metrics as *mut _ as *mut _),
+            )
+        };
+        if copied == 0 || metrics.bmWidth <= 0 || metrics.bmHeight <= 0 {
+            let _ = unsafe { DeleteObject(HGDIOBJ(hbitmap.0)) };
+            bail!("Shell icon has no bitmap size");
+        }
+        let mask = unsafe { CreateBitmap(metrics.bmWidth, metrics.bmHeight, 1, 1, None) };
+        let info = ICONINFO {
+            fIcon: true.into(),
+            hbmMask: mask,
+            hbmColor: hbitmap,
+            ..Default::default()
+        };
+        let icon = unsafe { CreateIconIndirect(&info) };
+        let _ = unsafe { DeleteObject(HGDIOBJ(hbitmap.0)) };
+        if !mask.is_invalid() {
+            let _ = unsafe { DeleteObject(HGDIOBJ(mask.0)) };
+        }
+        let icon = Icon(icon?);
+        bitmap(icon.0, size)
+    })();
+    if initialized {
+        unsafe { CoUninitialize() };
+    }
+    result
+}
+
 fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Result<IconBitmap> {
     use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    if crate::shell_folder::is_shell_path(path) {
+        if let Ok(icon) = shell_item_icon(path, size) {
+            return Ok(icon);
+        }
+    }
     let mut info = SHFILEINFOW::default();
     let mut flags = SHGFI_SYSICONINDEX | SHGFI_ICON | SHGFI_ADDOVERLAYS | SHGFI_OVERLAYINDEX;
     if attributes {
@@ -196,9 +294,22 @@ fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Res
     if size <= 16 {
         flags |= SHGFI_SMALLICON;
     }
+    let pidl = if crate::shell_folder::is_shell_path(path) {
+        Some(crate::shell_folder::pidl(path)?)
+    } else {
+        None
+    };
+    if pidl.is_some() {
+        flags |= SHGFI_PIDL;
+    }
+    let name = wide(path);
+    let name_ptr = pidl
+        .as_ref()
+        .map(|pidl| pidl.as_ptr() as *const u16)
+        .unwrap_or_else(|| name.as_ptr());
     let result = unsafe {
         SHGetFileInfoW(
-            PCWSTR(wide(path).as_ptr()),
+            PCWSTR(name_ptr),
             if directory {
                 FILE_ATTRIBUTE_DIRECTORY
             } else {

@@ -84,3 +84,82 @@ mod tests {
         std::fs::remove_dir(root).unwrap();
     }
 }
+
+fn expand_environment(input: &str) -> String {
+    let mut result = String::with_capacity(input.len());
+    let mut rest = input;
+    while let Some(start) = rest.find('%') {
+        result.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('%') else {
+            result.push_str(&rest[start..]);
+            return result;
+        };
+        let name = &after[..end];
+        if name.is_empty() {
+            // A pair of percent signs is a literal percent sign.
+            result.push('%');
+        } else {
+            match std::env::var(name) {
+                Ok(value) => result.push_str(&value),
+                Err(_) => {
+                    result.push('%');
+                    result.push_str(name);
+                    result.push('%');
+                }
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+
+/// Resolve relative and environment-variable paths before sending them to the
+/// disposable completion helper. Shell namespace paths use the separate resolver.
+pub fn resolve_input(current: &Path, input: &str) -> Option<PathBuf> {
+    let input = input.trim().trim_matches('"');
+    if input.is_empty()
+        || input.starts_with("::")
+        || input.starts_with("shell:")
+        || input.starts_with("mtp:")
+        || input.starts_with("mtp-root:")
+    {
+        return None;
+    }
+    let mut input = expand_environment(input);
+    if input.len() == 2 && input.as_bytes()[1] == b':' {
+        input.push('\\');
+    }
+    let path = PathBuf::from(input);
+    if path.is_absolute() {
+        Some(path)
+    } else if current.is_absolute() {
+        Some(current.join(path))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod integrated_tests {
+    use super::*;
+    #[test]
+    fn contributor_relative_and_environment_paths_use_bounded_helper() {
+        assert_eq!(
+            resolve_input(Path::new("D:\\work"), "src\\ma"),
+            Some(PathBuf::from("D:\\work\\src\\ma"))
+        );
+        assert_eq!(
+            resolve_input(Path::new("D:\\work"), "C:"),
+            Some(PathBuf::from("C:\\"))
+        );
+        assert_eq!(expand_environment("100%%"), "100%");
+        assert_eq!(
+            expand_environment("%__MISSING_DSH_VALUE__%"),
+            "%__MISSING_DSH_VALUE__%"
+        );
+        assert!(resolve_input(Path::new("::ThisPC"), "file").is_none());
+        assert!(resolve_input(Path::new("D:\\work"), "mtp:1234").is_none());
+    }
+}

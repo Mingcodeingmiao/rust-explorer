@@ -11,11 +11,8 @@ pub const TAB_MAX_WIDTH: f32 = 230.;
 pub const CONTENT_FIRST_COLUMN_MAX: f32 = 160.;
 
 pub fn content_columns(inner_width: f32, image: bool) -> (f32, bool) {
-    let width = inner_width.max(0.);
-    (
-        (width * 0.45).min(CONTENT_FIRST_COLUMN_MAX),
-        width >= if image { 480. } else { 360. },
-    )
+    let layout = crate::content_layout::columns(inner_width, image);
+    (layout.first, layout.right.is_some())
 }
 
 pub fn recycled_row_count(viewport_height: f32, zoom: f32, total_rows: usize) -> usize {

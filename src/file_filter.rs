@@ -162,6 +162,8 @@ mod tests {
             hidden: false,
             system: false,
             size,
+            total: None,
+            free: None,
             modified: None,
             created: None,
             kind: kind.into(),

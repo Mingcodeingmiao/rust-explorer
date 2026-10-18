@@ -22,6 +22,11 @@ pub struct Entry {
     #[serde(default)]
     pub system: bool,
     pub size: u64,
+    /// Portable-device storage capacity/free space (Shell properties).
+    #[serde(default)]
+    pub total: Option<u64>,
+    #[serde(default)]
+    pub free: Option<u64>,
     pub modified: Option<SystemTime>,
     #[serde(default)]
     pub created: Option<SystemTime>,
@@ -67,6 +72,8 @@ impl Entry {
                 metadata.file_attributes() & 4 != 0
             },
             size: metadata.len(),
+            total: None,
+            free: None,
             modified: metadata.modified().ok(),
             created: metadata.created().ok(),
             kind,

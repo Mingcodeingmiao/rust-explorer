@@ -214,7 +214,10 @@ struct Explorer {
     watch_pending: bool,
     content_scroll: ScrollHandle,
     home_scroll: ScrollHandle,
+    high_performance_row: std::cell::Cell<f32>,
+    high_performance_visible: std::cell::Cell<usize>,
     rows: Vec<DisplayRow>,
+    content_image_present: bool,
     thumbnails: rust_explorer::thumbnails::Loader,
     thumbnail_images: Entity<visual::ThumbnailImages>,
     thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
@@ -243,7 +246,9 @@ struct Explorer {
     drag_tx: mpsc::Sender<TabDrop>,
     own_window: Option<AnyWindowHandle>,
     tab_drag: Option<Arc<AtomicBool>>,
+    tab_tip: Option<crate::tab_tip::TabTip>,
     volumes: Vec<Volume>,
+    storage_volumes: Vec<Volume>,
     volume_busy: bool,
     volume_tick: Instant,
     volume_capacity_tick: Instant,
@@ -263,6 +268,7 @@ struct Explorer {
     device_groups: BTreeSet<String>,
     context_target: Option<PathBuf>,
     theme: Theme,
+    theme_tick: Instant,
     tabs: Vec<Tab>,
     active: usize,
     entries: Arc<Vec<Entry>>,
@@ -303,6 +309,10 @@ struct Explorer {
     address_scroll: ScrollHandle,
     address_bounds: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     recycled_rows: Vec<Entity<RecycledRow>>,
+    shell_names: HashMap<PathBuf, String>,
+    shell_chain: Vec<(String, PathBuf)>,
+    shell_clipboard: Option<(Vec<PathBuf>, bool)>,
+    shell_clipboard_seq: u32,
     list_scroll: ListState,
     zoom: f32,
     layout_width: f32,
@@ -435,17 +445,70 @@ impl Explorer {
                             }
                         }
                         let text = input.read(cx).value();
+                        this.editing_address = false;
+                        let typed = text.trim_matches('"').trim();
+                        // Portable-device addresses are Shell namespace paths,
+                        // not filesystem paths. Accept the displayed breadcrumb
+                        // path and the explicit mtp: / mtp:// forms.
+                        if let Some(hex) = typed.strip_prefix("mtp://") {
+                            this.address_candidates.clear();
+                            window.focus(&this.focus);
+                            this.navigate(PathBuf::from(format!("mtp:{hex}")), cx);
+                            return;
+                        }
+                        if typed.starts_with("mtp:") || typed.starts_with("mtp-root:") {
+                            this.address_candidates.clear();
+                            window.focus(&this.focus);
+                            this.navigate(PathBuf::from(typed), cx);
+                            return;
+                        }
+                        let portable_display = typed.contains('\\')
+                            && (typed.starts_with(&this.computer_name)
+                                || typed.starts_with("此电脑")
+                                || this.volumes.iter().any(|volume| {
+                                    volume.kind == 7 && typed.starts_with(&volume.label)
+                                }));
+                        if portable_display {
+                            this.address_candidates.clear();
+                            window.focus(&this.focus);
+                            let request = typed.to_string();
+                            let task = cx.background_executor().spawn(async move {
+                                let request = serde_json::to_string(&request).ok()?;
+                                volumes::bounded::<PathBuf>(
+                                    "--shell-resolve",
+                                    &request,
+                                    Duration::from_secs(5),
+                                )
+                                .ok()
+                            });
+                            cx.spawn(async move |view, cx| {
+                                let path = task.await;
+                                let _ = view.update(cx, |v, cx| match path {
+                                    Some(path) => v.navigate(path, cx),
+                                    None => {
+                                        v.error = Some("找不到这个便携设备目录".into());
+                                        cx.notify();
+                                    }
+                                });
+                            })
+                            .detach();
+                            return;
+                        }
                         let path = match text.trim_matches('"') {
                             "此电脑" => volumes::computer(),
                             text if text == this.computer_name => volumes::computer(),
                             "网络" => PathBuf::from("::Network"),
                             "库" => PathBuf::from("::Libraries"),
-                            text => PathBuf::from(text),
+                            text => {
+                                rust_explorer::path_completion::resolve_input(&this.dir(), text)
+                                    .unwrap_or_else(|| PathBuf::from(text))
+                            }
                         };
                         this.open_address_path(path, window, cx);
                     }
                     InputEvent::Cancel => {
                         this.editing_address = false;
+                        this.address_candidates.clear();
                         window.focus(&this.focus);
                         cx.notify();
                     }
@@ -548,7 +611,7 @@ impl Explorer {
             settings.quick_access_system_migrated = true;
             settings.enqueue_save();
         }
-        let view = settings
+        let mut view = settings
             .folder_views
             .get(&initial)
             .copied()
@@ -558,6 +621,9 @@ impl Explorer {
             } else {
                 settings.view
             });
+        if initial.to_string_lossy().starts_with("mtp-root:") {
+            view = ViewMode::Tiles;
+        }
         let this = Self {
             marquee: None,
             view,
@@ -578,12 +644,15 @@ impl Explorer {
             watch_pending: false,
             content_scroll: ScrollHandle::new(),
             home_scroll: ScrollHandle::new(),
+            high_performance_row: std::cell::Cell::new(0.),
+            high_performance_visible: std::cell::Cell::new(0),
             thumbnails: rust_explorer::thumbnails::Loader::new(),
             thumbnail_images: visual::ThumbnailImages::new(cx),
             thumbnail_viewport: std::cell::Cell::new(None),
             thumbnail_sync_queued: std::cell::Cell::new(false),
             hidden_breadcrumbs: std::cell::RefCell::new(Vec::new()),
             rows: vec![],
+            content_image_present: false,
             filters: Default::default(),
             filter_types: Vec::new(),
             filter_folder: PathBuf::new(),
@@ -610,7 +679,9 @@ impl Explorer {
             drag_tx,
             own_window: Some(window.window_handle()),
             tab_drag: None,
+            tab_tip: None,
             volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
+            storage_volumes: Vec::new(),
             volume_busy: false,
             volume_tick: Instant::now() - Duration::from_secs(10),
             volume_capacity_tick: Instant::now() - Duration::from_secs(60),
@@ -632,6 +703,7 @@ impl Explorer {
             hidden: settings.hidden,
             preview_open: settings.preview,
             theme: Theme::preference(&settings.theme),
+            theme_tick: Instant::now(),
             settings,
             tabs: vec![Tab {
                 id: next_tab_id(),
@@ -677,6 +749,10 @@ impl Explorer {
             address_scroll: ScrollHandle::new(),
             address_bounds: Default::default(),
             recycled_rows: vec![],
+            shell_names: HashMap::new(),
+            shell_chain: Vec::new(),
+            shell_clipboard: None,
+            shell_clipboard_seq: 0,
             list_scroll: ListState::new(0, ListAlignment::Top, px(160.)),
             zoom: 1.,
             layout_width: 0.,
@@ -708,6 +784,16 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
+                        // Windows performs live window moves on the UI thread.
+                        // Pause background polls/icon notifications while the
+                        // left button is held so they cannot force repaints
+                        // during a drag.
+                        if unsafe {
+                            windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(1)
+                        } < 0
+                        {
+                            return;
+                        }
                         this.refresh_quick_access(cx);
                         this.refresh_computer_name(cx);
                         if !this.volume_busy && this.volume_tick.elapsed() > Duration::from_secs(3)
@@ -765,10 +851,18 @@ impl Explorer {
                             this.watch_pending = false;
                             this.reload(cx);
                         }
-                        let theme = Theme::preference(&this.settings.theme);
-                        if theme.dark != this.theme.dark {
-                            this.theme = theme;
-                            cx.notify();
+                        // Registry reads are cheap individually but not at
+                        // animation-frame frequency; system theme polling is
+                        // low priority and can be throttled.
+                        if this.settings.theme == "system"
+                            && this.theme_tick.elapsed() >= Duration::from_secs(2)
+                        {
+                            this.theme_tick = Instant::now();
+                            let theme = Theme::system();
+                            if theme.dark != this.theme.dark {
+                                this.theme = theme;
+                                cx.notify();
+                            }
                         }
                     })
                     .is_err()
@@ -795,7 +889,10 @@ impl Explorer {
         self.tabs[self.active].history.current().to_path_buf()
     }
     fn is_home(&self) -> bool {
-        navigation::is_virtual(&self.dir()) && self.tabs[self.active].query.trim().is_empty()
+        navigation::is_app_virtual(&self.dir()) && self.tabs[self.active].query.trim().is_empty()
+    }
+    pub(crate) fn is_device_root(&self) -> bool {
+        self.dir().to_string_lossy().starts_with("mtp-root:")
     }
     fn invalidate_list(&self) {
         let offset = self.list_scroll.logical_scroll_top();
@@ -824,6 +921,11 @@ impl Explorer {
         } else if volumes::is_computer(&self.dir()) && !volumes::is_computer(&path) {
             self.group.clear();
         }
+        if path.to_string_lossy().starts_with("mtp-root:") {
+            // Portable-device roots show storage volumes like drive tiles.
+            self.view = ViewMode::Tiles;
+            self.group.clear();
+        }
         self.tabs[self.active].history.push(path);
         if self.settings.expand_current {
             self.expand_to_current(cx);
@@ -841,6 +943,10 @@ impl Explorer {
         self.usage_running = false;
         self.usage_enabled = false;
         self.inline_rename = None;
+        if self.settings.high_performance {
+            self.content_scroll.set_offset(point(px(0.), px(0.)));
+            self.high_performance_row.set(0.);
+        }
         self.dialog = None;
         self.popup = None;
         self.rename_token += 1;
@@ -850,16 +956,22 @@ impl Explorer {
         self.generation += 1;
         let generation = self.generation;
         let path = self.dir();
-        self.address.update(cx, |v, cx| {
-            v.set_value(
-                if navigation::is_virtual(&path) {
-                    navigation::location_name(&path)
-                } else {
-                    path.display().to_string()
-                },
-                cx,
-            )
-        });
+        if !navigation::is_shell_folder(&path) {
+            self.shell_chain.clear();
+        }
+        let address_value = if navigation::is_shell_folder(&path) {
+            self.shell_names
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| path.display().to_string())
+        } else if navigation::is_app_virtual(&path) {
+            navigation::location_name(&path)
+        } else {
+            path.display().to_string()
+        };
+        self.address
+            .update(cx, |v, cx| v.set_value(address_value, cx));
+        self.sync_search_placeholder(cx);
         self.loading = true;
         self.error = None;
         self.selected.clear();
@@ -869,7 +981,7 @@ impl Explorer {
         self.clear_preview();
         self.list_scroll.reset(0);
         let query = self.tabs[self.active].query.clone();
-        if navigation::is_virtual(&path) && query.trim().is_empty() {
+        if navigation::is_app_virtual(&path) && query.trim().is_empty() {
             self.loading = false;
             self.watcher = None;
             self.sync_computer_entries();
@@ -884,7 +996,8 @@ impl Explorer {
             cx.notify();
             return;
         }
-        let virtual_search = navigation::is_virtual(&path);
+        let shell_folder = navigation::is_shell_folder(&path);
+        let virtual_search = navigation::is_app_virtual(&path);
         let path = if virtual_search {
             PathBuf::from(format!(
                 "{}\\",
@@ -893,6 +1006,7 @@ impl Explorer {
         } else {
             path
         };
+        let result_path = path.clone();
         let global = self.tabs[self.active].global || virtual_search;
         let hidden = self.hidden;
         let protected = self.settings.protected;
@@ -902,6 +1016,28 @@ impl Explorer {
         let tx = self.watch_tx.clone();
         let task = cx.background_executor().spawn(async move {
             let result = (|| -> anyhow::Result<_> {
+                if shell_folder {
+                    let request = serde_json::to_string(&path)?;
+                    let listing: rust_explorer::shell_folder::Listing =
+                        volumes::bounded("--shell-list", &request, Duration::from_millis(8000))?;
+                    let mut entries = listing.entries;
+                    if !query.trim().is_empty() {
+                        let needle = query.to_lowercase();
+                        entries.retain(|entry| entry.name.to_lowercase().contains(&needle));
+                    }
+                    if !hidden {
+                        entries.retain(|entry| !entry.hidden);
+                    }
+                    if !protected {
+                        entries.retain(|entry| !entry.system);
+                    }
+                    fs::sort(&mut entries, sort, descending);
+                    if !folders_first {
+                        entries.sort_by(|a, b| compare_entries(a, b, sort, descending));
+                    }
+                    let status = format!("{} 个项目 · {}", entries.len(), listing.name);
+                    return Ok((entries, status, None, Some((listing.name, listing.parents))));
+                }
                 let (mut entries, status) = if query.trim().is_empty() {
                     let (items, skipped) = fs::read_directory(&path, &cancel)?;
                     let n = items.len();
@@ -956,7 +1092,7 @@ impl Explorer {
                         .ok()
                         .map(|_| w)
                 });
-                Ok((entries, status, watcher))
+                Ok((entries, status, watcher, None))
             })();
             result
         });
@@ -968,7 +1104,47 @@ impl Explorer {
                 }
                 this.loading = false;
                 match result {
-                    Ok((entries, status, watcher)) => {
+                    Ok((entries, status, watcher, shell_name)) => {
+                        if let Some((name, parents)) = shell_name {
+                            if !parents.is_empty() {
+                                this.shell_chain = parents;
+                            }
+                            for (parent_name, parent_path) in &this.shell_chain {
+                                this.shell_names
+                                    .insert(parent_path.clone(), parent_name.clone());
+                            }
+                            this.shell_names.insert(result_path.clone(), name.clone());
+                            let mut full_path = navigation::computer_name();
+                            if this.shell_chain.is_empty() {
+                                full_path.push('\\');
+                                full_path.push_str(&name);
+                            } else {
+                                for (parent_name, _) in &this.shell_chain {
+                                    full_path.push('\\');
+                                    full_path.push_str(parent_name);
+                                }
+                            }
+                            this.address
+                                .update(cx, |input, cx| input.set_value(full_path, cx));
+                            this.sync_search_placeholder(cx);
+                        }
+                        this.storage_volumes.clear();
+                        if result_path.to_string_lossy().starts_with("mtp-root:") {
+                            for entry in &entries {
+                                if let (Some(total), Some(free)) = (entry.total, entry.free) {
+                                    this.storage_volumes.push(Volume {
+                                        path: entry.path.clone(),
+                                        label: entry.name.clone(),
+                                        kind: 8,
+                                        total: Some(total),
+                                        free: Some(free),
+                                        filesystem: "MTP".into(),
+                                        remote: None,
+                                        read_only: false,
+                                    });
+                                }
+                            }
+                        }
                         this.entries = Arc::new(entries);
                         this.rebuild_rows();
                         if let Some(path) = this.pending_select.take() {
@@ -1208,6 +1384,17 @@ impl Explorer {
             self.open_entry_with(entry, disposition, cx);
         }
     }
+    /// Ctrl+double-click opens every selected file and opens every selected
+    /// folder in its own window. Ctrl+single-click keeps toggling selection.
+    fn open_tab_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        self.tabs.push(Tab {
+            id: next_tab_id(),
+            history: History::new(path),
+            query: String::new(),
+            global: false,
+        });
+        self.switch_tab(self.tabs.len() - 1, cx);
+    }
     fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
         let disposition = rust_explorer::open_target::folder_disposition(
             false,
@@ -1264,6 +1451,10 @@ impl Explorer {
         disposition: rust_explorer::open_target::OpenDisposition,
         cx: &mut Context<Self>,
     ) {
+        if entry.directory && rust_explorer::shell_folder::is_shell_path(&entry.path) {
+            self.shell_names
+                .insert(entry.path.clone(), entry.name.clone());
+        }
         if entry.directory && !entry.link {
             self.open_directory(entry.path, disposition, cx);
         } else if entry.link
@@ -1355,6 +1546,8 @@ impl Explorer {
                 | shell::Request::PermanentDelete { .. }
                 | shell::Request::Rename { .. }
                 | shell::Request::Shortcut { .. }
+                | shell::Request::Menu { .. }
+                | shell::Request::ThemedMenu { .. }
         );
         let passive = matches!(
             &request,
@@ -1365,6 +1558,7 @@ impl Explorer {
                 | shell::Request::Properties { .. }
                 | shell::Request::PropertiesMany { .. }
                 | shell::Request::SharingAccess { .. }
+                | shell::Request::AdvancedShare { .. }
         );
         if self.busy && !passive {
             return;
@@ -1391,6 +1585,9 @@ impl Explorer {
                 | shell::Request::Properties { .. }
                 | shell::Request::PropertiesMany { .. }
                 | shell::Request::SharingAccess { .. }
+                | shell::Request::AdvancedShare { .. }
+                | shell::Request::Menu { .. }
+                | shell::Request::ThemedMenu { .. }
         );
         let moving_paths = match &request {
             shell::Request::Copy {
@@ -1603,6 +1800,15 @@ impl Explorer {
         if self.busy {
             return;
         }
+        // The native MTP namespace menu is incomplete and can misbehave. Use
+        // the app-owned item menu for portable-device items even when the
+        // "full system menu" option is enabled.
+        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+            self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
+            self.submenu = None;
+            cx.notify();
+            return;
+        }
         if self
             .paths()
             .iter()
@@ -1621,7 +1827,7 @@ impl Explorer {
             if self.selected.is_empty() {
                 if self.dir() == PathBuf::from("::QuickAccess") {
                     "quick-background-menu"
-                } else if navigation::is_virtual(&self.dir()) {
+                } else if navigation::is_app_virtual(&self.dir()) {
                     "computer-menu"
                 } else {
                     "background-menu"
@@ -1636,6 +1842,12 @@ impl Explorer {
         cx.notify();
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
+        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+            self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
+            self.submenu = None;
+            cx.notify();
+            return;
+        }
         if volumes::is_computer(&self.dir()) && self.selected.is_empty() {
             let (x, y) = shell::cursor();
             self.context_target = Some(volumes::computer());
@@ -1650,7 +1862,7 @@ impl Explorer {
             );
             return;
         }
-        if navigation::is_virtual(&self.dir()) && self.selected.is_empty() {
+        if navigation::is_app_virtual(&self.dir()) && self.selected.is_empty() {
             self.popup = Some((
                 if self.dir() == PathBuf::from("::QuickAccess") {
                     "quick-background-menu"
@@ -1688,12 +1900,30 @@ impl Explorer {
                 group: self.group.clone(),
                 undo: !self.undo_stack.is_empty(),
                 redo: !self.redo_stack.is_empty(),
+                can_paste: self.can_paste(),
             },
             cx,
         );
     }
     fn copy(&mut self, cut: bool, cx: &mut Context<Self>) {
-        match shell::copy_to_clipboard(&self.paths(), cut) {
+        let paths = self.paths();
+        if paths
+            .iter()
+            .any(|path| rust_explorer::shell_folder::is_shell_path(path))
+        {
+            self.shell_clipboard = Some((paths, cut));
+            self.shell_clipboard_seq = shell::clipboard_sequence();
+            self.status = if cut {
+                "已剪切便携设备项目 · Ctrl+V 移动到目标文件夹"
+            } else {
+                "已复制便携设备项目 · Ctrl+V 粘贴"
+            }
+            .into();
+            cx.notify();
+            return;
+        }
+        self.shell_clipboard = None;
+        match shell::copy_to_clipboard(&paths, cut) {
             Ok(()) => {
                 self.status = if cut {
                     "已剪切 · Ctrl+V 移动到目标文件夹"
@@ -1706,8 +1936,47 @@ impl Explorer {
         }
         cx.notify();
     }
+    pub(crate) fn can_paste(&self) -> bool {
+        // The device storage selector is not a writable folder. The storage
+        // root itself is also intentionally not a paste target.
+        if self.is_device_root()
+            || (self.dir().to_string_lossy().starts_with("mtp:") && self.shell_chain.len() == 2)
+        {
+            return false;
+        }
+        self.shell_clipboard.is_some() || shell::has_file_clipboard()
+    }
     fn paste(&mut self, cx: &mut Context<Self>) {
-        if navigation::is_virtual(&self.dir()) {
+        // A native Shell Copy/Cut writes the system clipboard. If that happened
+        // after an MTP copy, the internal PIDL clipboard is stale and must not
+        // win over the files the user just copied from a traditional menu.
+        if self.shell_clipboard.is_some() && shell::clipboard_sequence() != self.shell_clipboard_seq
+        {
+            self.shell_clipboard = None;
+        }
+        if navigation::is_app_virtual(&self.dir()) || !self.can_paste() {
+            if self.is_device_root()
+                || (self.dir().to_string_lossy().starts_with("mtp:") && self.shell_chain.len() == 2)
+            {
+                self.status = "便携设备存储根目录不允许粘贴".into();
+            }
+            cx.notify();
+            return;
+        }
+        if let Some((paths, moving)) = self.shell_clipboard.clone() {
+            if !paths.is_empty() {
+                self.run_shell(
+                    shell::Request::Copy {
+                        paths,
+                        destination: self.dir(),
+                        moving,
+                    },
+                    cx,
+                );
+            }
+            if moving {
+                self.shell_clipboard = None;
+            }
             return;
         }
         match shell::paste_from_clipboard() {
@@ -1733,11 +2002,26 @@ impl Explorer {
         }
         let name = match &dialog {
             Dialog::RenameVolume { initial, .. } => initial.clone(),
-            Dialog::Rename(path) => path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .into_owned(),
+            Dialog::Rename(path) => {
+                if rust_explorer::shell_folder::is_shell_path(path) {
+                    self.selected
+                        .iter()
+                        .filter_map(|index| self.entries.get(*index))
+                        .find(|entry| &entry.path == path)
+                        .map(|entry| entry.name.clone())
+                        .unwrap_or_else(|| {
+                            path.file_name()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned()
+                        })
+                } else {
+                    path.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            }
             Dialog::NewFolder => "新建文件夹".into(),
             Dialog::Shortcut => String::new(),
             Dialog::Delete(_) | Dialog::PermanentDelete(_) | Dialog::Transfer { .. } => {
@@ -1940,7 +2224,18 @@ impl Explorer {
     fn delete_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let paths = self.paths();
         if !paths.is_empty() {
-            self.show_dialog(Dialog::Delete(paths), window, cx);
+            // MTP has no recycle bin, and many removable drives do not either.
+            // Confirm the irreversible path before the Shell operation starts.
+            let permanent = paths
+                .iter()
+                .any(|path| rust_explorer::shell_folder::is_shell_path(path))
+                || !shell::can_recycle(&paths);
+            let dialog = if permanent {
+                Dialog::PermanentDelete(paths)
+            } else {
+                Dialog::Delete(paths)
+            };
+            self.show_dialog(dialog, window, cx);
         }
     }
     fn new_tab(&mut self, cx: &mut Context<Self>) {
@@ -2170,14 +2465,25 @@ impl Explorer {
             .position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index))
                 || matches!(r, DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i == index))))
         {
-            let top = self.list_scroll.logical_scroll_top().item_ix;
-            let visible_rows = (self.layout_height / self.estimated_row_height()).ceil() as usize + 1;
-            // GPUI's reveal operation uses measured heights. Rows outside the
-            // viewport have no height yet, so anchor distant jumps by index.
-            if row < top || row >= top.saturating_add(visible_rows) {
-                self.list_scroll.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+            if self.high_performance_active() {
+                let top = self.high_performance_row.get().floor() as usize;
+                let visible_rows = self.high_performance_visible.get().max(1);
+                if row < top || row >= top.saturating_add(visible_rows) {
+                    self.set_high_performance_row(row as f32);
+                }
             } else {
-                self.list_scroll.scroll_to_reveal_item(row);
+                let top = self.list_scroll.logical_scroll_top().item_ix;
+                let visible_rows =
+                    (self.layout_height / self.estimated_row_height()).ceil() as usize + 1;
+                // GPUI's reveal operation uses measured heights. Rows outside
+                // the viewport have no height yet, so anchor distant jumps by
+                // index.
+                if row < top || row >= top.saturating_add(visible_rows) {
+                    self.list_scroll
+                        .scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+                } else {
+                    self.list_scroll.scroll_to_reveal_item(row);
+                }
             }
             if let DisplayRow::List(cells) = &self.rows[row] {
                 if let Some(column) = cells.iter().position(|c| matches!(c,ListCell::File(i) if *i == index)) {
@@ -2193,6 +2499,9 @@ impl Explorer {
         cx.notify();
     }
     fn update_address_candidates(&mut self, text: String, cx: &mut Context<Self>) {
+        let text = rust_explorer::path_completion::resolve_input(&self.dir(), &text)
+            .map(|path| path.to_string_lossy().into_owned())
+            .unwrap_or_default();
         self.address_generation = self.address_generation.wrapping_add(1);
         let generation = self.address_generation;
         self.address_candidates.clear();
@@ -2266,9 +2575,42 @@ impl Explorer {
         self.address_generation = self.address_generation.wrapping_add(1);
         self.address
             .update(cx, |v, cx| v.focus_select_all(window, cx));
+        self.address_candidates.clear();
         cx.notify();
     }
-
+    fn focus_address_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.editing_address = true;
+        self.address_choice = None;
+        self.address_generation = self.address_generation.wrapping_add(1);
+        self.address.update(cx, |v, cx| v.focus_end(window, cx));
+        self.address_candidates.clear();
+        cx.notify();
+    }
+    fn sync_search_placeholder(&self, cx: &mut Context<Self>) {
+        let dir = self.dir();
+        let scope = if navigation::is_shell_folder(&dir) {
+            self.shell_names
+                .get(&dir)
+                .cloned()
+                .unwrap_or_else(|| navigation::location_name(&dir))
+        } else if self.tabs[self.active].global {
+            if navigation::is_app_virtual(&dir) {
+                navigation::location_name(&dir)
+            } else {
+                let root = dir.ancestors().last().unwrap_or(&dir).to_path_buf();
+                self.volumes
+                    .iter()
+                    .find(|volume| volume.path == root)
+                    .map(|volume| volume.label.clone())
+                    .unwrap_or_else(|| navigation::location_name(&root))
+            }
+        } else {
+            navigation::location_name(&dir)
+        };
+        self.search.update(cx, |input, cx| {
+            input.set_placeholder(format!("在{scope}中搜索"), cx)
+        });
+    }
     fn change_zoom(&mut self, delta: f32, window: &mut Window, cx: &mut Context<Self>) {
         let offset = self.list_scroll.logical_scroll_top();
         self.zoom = if delta == 0. {
@@ -2378,13 +2720,23 @@ impl Render for Explorer {
             self.rename_dialog(window, cx);
         }
         if self.settings.full_path {
-            window.set_window_title(&if navigation::is_virtual(&self.dir()) {
+            let title = if navigation::is_shell_folder(&self.dir()) {
+                self.shell_names
+                    .get(&self.dir())
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(&self.dir()))
+            } else if navigation::is_app_virtual(&self.dir()) {
                 navigation::location_name(&self.dir())
             } else {
                 self.dir().display().to_string()
-            });
+            };
+            window.set_window_title(&title);
         } else {
-            window.set_window_title("Rust Explorer 0.6.4");
+            window.set_window_title(concat!(
+                "Rust Explorer ",
+                env!("CARGO_PKG_VERSION"),
+                " local integration"
+            ));
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 177.).max(100.);
         if (available - self.layout_width).abs() > 0.5
@@ -2468,7 +2820,8 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|v, action: &ChangeNumberedView, w, cx| {
                 if v.options.is_none() && v.dialog.is_none() && action.index < ViewMode::ALL.len() {
-                    v.view = ViewMode::ALL[action.index].0;
+                    let requested = ViewMode::ALL[action.index].0;
+                    v.view = requested;
                     v.settings.view = v.view;
                     if v.settings.remember_views {
                         v.settings.folder_views.insert(v.dir(), v.view);
@@ -2651,7 +3004,7 @@ impl Render for Explorer {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                v.search.update(cx, |v, cx| v.focus_select_all(w, cx))
+                v.search.update(cx, |v, cx| v.focus_select_all(w, cx));
             }))
             .on_action(cx.listener(|v, _: &Open, w, cx| {
                 if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
@@ -2911,6 +3264,8 @@ impl Render for Explorer {
                         let mut point = v.content_scroll.offset();
                         point.x = px(offset - delta * ratio);
                         v.content_scroll.set_offset(point);
+                    } else if v.high_performance_active() {
+                        v.set_high_performance_row(offset + delta * ratio);
                     } else {
                         v.set_list_scroll_row(offset + delta * ratio);
                     }
@@ -3031,48 +3386,68 @@ impl Render for Explorer {
             );
         root = root.child(self.render_tabs(window, cx));
 
+        // The navigation bar uses the active tab's fill color; the shorter row
+        // halves the vertical gap above and below the 32 px fields.
         let mut nav = div()
             .h(ui(rust_explorer::layout_metrics::ADDRESS_ROW_HEIGHT))
             .flex()
             .items_center()
             .gap_2()
             .px_3()
-            .bg(rgb(t.chrome));
+            .bg(rgb(t.input));
         for (id, label) in [
             ("back", "←"),
             ("forward", "→"),
             ("up", "↑"),
             ("refresh", "⟳"),
         ] {
-            nav = nav.child(button(id, label, t).on_click(cx.listener(
-                move |v, _, _, cx| match id {
-                    "back" => {
-                        if v.tabs[v.active].history.back() {
-                            v.reload(cx);
-                        }
+            let click = cx.listener(move |v, _, _, cx| match id {
+                "back" => {
+                    if v.tabs[v.active].history.back() {
+                        v.reload(cx);
                     }
-                    "forward" => {
-                        if v.tabs[v.active].history.forward() {
-                            v.reload(cx);
-                        }
+                }
+                "forward" => {
+                    if v.tabs[v.active].history.forward() {
+                        v.reload(cx);
                     }
-                    "up" => {
-                        if !navigation::is_virtual(&v.dir()) {
-                            let path = v
-                                .dir()
-                                .parent()
-                                .map(|p| p.to_path_buf())
-                                .unwrap_or_else(volumes::computer);
-                            v.navigate(path, cx);
-                        }
+                }
+                "up" => {
+                    if !navigation::is_virtual(&v.dir()) {
+                        let path = v
+                            .dir()
+                            .parent()
+                            .map(|p| p.to_path_buf())
+                            .unwrap_or_else(volumes::computer);
+                        v.navigate(path, cx);
                     }
-                    _ => v.reload(cx),
-                },
-            )));
+                }
+                _ => v.reload(cx),
+            });
+            nav = nav.child(if id == "refresh" {
+                // 80% of the original 32 px square, including the glyph.
+                div()
+                    .id(id)
+                    .w(ui(30.))
+                    .h(ui(25.6))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui(4.))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(rgb(t.hover)))
+                    .child(visual::icon_sized("refresh", t.text, 12.8))
+                    .on_click(click)
+            } else {
+                button(id, label, t).on_click(click)
+            });
         }
+        let address_width = (logical_width - 492.).max(80.);
         let address = if self.editing_address {
             let bounds = self.address_bounds.clone();
             div()
+                .relative()
                 .flex_1()
                 .relative()
                 .child(self.address.clone())
@@ -3083,26 +3458,9 @@ impl Render for Explorer {
                 )
                 .into_any_element()
         } else {
-            self.render_breadcrumbs((logical_width - 492.).max(80.), window, cx)
+            self.render_breadcrumbs(address_width, window, cx)
         };
-        let search_path = if self.tabs[self.active].global {
-            self.dir()
-                .ancestors()
-                .last()
-                .unwrap_or(&self.dir())
-                .to_path_buf()
-        } else {
-            self.dir()
-        };
-        let search_name = self
-            .volumes
-            .iter()
-            .find(|volume| volume.path == search_path)
-            .map(|volume| volume.label.clone())
-            .unwrap_or_else(|| navigation::location_name(&search_path));
-        self.search.update(cx, |input, _| {
-            input.set_placeholder(format!("在 {} 中搜索", search_name))
-        });
+        self.sync_search_placeholder(cx);
         nav = nav.child(address).child(
             div()
                 .w(ui(260.))
@@ -3111,7 +3469,7 @@ impl Render for Explorer {
                 .items_center()
                 .px_2()
                 .gap_2()
-                .bg(rgb(t.input))
+                .bg(rgb(t.panel))
                 .rounded(ui(4.))
                 .child(icon("\u{e721}", t.muted))
                 .child(self.search.clone()),
@@ -3147,10 +3505,16 @@ impl Render for Explorer {
                 button(id, "", t).child(visual::icon(id, t.text))
             };
             let enabled = match id {
-                "new-folder" | "paste" => !navigation::is_virtual(&self.dir()),
-                "rename" => self.selected.len() == 1 && !self.is_home(),
+                "new-folder" => !navigation::is_virtual(&self.dir()),
+                "paste" => self.can_paste(),
+                "rename" => {
+                    self.selected.len() == 1
+                        && !self.is_home()
+                        && !navigation::is_shell_folder(&self.dir())
+                }
                 "share" => {
                     self.selected.len() == 1
+                        && !navigation::is_shell_folder(&self.dir())
                         && self
                             .selected
                             .first()
@@ -3186,7 +3550,16 @@ impl Render for Explorer {
                                     v.run_shell(shell::Request::Share { paths: v.paths() }, cx);
                                 }
                             }
-                            _ => v.delete_dialog(w, cx),
+                            _ => {
+                                if id == "delete" && w.modifiers().shift {
+                                    let paths = v.paths();
+                                    if !paths.is_empty() {
+                                        v.show_dialog(Dialog::PermanentDelete(paths), w, cx);
+                                    }
+                                } else {
+                                    v.delete_dialog(w, cx);
+                                }
+                            }
                         }
                     })),
             );
@@ -3269,6 +3642,7 @@ impl Render for Explorer {
                 .when(self.toolbar_overflow.contains(&"global"), |d| d.hidden())
                 .on_click(cx.listener(|v, _, _, cx| {
                     v.tabs[v.active].global = !v.tabs[v.active].global;
+                    v.sync_search_placeholder(cx);
                     if !v.tabs[v.active].query.is_empty() {
                         v.reload(cx);
                     }
@@ -3301,7 +3675,7 @@ impl Render for Explorer {
             .flex()
             .flex_col()
             .relative();
-        if self.is_home() {
+        if self.is_home() || (self.is_device_root() && !self.storage_volumes.is_empty()) {
             content = content
                 .child(
                     div()
@@ -3346,38 +3720,122 @@ impl Render for Explorer {
             } else {
                 available
             };
+            let high_performance = self.high_performance_active();
+            let row_height = self.high_performance_row_height();
+            let header_height = if self.view == ViewMode::Details {
+                34.
+            } else {
+                0.
+            };
+            let viewport_height = (list_height - header_height).max(row_height);
+            let visible_rows = (viewport_height / row_height).floor().max(1.) as usize;
+            self.high_performance_visible.set(visible_rows);
+            if high_performance {
+                let current = self.high_performance_row.get();
+                self.high_performance_row
+                    .set(current.clamp(0., self.high_performance_max_row()));
+            }
             let mut table = div()
                 .id("table-viewport")
-                .overflow_x_scroll()
-                .track_scroll(&self.content_scroll)
                 .flex_1()
                 .min_h_0()
                 .flex()
                 .flex_col();
-            table.style().restrict_scroll_to_axis = Some(true);
-            if self.view == ViewMode::Details {
-                table = table.child(self.render_header(available, cx));
-            }
-            let list = list(
-                self.list_scroll.clone(),
-                cx.processor(move |this, index: usize, window, cx| {
-                    if this.recycled_rows.is_empty() {
-                        this.render_list_row(index, window, cx)
-                    } else {
-                        let slot = this.recycled_rows[index % this.recycled_rows.len()].clone();
-                        slot.update(cx, |row, _| {
-                            row.index = index;
-                        });
-                        slot.into_any_element()
+            let body: AnyElement;
+            if high_performance {
+                let first_row = self.high_performance_row.get().floor() as usize;
+                let mut scroller = div()
+                    .id("high-performance-scroll")
+                    .overflow_x_scroll()
+                    .track_scroll(&self.content_scroll)
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col();
+                scroller.style().restrict_scroll_to_axis = Some(true);
+                if self.view == ViewMode::Details {
+                    scroller = scroller.child(self.render_header(available, cx));
+                }
+                let mut pool = div()
+                    .id("high-performance-pool")
+                    .relative()
+                    .w(ui(table_width.max(available)))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .on_scroll_wheel(cx.listener(|v, e: &ScrollWheelEvent, _, cx| {
+                        if e.modifiers.control || e.modifiers.shift {
+                            return;
+                        }
+                        let delta = e.delta.pixel_delta(px(40.));
+                        let amount = if f32::from(delta.y).abs() > 0.1 {
+                            f32::from(delta.y)
+                        } else {
+                            f32::from(delta.x)
+                        };
+                        if amount != 0. {
+                            v.scroll_high_performance_by(-amount);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }
+                    }));
+                for slot in 0..visible_rows + 2 {
+                    let row = first_row + slot;
+                    if row >= self.rows.len() {
+                        break;
                     }
-                }),
-            )
-            .flex_1()
-            .min_h_0();
+                    pool = pool.child(
+                        div()
+                            .id(("high-performance-slot", slot))
+                            .absolute()
+                            .top(ui(slot as f32 * row_height))
+                            .left_0()
+                            .w_full()
+                            .h(ui(row_height))
+                            .overflow_hidden()
+                            .child({
+                                let retained =
+                                    self.recycled_rows[slot % self.recycled_rows.len()].clone();
+                                retained.update(cx, |state, _| {
+                                    state.index = row;
+                                });
+                                retained.into_any_element()
+                            }),
+                    );
+                }
+                body = scroller.child(pool).into_any_element();
+            } else {
+                table = table.overflow_x_scroll().track_scroll(&self.content_scroll);
+                table.style().restrict_scroll_to_axis = Some(true);
+                if self.view == ViewMode::Details {
+                    table = table.child(self.render_header(available, cx));
+                }
+                body = list(
+                    self.list_scroll.clone(),
+                    cx.processor(move |this, index: usize, window, cx| {
+                        if this.recycled_rows.is_empty() {
+                            this.render_list_row(index, window, cx)
+                        } else {
+                            let slot = this.recycled_rows[index % this.recycled_rows.len()].clone();
+                            slot.update(cx, |row, _| {
+                                row.index = index;
+                            });
+                            slot.into_any_element()
+                        }
+                    }),
+                )
+                .flex_1()
+                .min_h_0()
+                .into_any_element();
+            }
             table = table.child(
                 div()
                     .id("list-area")
-                    .w(ui(table_width.max(available)))
+                    .w(ui(if high_performance {
+                        available
+                    } else {
+                        table_width.max(available)
+                    }))
                     .flex_shrink_0()
                     .on_mouse_down(
                         MouseButton::Left,
@@ -3415,14 +3873,22 @@ impl Render for Explorer {
                         }),
                     )
                     .relative()
-                    .child(list)
+                    .child(body)
                     .child(self.list_wheel_guard(cx)),
             );
             content =
                 content
                     .child(table)
                     .child(self.horizontal_scrollbar(available, table_width, cx));
-            content = content.child(self.vertical_scrollbar(cx));
+            content = if high_performance {
+                content.child(self.high_performance_vertical_scrollbar(
+                    viewport_height,
+                    header_height,
+                    cx,
+                ))
+            } else {
+                content.child(self.vertical_scrollbar(cx))
+            };
             if self.entries.is_empty() {
                 content = content.child(
                     div()
