@@ -970,6 +970,9 @@ pub fn can_recycle(paths: &[PathBuf]) -> bool {
 pub fn has_file_clipboard() -> bool {
     unsafe { IsClipboardFormatAvailable(15).is_ok() }
 }
+pub fn clipboard_sequence() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
 pub fn copy_to_clipboard(paths: &[PathBuf], cut: bool) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -1571,6 +1574,13 @@ fn context_menu_options(
             }
             if matches!(verb.as_str(), "open" | "explore") && !paths.is_empty() {
                 println!("command:file-open");
+                return Ok(());
+            }
+            // The Shell copy/cut verbs can fail or leave an empty clipboard when
+            // invoked from this short-lived menu host. Write CF_HDROP ourselves
+            // so a traditional-menu Copy always lands on the Windows clipboard.
+            if matches!(verb.as_str(), "copy" | "cut") && !paths.is_empty() {
+                crate::shell::copy_to_clipboard(paths, verb == "cut")?;
                 return Ok(());
             }
             let mut info = CMINVOKECOMMANDINFOEX {

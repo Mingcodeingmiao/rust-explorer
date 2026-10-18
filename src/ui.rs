@@ -296,6 +296,7 @@ struct Explorer {
     shell_names: HashMap<PathBuf, String>,
     shell_chain: Vec<(String, PathBuf)>,
     shell_clipboard: Option<(Vec<PathBuf>, bool)>,
+    shell_clipboard_seq: u32,
     list_scroll: ListState,
     zoom: f32,
     layout_width: f32,
@@ -737,6 +738,7 @@ impl Explorer {
             shell_names: HashMap::new(),
             shell_chain: Vec::new(),
             shell_clipboard: None,
+            shell_clipboard_seq: 0,
             list_scroll: ListState::new(0, ListAlignment::Top, px(160.)),
             zoom: 1.,
             layout_width: 0.,
@@ -1831,6 +1833,7 @@ impl Explorer {
             .any(|path| rust_explorer::shell_folder::is_shell_path(path))
         {
             self.shell_clipboard = Some((paths, cut));
+            self.shell_clipboard_seq = shell::clipboard_sequence();
             self.status = if cut {
                 "已剪切便携设备项目 · Ctrl+V 移动到目标文件夹"
             } else {
@@ -1865,6 +1868,13 @@ impl Explorer {
         self.shell_clipboard.is_some() || shell::has_file_clipboard()
     }
     fn paste(&mut self, cx: &mut Context<Self>) {
+        // A native Shell Copy/Cut writes the system clipboard. If that happened
+        // after an MTP copy, the internal PIDL clipboard is stale and must not
+        // win over the files the user just copied from a traditional menu.
+        if self.shell_clipboard.is_some() && shell::clipboard_sequence() != self.shell_clipboard_seq
+        {
+            self.shell_clipboard = None;
+        }
         if navigation::is_app_virtual(&self.dir()) || !self.can_paste() {
             if self.is_device_root()
                 || (self.dir().to_string_lossy().starts_with("mtp:") && self.shell_chain.len() == 2)

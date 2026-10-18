@@ -37,7 +37,10 @@ impl IconRequest {
         // handlers. Portable-device child folders/files use generic stock icons
         // so a phone folder does not issue one slow Shell icon request each.
         let shell_root = path.to_string_lossy().starts_with("mtp-root:");
+        let custom_folder =
+            directory && path.is_absolute() && crate::system_icons::folder_has_custom_icon(path);
         let per_item = shell_root
+            || custom_folder
             || (path.is_absolute()
                 && matches!(
                     path.extension()
@@ -65,7 +68,10 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            epoch: if shell_root || (directory && path.has_root() && path.parent().is_none()) {
+            epoch: if shell_root
+                || custom_folder
+                || (directory && path.has_root() && path.parent().is_none())
+            {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()

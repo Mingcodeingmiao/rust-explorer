@@ -2,6 +2,15 @@
 
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
+## [Unreleased]
+
+### Fixed
+
+- The traditional Shell file menu now writes CF_HDROP directly for Copy/Cut, so copied files reliably reach the Windows clipboard instead of leaving it empty after the short-lived menu helper exits. Internal MTP clipboard state is invalidated when the system clipboard sequence changes.
+- Right-clicking any part of a file row now opens the file menu; previously right-clicking outside the filename could clear the selection and open the folder background menu.
+- The traditional background menu places Paste directly below Refresh.
+- Folders with a custom `desktop.ini` class or icon (for example `C:\Windows\Offline Web Pages`) are resolved through the Shell instead of the generic folder icon.
+
 ## [0.7.1] - 2026-10-18
 
 完整说明见 [docs/v0.7.1.md](docs/v0.7.1.md)。

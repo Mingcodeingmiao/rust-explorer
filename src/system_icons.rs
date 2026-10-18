@@ -57,6 +57,33 @@ impl Drop for Module {
     }
 }
 
+/// Folders can define a custom class/icon in desktop.ini (for example
+/// `C:\Windows\Offline Web Pages`). Only those folders need a per-item Shell
+/// lookup; ordinary folders keep the cheap cached stock folder icon.
+pub fn folder_has_custom_icon(path: &Path) -> bool {
+    let Ok(data) = std::fs::read(path.join("desktop.ini")) else {
+        return false;
+    };
+    let ascii = String::from_utf8_lossy(&data).to_ascii_lowercase();
+    if ["iconresource", "iconfile", "clsid="]
+        .iter()
+        .any(|needle| ascii.contains(needle))
+    {
+        return true;
+    }
+    if data.len() % 2 == 0 {
+        let units: Vec<u16> = data
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect();
+        let utf16 = String::from_utf16_lossy(&units).to_ascii_lowercase();
+        return ["iconresource", "iconfile", "clsid="]
+            .iter()
+            .any(|needle| utf16.contains(needle));
+    }
+    false
+}
+
 /// Obtain Explorer's associated file-type icon without reading normal files.
 /// Executables, shortcuts and .ico files retain their per-item Shell icon.
 pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> {
@@ -66,6 +93,11 @@ pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> 
         if shell_root {
             // Request the portable-device icon only for the device root; child
             // folders use the stock folder icon below.
+            if let Ok(icon) = shell_image(path, true, size, false) {
+                return Ok(icon);
+            }
+        }
+        if path.is_absolute() && folder_has_custom_icon(path) {
             if let Ok(icon) = shell_image(path, true, size, false) {
                 return Ok(icon);
             }

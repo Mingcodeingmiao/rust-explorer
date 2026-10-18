@@ -2461,7 +2461,6 @@ impl Explorer {
         let click_path = entry.path.clone();
         let drop_directory = entry.directory;
         let painted_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
-        let mouse_bounds = painted_bounds.clone();
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
@@ -2588,55 +2587,6 @@ impl Explorer {
                 cx.listener(move |v, e: &MouseUpEvent, w, cx| {
                     cx.stop_propagation();
                     v.rename_token += 1;
-                    if !v.selected.contains(&index)
-                        && matches!(v.view, ViewMode::Details | ViewMode::List | ViewMode::Small)
-                    {
-                        let (mut offset, mut width) = (0., cell_width);
-                        if v.view == ViewMode::Details {
-                            for (id, column_width) in &v.settings.columns {
-                                if id == "name" {
-                                    width = *column_width;
-                                    break;
-                                }
-                                offset += *column_width;
-                            }
-                        }
-                        let name = v.displayed_name(&v.entries[index]);
-                        let run = TextRun {
-                            len: name.len(),
-                            font: font("Microsoft YaHei UI"),
-                            color: rgb(v.theme.text).into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let text_width = f32::from(
-                            w.text_system()
-                                .shape_line(name.into(), px(13. * v.zoom), &[run], None)
-                                .width,
-                        ) / v.zoom;
-                        let check = if v.settings.checkboxes { 30. } else { 0. };
-                        let left = f32::from(mouse_bounds.get().origin.x)
-                            + (offset + 12. + check) * v.zoom;
-                        let right = left
-                            + (24. + text_width.min((width - 48. - check).max(0.)) + 6.) * v.zoom;
-                        if f32::from(e.position.x) < left - 4. * v.zoom
-                            || f32::from(e.position.x) > right
-                        {
-                            v.selected.clear();
-                            v.clear_preview();
-                            w.focus(&v.focus);
-                            if e.modifiers.shift {
-                                v.system_menu(cx);
-                                return;
-                            }
-                            v.menu(cx);
-                            if let Some((_, position)) = &mut v.popup {
-                                *position = e.position;
-                            }
-                            return;
-                        }
-                    }
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);
                     }

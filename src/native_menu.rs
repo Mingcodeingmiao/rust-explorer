@@ -156,22 +156,6 @@ pub(super) unsafe fn augment(
             position = start + 3;
         }
         if background {
-            builder.root(
-                menu,
-                position,
-                "粘贴(&P)\tCtrl+V",
-                "paste",
-                options.can_paste,
-            )?;
-            position += 1;
-            InsertMenuW(
-                menu,
-                position,
-                MF_BYPOSITION | MF_SEPARATOR,
-                0,
-                PCWSTR::null(),
-            )?;
-            position += 1;
             let views = Builder::submenu(menu, position, "查看(&V)")?;
             position += 1;
             for (index, label) in [
@@ -234,6 +218,14 @@ pub(super) unsafe fn augment(
                 )?;
             }
             builder.root(menu, position, "刷新(&E)", "refresh-folder", true)?;
+            position += 1;
+            builder.root(
+                menu,
+                position,
+                "粘贴(&P)\tCtrl+V",
+                "paste",
+                options.can_paste,
+            )?;
             position += 1;
         }
         if background || options.undo || options.redo {
