@@ -2775,11 +2775,7 @@ impl Render for Explorer {
             };
             window.set_window_title(&title);
         } else {
-            window.set_window_title(concat!(
-                "Rust Explorer ",
-                env!("CARGO_PKG_VERSION"),
-                " local integration"
-            ));
+            window.set_window_title(concat!("Rust Explorer ", env!("CARGO_PKG_VERSION")));
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 177.).max(100.);
         if (available - self.layout_width).abs() > 0.5

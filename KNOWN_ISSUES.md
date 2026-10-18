@@ -13,4 +13,4 @@ See the detailed [0.6.2 audit](docs/audit-0.6.2.md) for the distinction between 
 
 ## 本地候选版实机回归（2026-10-18）
 
-- Xiaomi 14 实测：MTP 多级向上导航、容量页、上传、下载和重命名通过。当前同一手机内部直接复制/移动由 Windows Shell 返回 `0x800700AA`（请求的资源正在使用中），重新连接后仍可复现。不要把此整合版的 MTP 全流程标记为已通过；正式发布暂缓，详见 `docs/mtp-tabs-validation-2026-10-18.md`。
+- Xiaomi 14 实测：MTP 多级向上导航、容量页、上传、下载和重命名通过。当前同一手机内部直接复制/移动由 Windows Shell 返回 `0x800700AA`（请求的资源正在使用中），重新连接后仍可复现。0.7.2 按预发布版披露此问题，不代表 MTP 全流程已通过；详见 `docs/mtp-tabs-validation-2026-10-18.md`。
