@@ -4,7 +4,7 @@ Notable changes are recorded here. Versions before 1.0 may change behavior and c
 
 ## 0.7.2 integration and validation
 
-PR #11 at `f929129` is integrated with the maintainer's changes. MTP parent navigation and light active-tab contrast are fixed. Formatting, 76 core tests and desktop compilation passed; device navigation, upload/download and rename were tested on Xiaomi 14. Same-device MTP copy/move remains a known ERROR_BUSY limitation. See [integration validation](docs/pr-11-integration-072.md) and [device validation](docs/mtp-tabs-validation-2026-10-18.md). Default-browser association remains deferred; the content first column uses 160 logical pixels (280 physical pixels at 175% DPI). Version 0.7.2 is published as a pre-release.
+PR #11 at `f929129` is integrated with the maintainer's changes. MTP parent navigation and light active-tab contrast are fixed. Formatting, 76 core tests and desktop compilation passed; device navigation, upload/download and rename were tested on Xiaomi 14. MTP/WPD transfers are documented as a device/protocol-path capability boundary: some paths require serialized I/O, and same-device copy/move may return ERROR_BUSY. See [integration validation](docs/pr-11-integration-072.md) and [device validation](docs/mtp-tabs-validation-2026-10-18.md). Default-browser association remains deferred; the content first column uses 160 logical pixels (280 physical pixels at 175% DPI). Version 0.7.2 is published as a pre-release.
 
 ## [0.7.2] - 2026-10-18
 
