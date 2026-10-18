@@ -30,6 +30,7 @@
 ## 验证记录
 
 - `scripts/check.ps1`：格式、75 项库测试、桌面全部目标编译全部通过。新增覆盖双方配置字段迁移、相对/环境路径，以及 GB18030/UTF-16 严格解码。
+- 最终 `cargo build --release --locked` 优化构建通过；打包程序已实际启动，输入相对前缀 A-，Down 选候选、Enter 成功进入 A-folder。最终包 stderr 无错误。
 - Windows 实际窗口，独立 LOCALAPPDATA 和专用临时文件夹，不使用日常配置。目录共 242 项。
 - 高性能详细信息：滚动后项目更新，Home/End 正确到达首项和 item-239.txt；选择对应正确。
 - Shift+Enter 新建 A-folder 标签；Ctrl+Enter 多选 A-folder/B-folder 后从一个窗口增加到三个，分别核对目标目录并关闭测试子窗口。
