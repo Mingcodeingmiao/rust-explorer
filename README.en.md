@@ -4,15 +4,15 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.6.4** is an early-stage release, primarily validated on Windows 11 x64. It does not claim full Explorer parity. Back up important files before trying new builds.
+Version **0.7.2 is a pre-release**, combining PR #11 with the maintainer's changes. See [integration validation](docs/pr-11-integration-072.md) and [MTP validation](docs/mtp-tabs-validation-2026-10-18.md). Same-device MTP copy/move can still fail with ERROR_BUSY. Default-folder associations remain deferred. It does not claim full Explorer parity.
 
 ## Features
 
 - Tabs, breadcrumbs, navigation history and keyboard shortcuts.
-- Eight views, adjustable columns, sorting, grouping, filters and marquee selection.
-- System Quick Access synchronization, resizable panes and drive capacity views.
-- Native clipboard/Shell operations, drag/drop confirmation and receipt-based undo/redo.
-- Actual Windows Shell menus for files, folders, drives and backgrounds.
+- Eight views, adjustable columns, sorting, grouping, filters and marquee selection; an optional fixed-pool high-performance mode falls back to the traditional implementation for unsupported views.
+- System Quick Access synchronization, resizable panes and drive capacity views. Portable/MTP devices support full breadcrumbs, tree expansion, storage-capacity pages, Shell copy/paste and context menus.
+- Native clipboard/Shell operations, drag/drop confirmation and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
+- Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
 - Light/dark/system themes, zoom, high-DPI icons and optional Everything integration.
 

@@ -29,6 +29,8 @@ actions!(
         Quit,
         Submit,
         Cancel,
+        SuggestPrevious,
+        SuggestNext,
     ]
 );
 
@@ -62,6 +64,12 @@ impl TextInput {
             compact: false,
         }
     }
+    fn suggest_previous(&mut self, _: &SuggestPrevious, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::Suggestion(-1));
+    }
+    fn suggest_next(&mut self, _: &SuggestNext, _: &mut Window, cx: &mut Context<Self>) {
+        cx.emit(InputEvent::Suggestion(1));
+    }
     pub fn value(&self) -> String {
         self.content.to_string()
     }
@@ -71,9 +79,20 @@ impl TextInput {
         self.marked_range = None;
         cx.notify();
     }
+    pub fn set_placeholder(&mut self, placeholder: String, cx: &mut Context<Self>) {
+        if self.placeholder.as_ref() == placeholder {
+            return;
+        }
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
     pub fn focus_select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.select_all(&SelectAll, window, cx);
+    }
+    pub fn focus_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        self.move_to(self.content.len(), cx);
     }
     pub fn focus_filename(&mut self, window: &mut Window, cx: &mut Context<Self>, directory: bool) {
         self.focus_select_all(window, cx);
@@ -666,6 +685,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::suggest_previous))
+            .on_action(cx.listener(Self::suggest_next))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -693,6 +714,7 @@ impl Focusable for TextInput {
 }
 
 pub enum InputEvent {
+    Suggestion(i32),
     Changed,
     Submit,
     Cancel,
@@ -700,6 +722,8 @@ pub enum InputEvent {
 impl gpui::EventEmitter<InputEvent> for TextInput {}
 pub fn init(cx: &mut App) {
     cx.bind_keys([
+        KeyBinding::new("up", SuggestPrevious, Some("TextInput")),
+        KeyBinding::new("down", SuggestNext, Some("TextInput")),
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("delete", Delete, Some("TextInput")),
         KeyBinding::new("left", Left, Some("TextInput")),

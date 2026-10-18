@@ -43,9 +43,12 @@ pub struct Settings {
     pub protected: bool,
     pub checkboxes: bool,
     pub compact: bool,
+    pub high_performance: bool,
     pub thumbnails: bool,
     pub wrap_names: bool,
     pub single_click: bool,
+    #[serde(alias = "shift_new_tab")]
+    pub shift_open_tab: bool,
     pub separate_process: bool,
     pub full_path: bool,
     pub preview: bool,
@@ -81,9 +84,11 @@ impl Default for Settings {
             protected: false,
             checkboxes: false,
             compact: false,
+            high_performance: false,
             thumbnails: true,
             wrap_names: true,
             single_click: false,
+            shift_open_tab: false,
             separate_process: false,
             full_path: false,
             preview: true,
@@ -248,6 +253,16 @@ fn normalize_volume_columns(columns: &mut Vec<(String, f32)>) {
 }
 #[cfg(test)]
 mod volume_column_tests {
+    #[test]
+    fn contributor_and_local_shift_settings_share_one_state() {
+        let contributor: super::Settings =
+            serde_json::from_str(r#"{"shift_new_tab":true}"#).unwrap();
+        let local: super::Settings = serde_json::from_str(r#"{"shift_open_tab":true}"#).unwrap();
+        assert!(contributor.shift_open_tab && local.shift_open_tab);
+        let saved = serde_json::to_value(contributor).unwrap();
+        assert!(saved.get("shift_new_tab").is_none());
+        assert_eq!(saved["shift_open_tab"], true);
+    }
     #[test]
     fn repairs_invalid_widths_and_preserves_independent_drive_columns() {
         let mut columns = vec![

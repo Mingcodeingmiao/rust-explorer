@@ -3,6 +3,26 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
+        Some("--shell-parent") => (|| -> anyhow::Result<()> {
+            let path: std::path::PathBuf =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::shell_folder::parent(&path)?)?
+            );
+            Ok(())
+        })(),
+        Some("--path-completions") => (|| -> anyhow::Result<()> {
+            let text: String = serde_json::from_str(
+                args.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("query missing"))?,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::path_completion::collect(&text)?)?
+            );
+            Ok(())
+        })(),
         Some("--open-target") => (|| -> anyhow::Result<()> {
             let path: std::path::PathBuf =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
@@ -28,6 +48,32 @@ fn main() {
             Ok(())
         })(),
         Some("--thumbnail-server") => rust_explorer::native_assets::thumbnail_server(),
+        Some("--shell-list") => (|| -> anyhow::Result<()> {
+            let raw = args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?;
+            let path: std::path::PathBuf =
+                serde_json::from_str(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::shell_folder::list(&path)?)?
+            );
+            Ok(())
+        })(),
+        Some("--shell-devices") => (|| -> anyhow::Result<()> {
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::shell_folder::device_paths()?)?
+            );
+            Ok(())
+        })(),
+        Some("--shell-resolve") => (|| -> anyhow::Result<()> {
+            let text: String =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::shell_folder::resolve_display_path(&text)?)?
+            );
+            Ok(())
+        })(),
         Some("--tree-metadata") => (|| -> anyhow::Result<()> {
             let request =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
@@ -93,6 +139,7 @@ fn main() {
 #[cfg(feature = "desktop")]
 mod input;
 #[cfg(feature = "desktop")]
+mod tab_tip;
 mod ui;
 #[cfg(feature = "desktop")]
 mod visual;

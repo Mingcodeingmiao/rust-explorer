@@ -2,6 +2,7 @@ use super::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::sync::atomic::AtomicU64;
+use unicode_segmentation::UnicodeSegmentation;
 
 thread_local! {static TAB_WINDOWS:RefCell<HashMap<isize,WeakEntity<Explorer>>>=RefCell::new(HashMap::new());}
 pub(super) struct TabDrop {
@@ -241,6 +242,7 @@ struct DragTab {
 }
 struct TabGhost {
     tab: Tab,
+    name: String,
     accepted: Arc<AtomicBool>,
     width: f32,
     theme: Theme,
@@ -259,7 +261,7 @@ impl Render for TabGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(ui(self.width))
-            .h(ui(36.))
+            .h(ui(32.4))
             .px_3()
             .flex()
             .items_center()
@@ -267,6 +269,7 @@ impl Render for TabGhost {
             .rounded_t(ui(7.))
             .bg(rgb(self.theme.input))
             .text_color(rgb(self.theme.text))
+            .text_size(ui(13. * 0.9))
             .child(visual::icon("folder", self.theme.text))
             .child(
                 div()
@@ -275,9 +278,9 @@ impl Render for TabGhost {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(navigation::location_name(self.tab.history.current())),
+                    .child(self.name.clone()),
             )
-            .child(visual::icon("close", self.theme.text))
+            .child(visual::icon_at("close", self.theme.text, 16. * 2. / 3.))
     }
 }
 
@@ -291,7 +294,7 @@ pub(super) fn open_explorer(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Rust Explorer 0.6.4".into()),
+                title: Some(format!("Rust Explorer {}", env!("CARGO_PKG_VERSION")).into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -301,6 +304,9 @@ pub(super) fn open_explorer(
             let view = cx.new(|cx| Explorer::new(w, cx));
             if let Some(hwnd) = native_hwnd(w) {
                 set_application_icon(hwnd);
+                if let Err(error) = rust_explorer::window_frame::install(hwnd) {
+                    eprintln!("{error:#}");
+                }
                 TAB_WINDOWS.with(|windows| {
                     windows.borrow_mut().insert(hwnd, view.downgrade());
                 });
@@ -334,6 +340,9 @@ pub(super) fn compare_entries(
     .then_with(|| fs::natural_cmp(&a.name, &b.name));
     if descending { value.reverse() } else { value }
 }
+fn is_image_entry(entry: &Entry) -> bool {
+    !entry.directory && matches!(rust_explorer::preview::kind(&entry.path), Kind::Image)
+}
 fn column_sort(id: &str) -> Sort {
     match id {
         "modified" => Sort::Modified,
@@ -354,7 +363,58 @@ fn column_label(id: &str, usage: bool) -> &'static str {
     }
 }
 fn wrapped(text: &str) -> String {
-    text.graphemes(true).collect::<Vec<_>>().join("\u{200b}")
+    text.to_owned()
+}
+pub(super) fn icon_label_lines(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    window: &Window,
+) -> Vec<String> {
+    rust_explorer::icon_layout::label_lines(text.graphemes(true), width.max(1.), 4, |line| {
+        let run = TextRun {
+            len: line.len(),
+            font: font("Microsoft YaHei UI"),
+            color: rgb(0).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(
+            window
+                .text_system()
+                .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
+                .width,
+        ) / scale
+    })
+}
+pub(super) fn icon_label(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    window: &Window,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .line_height(ui(20.))
+        .text_size(ui(font_size))
+        .children(
+            icon_label_lines(text, width, font_size, scale, window)
+                .into_iter()
+                .map(|line| {
+                    div()
+                        .h(ui(20.))
+                        .w_full()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(line)
+                }),
+        )
+        .into_any_element()
 }
 fn menu_icon(id: &str) -> Option<&'static str> {
     Some(if id.starts_with("view:") {
@@ -386,7 +446,10 @@ fn menu_icon(id: &str) -> Option<&'static str> {
             "submenu:sort-menu" => "sort",
             "pin" | "nav-pin" | "nav-unpin" => "pin",
             "copy-path" | "nav-copy-path" => "copy-path",
-            "select-all" | "select-none" | "select-invert" | "checkboxes" => "select-all",
+            "select-all" => "select-all",
+            "select-none" => "select-none",
+            "select-invert" => "invert-selection",
+            "checkboxes" => "checkbox",
             "properties" | "nav-properties" => "properties",
             "options" => "options",
             "preview-pane" | "details-pane" => "preview",
@@ -473,7 +536,7 @@ impl Explorer {
     pub(super) fn sync_thumbnails(&self) {
         let enabled = matches!(
             self.view,
-            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge
+            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge | ViewMode::Content
         ) && self.settings.thumbnails
             && !self.is_home()
             && !self.loading;
@@ -535,6 +598,34 @@ impl Explorer {
             _ => 34.,
         }
     }
+    /// High-performance mode keeps a fixed pool of row widgets and only
+    /// changes their data. Grouped lists use variable-height headers, so they
+    /// fall back to the regular measured virtual list.
+    pub(super) fn high_performance_active(&self) -> bool {
+        self.settings.high_performance
+            && self.group.is_empty()
+            && !self.is_home()
+            && matches!(
+                self.view,
+                ViewMode::Details | ViewMode::List | ViewMode::Small | ViewMode::Tiles
+            )
+    }
+    pub(super) fn high_performance_row_height(&self) -> f32 {
+        self.estimated_row_height().max(1.)
+    }
+    pub(super) fn high_performance_max_row(&self) -> f32 {
+        let visible = self.high_performance_visible.get().max(1);
+        self.rows.len().saturating_sub(visible) as f32
+    }
+    pub(super) fn set_high_performance_row(&self, row: f32) {
+        self.high_performance_row
+            .set(row.clamp(0., self.high_performance_max_row()));
+    }
+    pub(super) fn scroll_high_performance_by(&self, pixels: f32) {
+        let row_height = self.high_performance_row_height() * self.zoom;
+        let current = self.high_performance_row.get();
+        self.set_high_performance_row(current + pixels / row_height.max(1.));
+    }
     pub(super) fn set_list_scroll_row(&self, row: f32) {
         let height = self.estimated_row_height() * self.zoom;
         let visible = f32::from(self.list_scroll.viewport_bounds().size.height) / height;
@@ -564,6 +655,21 @@ impl Explorer {
                         return;
                     }
                     let _ = weak.update(cx, |v, cx| {
+                        if v.high_performance_active() && !e.modifiers.control && !e.modifiers.shift
+                        {
+                            let delta = e.delta.pixel_delta(px(40.));
+                            let amount = if f32::from(delta.y).abs() > 0.1 {
+                                f32::from(delta.y)
+                            } else {
+                                f32::from(delta.x)
+                            };
+                            if amount != 0. {
+                                v.scroll_high_performance_by(-amount);
+                                cx.stop_propagation();
+                                cx.notify();
+                                return;
+                            }
+                        }
                         if e.modifiers.control {
                             let delta = f32::from(e.delta.pixel_delta(px(40.)).y);
                             if v.view_wheel_remainder.signum() != delta.signum() {
@@ -764,7 +870,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty()
-            || navigation::is_virtual(&destination)
+            || navigation::is_app_virtual(&destination)
             || self.busy
             || self.options.is_some()
             || self.dialog.is_some()
@@ -801,7 +907,7 @@ impl Explorer {
             Some((path, true)) => Some(path),
             Some((_, false)) => None,
             None if self.content_scroll.bounds().contains(&position)
-                && !navigation::is_virtual(&self.dir()) =>
+                && !navigation::is_app_virtual(&self.dir()) =>
             {
                 Some(self.dir())
             }
@@ -915,6 +1021,55 @@ impl Explorer {
             }))
             .into_any_element()
     }
+    pub(super) fn high_performance_vertical_scrollbar(
+        &self,
+        height: f32,
+        top: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let total = self.rows.len() as f32;
+        let visible = self.high_performance_visible.get().max(1) as f32;
+        let max = (total - visible).max(0.);
+        if max <= 0.01 || height <= 1. || total <= 0. {
+            return div().into_any_element();
+        }
+        let physical_height = height * self.zoom;
+        let thumb = (physical_height * visible / total.max(1.))
+            .max(28. * self.zoom)
+            .min(physical_height);
+        let travel = (physical_height - thumb).max(1.);
+        let offset = self.high_performance_row.get().clamp(0., max);
+        let thumb_top = offset / max * travel;
+        let t = self.theme;
+        div()
+            .id("high-performance-scrollbar")
+            .absolute()
+            .right_0()
+            .top(ui(top))
+            .h(px(physical_height))
+            .w(ui(12.))
+            .bg(rgb(t.panel))
+            .child(
+                div()
+                    .id("high-performance-thumb")
+                    .absolute()
+                    .top(px(thumb_top))
+                    .left(ui(3.))
+                    .w(ui(6.))
+                    .h(px(thumb))
+                    .rounded(ui(3.))
+                    .bg(rgb(t.muted))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.scroll_drag =
+                                Some((false, e.position.y.into(), offset, max / travel));
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
     pub(super) fn vertical_scrollbar(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.view == ViewMode::List {
             return div().into_any_element();
@@ -975,7 +1130,24 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
-        let mut parts: Vec<(String, PathBuf)> = if navigation::is_virtual(&self.dir()) {
+        let mut parts: Vec<(String, PathBuf)> = if navigation::is_shell_folder(&self.dir()) {
+            let mut parts = vec![(navigation::computer_name(), volumes::computer())];
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, path)| path == &self.dir())
+            {
+                parts.extend(self.shell_chain.iter().cloned());
+            } else {
+                let label = self
+                    .shell_names
+                    .get(&self.dir())
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(&self.dir()));
+                parts.push((label, self.dir()));
+            }
+            parts
+        } else if navigation::is_app_virtual(&self.dir()) {
             vec![(navigation::location_name(&self.dir()), self.dir())]
         } else {
             let mut parts = vec![(navigation::computer_name(), volumes::computer())];
@@ -1015,14 +1187,18 @@ impl Explorer {
                 + 40.
         };
         let widths: Vec<_> = parts.iter().map(|(name, _)| measure(name)).collect();
-        let hidden = rust_explorer::breadcrumb_layout::hidden_prefix(&widths, available, 108.);
+        let hidden = rust_explorer::breadcrumb_layout::hidden_prefix(
+            &widths,
+            (available - 108.).max(0.),
+            48.,
+        );
         *self.hidden_breadcrumbs.borrow_mut() = parts.drain(..hidden).collect();
         let mut crumbs = div()
             .id("breadcrumbs")
             .flex_1()
             .min_w_0()
             .h(ui(32.))
-            .bg(rgb(t.input))
+            .bg(rgb(t.panel))
             .rounded(ui(4.))
             .flex()
             .items_center()
@@ -1030,18 +1206,19 @@ impl Explorer {
             .px_2()
             .overflow_hidden()
             .cursor_pointer()
-            .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
+            .on_click(cx.listener(|v, _, w, cx| v.focus_address_end(w, cx)));
+        crumbs = crumbs
+            .child(
+                div()
+                    .w(ui(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_center()
+                    .child(visual::icon("computer-outline", t.text)),
+            )
+            .child(visual::icon("chevron-right", t.muted));
         if hidden > 0 {
             crumbs = crumbs
-                .child(
-                    div()
-                        .w(ui(28.))
-                        .flex_shrink_0()
-                        .flex()
-                        .justify_center()
-                        .child(visual::icon("computer", t.text)),
-                )
-                .child(visual::icon("chevron-right", t.muted))
                 .child(
                     button("hidden-crumbs", "", t)
                         .w(ui(32.))
@@ -1070,14 +1247,13 @@ impl Explorer {
                     .id(("crumb", index))
                     .h_full()
                     .min_w_0()
-                    .max_w(ui((available - 90.).max(40.)))
+                    .max_w(ui((available - 160.).max(24.)))
                     .px_2()
                     .flex()
                     .items_center()
                     .rounded(ui(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(t.hover)))
-                    .when(index + 1 == n, |d| d.flex_1())
                     .when(index + 1 < n, |d| d.flex_shrink_0())
                     .child(
                         div()
@@ -1092,11 +1268,11 @@ impl Explorer {
                         v.navigate(path.clone(), cx);
                     })),
             );
-            if index + 1 < n {
-                crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
-            }
+            crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
         }
-        crumbs.into_any_element()
+        crumbs
+            .child(div().min_w(ui(64.)).h_full().flex_1())
+            .into_any_element()
     }
     pub(super) fn save_settings(&self, _: &mut Context<Self>) {
         self.settings.enqueue_save();
@@ -1104,6 +1280,7 @@ impl Explorer {
     pub(super) fn rebuild_rows(&mut self) {
         self.thumbnail_viewport.set(None);
         self.rows.clear();
+        self.content_image_present = false;
         if self.filter_folder != self.dir() {
             self.filter_folder = self.dir();
             self.filters = Default::default();
@@ -1129,6 +1306,7 @@ impl Explorer {
         let mut types = BTreeSet::new();
         for (index, e) in self.entries.iter().enumerate() {
             types.insert(e.kind.as_str());
+            self.content_image_present |= is_image_entry(e);
             if !self.filters.matches(e, self.entry_size(e), today) {
                 continue;
             }
@@ -1392,23 +1570,25 @@ impl Explorer {
         self.status = "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整".into();
         let task = cx.background_executor().spawn(async move {
             let mut skipped = 0;
+            let mut hits = 0;
             for e in entries.iter().filter(|e| e.directory) {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let usage = disk_usage::calculate(&e.path, &cancel);
+                let (usage, cached) = disk_usage::calculate_cached(&e.path, &cancel);
+                hits += usize::from(cached);
                 skipped += usage.skipped;
                 let _ = tx.send((generation, e.path.clone(), usage));
             }
-            skipped
+            (skipped, hits)
         });
         cx.spawn(async move |view, cx| {
-            let skipped = task.await;
+            let (skipped, hits) = task.await;
             let _ = view.update(cx, |v, cx| {
                 if v.generation == generation {
                     v.usage_running = false;
                     v.status = format!(
-                        "大小统计结束 · 逻辑字节 · 跳过 {skipped} 项（联接、挂载点或无权限）"
+                        "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
                     );
                     v.rebuild_rows();
                     cx.notify();
@@ -1542,7 +1722,8 @@ impl Explorer {
     }
     fn tab_drop_index(&self, x: f32) -> usize {
         let available = (self.window_width - 300.).max(110.);
-        let width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        let width = (available / self.tabs.len().max(1) as f32 - 4.)
+            .clamp(100., rust_explorer::layout_metrics::TAB_MAX_WIDTH);
         let arrows = if self.tabs.len() as f32 * (width + 4.) > available {
             24.
         } else {
@@ -1597,10 +1778,92 @@ impl Explorer {
             });
         }
     }
+    fn tab_full_path(&self, path: &std::path::Path) -> String {
+        if navigation::is_shell_folder(path) {
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, chain_path)| chain_path == path)
+            {
+                let mut out = navigation::computer_name();
+                for (name, _) in &self.shell_chain {
+                    out.push('\\');
+                    out.push_str(name);
+                }
+                out
+            } else {
+                self.shell_names
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(path))
+            }
+        } else if navigation::is_app_virtual(path) {
+            navigation::location_name(path)
+        } else {
+            path.display().to_string()
+        }
+    }
+    fn tab_short_path(&self, path: &std::path::Path) -> String {
+        let last = if navigation::is_shell_folder(path) {
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, chain_path)| chain_path == path)
+            {
+                self.shell_chain.last().map(|(name, _)| name.clone())
+            } else {
+                self.shell_names.get(path).cloned()
+            }
+        } else {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        };
+        last.map(|name| format!("..\\{name}"))
+            .unwrap_or_else(|| self.tab_full_path(path))
+    }
+    fn show_tab_tip(
+        &mut self,
+        path: PathBuf,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if !self.settings.full_path {
+            self.hide_tab_tip();
+            return;
+        }
+        let Some(hwnd) = native_hwnd(window) else {
+            return;
+        };
+        use windows::Win32::{
+            Foundation::{HWND, RECT},
+            UI::WindowsAndMessaging::GetWindowRect,
+        };
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(HWND(hwnd as _), &mut rect) }.is_err() {
+            return;
+        }
+        let scale = window.scale_factor();
+        let text = self.tab_full_path(&path);
+        let x = rect.left + (f32::from(bounds.left()) * scale).round() as i32;
+        let tab_top = rect.top + (f32::from(bounds.top()) * scale).round() as i32;
+        if self.tab_tip.is_none() {
+            self.tab_tip = crate::tab_tip::TabTip::new(scale, self.theme.dark);
+        }
+        if let Some(tip) = &mut self.tab_tip {
+            tip.show(&text, x, tab_top, scale);
+        }
+    }
+    fn hide_tab_tip(&mut self) {
+        if let Some(tip) = &self.tab_tip {
+            tip.hide();
+        }
+    }
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let available = (f32::from(window.viewport_size().width) / self.zoom - 300.).max(110.);
-        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.)
+            .clamp(100., rust_explorer::layout_metrics::TAB_MAX_WIDTH);
         let overflowing = self.tabs.len() as f32 * (tab_width + 4.) > available;
         let mut strip = div()
             .id("tab-strip")
@@ -1608,10 +1871,10 @@ impl Explorer {
             .min_w_0()
             .relative()
             .pr(ui(138.))
-            .h(ui(40.))
+            .h(ui(32.4))
             .flex_shrink_0()
             .flex()
-            .items_center()
+            .items_end()
             .bg(rgb(t.chrome));
         let mut tabs = div()
             .id("tabs-scroll")
@@ -1624,22 +1887,57 @@ impl Explorer {
             .gap_1()
             .px_2();
         for (index, tab) in self.tabs.iter().enumerate() {
-            let name = navigation::location_name(tab.history.current());
+            let current = tab.history.current();
+            let full_path = self.tab_full_path(current);
+            let name = if self.settings.full_path {
+                let short = self.tab_short_path(current);
+                let text_space = (tab_width - 84.).max(16.) * self.zoom;
+                let width = |text: &str| {
+                    let run = TextRun {
+                        len: text.len(),
+                        font: font("Microsoft YaHei UI"),
+                        color: rgb(t.text).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    f32::from(
+                        window
+                            .text_system()
+                            .shape_line(text.to_string().into(), px(11.7 * self.zoom), &[run], None)
+                            .width,
+                    )
+                };
+                if width(&full_path) <= text_space {
+                    full_path.clone()
+                } else {
+                    short
+                }
+            } else {
+                self.shell_names
+                    .get(current)
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(current))
+            };
             let drag = DragTab {
                 tab: tab.clone(),
                 source: cx.entity().downgrade(),
                 accepted: Arc::new(AtomicBool::new(false)),
             };
             let sender = self.drag_tx.clone();
+            let ghost_name = name.clone();
+            let tip_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let tip_bounds_canvas = tip_bounds.clone();
+            let tip_path = current.to_path_buf();
             tabs = tabs.child(
                 div()
                     .id(("tab", tab.id))
-                    .h(ui(36.))
+                    .h(ui(32.4))
                     .w(ui(tab_width))
                     .flex_shrink_0()
                     .rounded_t(ui(7.))
                     .bg(rgb(if index == self.active {
-                        t.input
+                        t.active_tab()
                     } else {
                         t.chrome
                     }))
@@ -1648,6 +1946,13 @@ impl Explorer {
                     .px_3()
                     .gap_2()
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |v, hovered, w, cx| {
+                        if *hovered {
+                            v.show_tab_tip(tip_path.clone(), tip_bounds.get(), w, cx);
+                        } else {
+                            v.hide_tab_tip();
+                        }
+                    }))
                     .on_click(cx.listener(move |v, _, _, cx| v.switch_tab(index, cx)))
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -1658,6 +1963,7 @@ impl Explorer {
                         let _ = drag.source.update(cx, |v, _| v.tab_drag = Some(flag));
                         cx.new(|_| TabGhost {
                             tab: drag.tab.clone(),
+                            name: ghost_name.clone(),
                             accepted: drag.accepted.clone(),
                             width: tab_width,
                             theme: t,
@@ -1680,20 +1986,35 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .text_size(ui(13. * 0.9))
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .text_ellipsis()
+                            .when(!self.settings.full_path, |d| d.text_ellipsis())
                             .child(name),
                     )
                     .child(
-                        button(("close-tab", tab.id), "×", t)
+                        button(("close-tab", tab.id), "", t)
+                            .child(visual::icon_at("close", t.text, 16. * 2. / 3.))
                             .w(ui(24.))
                             .px_1()
                             .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui(3.))
+                            .cursor_pointer()
                             .on_click(cx.listener(move |v, _, _, cx| {
                                 cx.stop_propagation();
                                 v.close_tab(index, cx);
                             })),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| tip_bounds_canvas.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
                     ),
             )
         }
@@ -1701,8 +2022,10 @@ impl Explorer {
             strip = strip.child(button("tabs-left", "‹", t).w(ui(24.)).px_1().on_click(
                 cx.listener(|v, _, _, cx| {
                     let offset = v.tab_scroll.offset();
-                    v.tab_scroll
-                        .set_offset(point(offset.x + px(200. * v.zoom), px(0.)));
+                    v.tab_scroll.set_offset(point(
+                        offset.x + px(rust_explorer::layout_metrics::TAB_MAX_WIDTH * v.zoom),
+                        px(0.),
+                    ));
                     cx.notify();
                 }),
             ));
@@ -1712,8 +2035,10 @@ impl Explorer {
             strip = strip.child(button("tabs-right", "›", t).w(ui(24.)).px_1().on_click(
                 cx.listener(|v, _, _, cx| {
                     let offset = v.tab_scroll.offset();
-                    v.tab_scroll
-                        .set_offset(point(offset.x - px(200. * v.zoom), px(0.)));
+                    v.tab_scroll.set_offset(point(
+                        offset.x - px(rust_explorer::layout_metrics::TAB_MAX_WIDTH * v.zoom),
+                        px(0.),
+                    ));
                     cx.notify();
                 }),
             ));
@@ -1723,7 +2048,10 @@ impl Explorer {
             .child(
                 div()
                     .id("caption-drag")
-                    .h_full()
+                    // Leave the top 4 px free of a drag hit region so the
+                    // native top resize border still works; the caption
+                    // buttons themselves remain flush with the window top.
+                    .h(ui(28.4))
                     .w(ui(64.))
                     .flex_1()
                     .min_w(ui(64.))
@@ -2033,13 +2361,15 @@ impl Explorer {
             .flex_shrink_0()
             .min_w_0()
             .line_height(ui(20.))
-            .when(expand, |d| {
-                d.whitespace_normal().text_ellipsis().line_clamp(4)
-            })
+            .when(expand, |d| d.whitespace_normal())
             .when(!expand, |d| {
                 d.whitespace_nowrap().overflow_hidden().text_ellipsis()
             })
-            .child(if expand { wrapped(&name) } else { name })
+            .child(if expand {
+                icon_label(&name, width, 13., self.zoom, window)
+            } else {
+                div().child(name).into_any_element()
+            })
             .on_drag(drag, move |drag, _, w, cx| {
                 let _ = source.update(cx, |v, cx| {
                     v.rename_token += 1;
@@ -2052,6 +2382,9 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if v.activate_file_item(index, e, cx) {
+                        return;
+                    }
                     let rename = v.selected.len() == 1
                         && v.selected.contains(&index)
                         && v.selected_at.elapsed() > Duration::from_millis(500)
@@ -2070,7 +2403,7 @@ impl Explorer {
                     }
                     if e.click_count == 2 || v.settings.single_click {
                         v.rename_token += 1;
-                        v.open_selected(cx);
+                        v.open_selected_with(e.modifiers, cx);
                     } else if rename {
                         let token = v.rename_token;
                         cx.spawn(async move |view, cx| {
@@ -2110,7 +2443,7 @@ impl Explorer {
             self.view,
             ViewMode::ExtraLarge | ViewMode::Large | ViewMode::Medium
         );
-        let rich = matches!(self.view, ViewMode::Tiles | ViewMode::Content);
+        let rich = self.view == ViewMode::Tiles;
         // Keep grid allocation stable, but paint each item's own content rectangle.
         let natural_name = self.displayed_name(entry);
         let run = TextRun {
@@ -2140,31 +2473,14 @@ impl Explorer {
             cell_width
         };
         let name_lines = if large {
-            let text = wrapped(&natural_name);
-            let run = TextRun {
-                len: text.len(),
-                font: font("Microsoft YaHei UI"),
-                color: rgb(t.text).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_text(
-                    text.into(),
-                    px(13. * self.zoom),
-                    &[run],
-                    Some(px((item_width - 24.).max(24.) * self.zoom)),
-                    Some(4),
-                )
-                .ok()
-                .and_then(|lines| {
-                    lines
-                        .first()
-                        .map(|line| (line.wrap_boundaries().len() + 1).min(4) as f32)
-                })
-                .unwrap_or(1.)
+            icon_label_lines(
+                &natural_name,
+                (item_width - 24.).max(24.),
+                13.,
+                self.zoom,
+                window,
+            )
+            .len() as f32
         } else {
             1.
         };
@@ -2177,7 +2493,6 @@ impl Explorer {
         let drop_path = entry.path.clone();
         let drop_directory = entry.directory;
         let painted_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
-        let mouse_bounds = painted_bounds.clone();
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
@@ -2205,6 +2520,7 @@ impl Explorer {
                 }))
                 .py_0()
             })
+            .when(self.view == ViewMode::Content, |d| d.h(ui(74.)).py_0())
             .flex()
             .items_center()
             .when(large, |d| {
@@ -2256,6 +2572,9 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if v.activate_file_item(index, e, cx) {
+                        return;
+                    }
                     if v.selected.contains(&index)
                         && !e.modifiers.shift
                         && e.click_count == 1
@@ -2266,7 +2585,7 @@ impl Explorer {
                         v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     }
                     if e.click_count == 2 || v.settings.single_click {
-                        v.open_selected(cx);
+                        v.open_selected_with(e.modifiers, cx);
                     }
                 }),
             )
@@ -2293,55 +2612,6 @@ impl Explorer {
                 cx.listener(move |v, e: &MouseUpEvent, w, cx| {
                     cx.stop_propagation();
                     v.rename_token += 1;
-                    if !v.selected.contains(&index)
-                        && matches!(v.view, ViewMode::Details | ViewMode::List | ViewMode::Small)
-                    {
-                        let (mut offset, mut width) = (0., cell_width);
-                        if v.view == ViewMode::Details {
-                            for (id, column_width) in &v.settings.columns {
-                                if id == "name" {
-                                    width = *column_width;
-                                    break;
-                                }
-                                offset += *column_width;
-                            }
-                        }
-                        let name = v.displayed_name(&v.entries[index]);
-                        let run = TextRun {
-                            len: name.len(),
-                            font: font("Microsoft YaHei UI"),
-                            color: rgb(v.theme.text).into(),
-                            background_color: None,
-                            underline: None,
-                            strikethrough: None,
-                        };
-                        let text_width = f32::from(
-                            w.text_system()
-                                .shape_line(name.into(), px(13. * v.zoom), &[run], None)
-                                .width,
-                        ) / v.zoom;
-                        let check = if v.settings.checkboxes { 30. } else { 0. };
-                        let left = f32::from(mouse_bounds.get().origin.x)
-                            + (offset + 12. + check) * v.zoom;
-                        let right = left
-                            + (24. + text_width.min((width - 48. - check).max(0.)) + 6.) * v.zoom;
-                        if f32::from(e.position.x) < left - 4. * v.zoom
-                            || f32::from(e.position.x) > right
-                        {
-                            v.selected.clear();
-                            v.clear_preview();
-                            w.focus(&v.focus);
-                            if e.modifiers.shift {
-                                v.system_menu(cx);
-                                return;
-                            }
-                            v.menu(cx);
-                            if let Some((_, position)) = &mut v.popup {
-                                *position = e.position;
-                            }
-                            return;
-                        }
-                    }
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);
                     }
@@ -2448,7 +2718,7 @@ impl Explorer {
                     row.child(checkbox(self, cx))
                 };
             }
-            let key = if large {
+            let key = if large || self.view == ViewMode::Content {
                 rust_explorer::thumbnails::Key::from_entry(
                     entry,
                     visual::thumbnail_pixels(self.view.icon_size()),
@@ -2505,48 +2775,138 @@ impl Explorer {
                         )
                     },
                 );
-            row = row.child(picture);
-            let name_width = (item_width
-                - 24.
-                - if large {
-                    0.
-                } else {
-                    self.view.icon_size() + 8.
-                }
-                - if self.settings.checkboxes && !large {
-                    30.
-                } else {
-                    0.
-                })
-            .max(24.);
-            let mut name = div()
-                .w(ui(name_width))
-                .flex_shrink_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .when(large, |d| d.w_full().text_center())
-                .child(self.name_element(index, entry, name_width, window, cx));
-            if rich {
-                name = name.child(
+            if self.view == ViewMode::Content {
+                let inner = (item_width - 24.).max(0.);
+                // 160 logical pixels = 280 physical pixels at 175% DPI.
+                let image = presentation.source_width > 0 && presentation.source_height > 0;
+                let (first, show_metadata) =
+                    rust_explorer::layout_metrics::content_columns(inner, image);
+                let text_width = (first - self.view.icon_size() - 8.).max(1.);
+                let metadata_width = (inner - first - 16.).clamp(1., 240.);
+                let image_width = (inner - first - metadata_width - 16.).max(1.);
+                let ellipsis = |text: String, width: f32| {
                     div()
-                        .text_color(rgb(t.muted))
-                        .text_size(ui(12.))
+                        .w(ui(width))
+                        .flex_shrink_0()
+                        .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
+                        .child(text)
+                };
+                let mut title = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.name_element(index, entry, text_width, window, cx));
+                if !entry.directory && !image {
+                    title = title.child(
+                        ellipsis(entry.kind.clone(), text_width)
+                            .text_color(rgb(t.muted))
+                            .text_size(ui(12.)),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .w(ui(first))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .child(picture)
+                        .child(title),
                 );
-                if self.view == ViewMode::Content {
+                if show_metadata {
+                    if image {
+                        row = row.child(
+                            div()
+                                .w(ui(image_width))
+                                .flex_shrink_0()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .text_size(ui(12.))
+                                .text_color(rgb(t.muted))
+                                .child(ellipsis(format!("类型：{}", entry.kind), image_width))
+                                .child(ellipsis(
+                                    format!(
+                                        "分辨率：{} x {}",
+                                        presentation.source_width, presentation.source_height
+                                    ),
+                                    image_width,
+                                )),
+                        );
+                    } else {
+                        row = row.child(div().flex_1());
+                    }
+                    let mut metadata = div()
+                        .w(ui(metadata_width))
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .text_size(ui(12.))
+                        .text_color(rgb(t.muted));
+                    if !image {
+                        metadata = metadata.child(ellipsis(
+                            format!("修改日期：{}", entry.date()),
+                            metadata_width,
+                        ));
+                    }
+                    if !entry.directory {
+                        metadata = metadata.child(ellipsis(
+                            format!("大小：{}", self.entry_size_text(entry)),
+                            metadata_width,
+                        ));
+                    }
+                    row = row.child(metadata);
+                }
+            } else {
+                row = row.child(picture);
+                let name_width = (item_width
+                    - 24.
+                    - if large {
+                        0.
+                    } else {
+                        self.view.icon_size() + 8.
+                    }
+                    - if self.settings.checkboxes && !large {
+                        30.
+                    } else {
+                        0.
+                    })
+                .max(24.);
+                let mut name = div()
+                    .w(ui(name_width))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(large, |d| d.w_full().text_center())
+                    .child(self.name_element(index, entry, name_width, window, cx));
+                if rich {
                     name = name.child(
                         div()
                             .text_color(rgb(t.muted))
                             .text_size(ui(12.))
-                            .child(format!("修改日期：{}", entry.date())),
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
                     );
+                    if self.view == ViewMode::Content {
+                        name = name.child(
+                            div()
+                                .text_color(rgb(t.muted))
+                                .text_size(ui(12.))
+                                .child(format!("修改日期：{}", entry.date())),
+                        );
+                    }
                 }
+                row = row.child(name);
             }
-            row = row.child(name);
         }
         let row = row
             .when(
@@ -2866,9 +3226,31 @@ impl Explorer {
                         .selected
                         .first()
                         .is_some_and(|i| self.entries[*i].directory);
+                if navigation::is_shell_folder(&self.dir()) {
+                    let single = self.selected.len() == 1;
+                    let mut items = vec![MenuItem::new("file-open", "打开")];
+                    if folder {
+                        items.push(MenuItem::new("file-tab", "在新标签页中打开"));
+                        items.push(MenuItem::new("file-window", "在新窗口中打开"));
+                    }
+                    items.push(MenuItem::separator());
+                    if folder {
+                        items.push(MenuItem::new("file-cut", "剪切"));
+                        items.push(MenuItem::new("file-copy", "复制"));
+                    } else {
+                        items.push(MenuItem::new("file-copy", "复制"));
+                        items.push(MenuItem::new("file-cut", "剪切"));
+                    }
+                    items.push(MenuItem::new("file-delete", "删除"));
+                    items.push(MenuItem::new("file-rename", "重命名").enable(single));
+                    items.push(MenuItem::separator());
+                    items.push(MenuItem::new("properties", "属性").enable(single));
+                    return items;
+                }
                 vec![
                     MenuItem::new("file-open", "打开"),
                     MenuItem::new("file-tab", "在新标签页中打开").enable(folder),
+                    MenuItem::new("file-window", "在新窗口中打开").enable(folder),
                     MenuItem::new("file-explorer", "在系统资源管理器中打开").enable(folder),
                     MenuItem::separator(),
                     MenuItem::new("file-cut", "剪切"),
@@ -2876,20 +3258,37 @@ impl Explorer {
                     MenuItem::new("file-rename", "重命名")
                         .enable(self.selected.len() == 1 && !navigation::is_virtual(&self.dir())),
                     MenuItem::new("file-delete", "删除")
-                        .enable(!navigation::is_virtual(&self.dir())),
+                        .enable(!navigation::is_app_virtual(&self.dir())),
                     MenuItem::new("copy-path", "复制路径"),
-                    MenuItem::new("pin", "固定到快速访问").enable(folder),
+                    MenuItem::new("pin", "固定到快速访问")
+                        .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
-                        .enable(folder),
+                        .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::separator(),
-                    MenuItem::new("properties", "属性"),
-                    MenuItem::new("system-menu", "显示完整系统菜单"),
+                    MenuItem::new("properties", "属性")
+                        .enable(!navigation::is_shell_folder(&self.dir())),
+                    MenuItem::new("system-menu", "显示完整系统菜单")
+                        .enable(!navigation::is_shell_folder(&self.dir())),
                 ]
             }
-            "access-menu" => vec![
-                MenuItem::new("remove-access", "删除访问权限（系统设置）…"),
-                MenuItem::new("grant-access", "特定用户…"),
-            ],
+            "access-menu" => {
+                let path = self
+                    .selected
+                    .iter()
+                    .next()
+                    .and_then(|index| self.entries.get(*index))
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_else(|| self.dir());
+                if path.has_root() && path.parent().is_none() {
+                    // Explorer exposes only Advanced Sharing at a drive root.
+                    vec![MenuItem::new("advanced-share", "高级共享…")]
+                } else {
+                    vec![
+                        MenuItem::new("remove-access", "删除访问权限（系统设置）…"),
+                        MenuItem::new("grant-access", "特定用户…"),
+                    ]
+                }
+            }
             "background-menu" => vec![
                 MenuItem::new("undo", "撤销    Ctrl+Z")
                     .enable(!self.undo_stack.is_empty() && !self.busy),
@@ -2901,13 +3300,16 @@ impl Explorer {
                 MenuItem::new("submenu:group", "分组依据                     ›"),
                 MenuItem::new("refresh-folder", "刷新"),
                 MenuItem::separator(),
-                MenuItem::new("file-paste", "粘贴"),
-                MenuItem::new("submenu:new-menu", "新建                         ›"),
+                MenuItem::new("file-paste", "粘贴").enable(self.can_paste()),
+                MenuItem::new("submenu:new-menu", "新建                         ›")
+                    .enable(!navigation::is_virtual(&self.dir())),
                 MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
                     .enable(!navigation::is_virtual(&self.dir())),
                 MenuItem::separator(),
-                MenuItem::new("properties", "属性"),
-                MenuItem::new("system-menu", "显示完整系统菜单"),
+                MenuItem::new("properties", "属性")
+                    .enable(!navigation::is_shell_folder(&self.dir())),
+                MenuItem::new("system-menu", "显示完整系统菜单")
+                    .enable(!navigation::is_shell_folder(&self.dir())),
             ],
             "quick-background-menu" => vec![
                 MenuItem::new("submenu:view-menu", "查看                         ›"),
@@ -2973,11 +3375,15 @@ impl Explorer {
                 {
                     items.push(MenuItem::new("nav-pin", "固定到快速访问"));
                 }
+                let shell_target = self
+                    .context_target
+                    .as_ref()
+                    .is_some_and(|path| navigation::is_shell_folder(path));
                 items.extend([
                     MenuItem::separator(),
                     MenuItem::new("nav-copy-path", "复制文件地址"),
-                    MenuItem::new("nav-properties", "属性"),
-                    MenuItem::new("nav-system-menu", "显示完整系统菜单"),
+                    MenuItem::new("nav-properties", "属性").enable(!shell_target),
+                    MenuItem::new("nav-system-menu", "显示完整系统菜单").enable(!shell_target),
                 ]);
                 items
             }
@@ -3063,11 +3469,15 @@ impl Explorer {
                         "cut" => MenuItem::new("file-cut", "剪切").enable(any),
                         "copy" => MenuItem::new("file-copy", "复制").enable(any),
                         "paste" => MenuItem::new("file-paste", "粘贴")
-                            .enable(!navigation::is_virtual(&self.dir())),
-                        "rename" => MenuItem::new("file-rename", "重命名")
-                            .enable(self.selected.len() == 1 && !self.is_home()),
+                            .enable(!navigation::is_app_virtual(&self.dir())),
+                        "rename" => MenuItem::new("file-rename", "重命名").enable(
+                            self.selected.len() == 1
+                                && !self.is_home()
+                                && !navigation::is_shell_folder(&self.dir()),
+                        ),
                         "share" => MenuItem::new("file-share", "共享").enable(
                             self.selected.len() == 1
+                                && !navigation::is_shell_folder(&self.dir())
                                 && self
                                     .selected
                                     .first()
@@ -3355,6 +3765,34 @@ impl Explorer {
             cx.notify();
             return;
         }
+        if id == "open-new-tab" || id == "open-new-window" {
+            let folders: Vec<PathBuf> = self
+                .selected
+                .iter()
+                .filter_map(|index| self.entries.get(*index))
+                .filter(|entry| entry.directory && !entry.link)
+                .map(|entry| entry.path.clone())
+                .collect();
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+            w.focus(&self.focus);
+            for path in folders {
+                if id == "open-new-tab" {
+                    self.open_tab_path(path, cx);
+                } else {
+                    let tab = Tab {
+                        id: next_tab_id(),
+                        history: History::new(path),
+                        query: String::new(),
+                        global: false,
+                    };
+                    let _ = open_explorer(Some(tab), cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         if let Some((column, option)) = id
             .strip_prefix("filter-option:")
             .and_then(|s| s.split_once(':'))
@@ -3447,6 +3885,7 @@ impl Explorer {
             if let Some((view, _)) = ViewMode::ALL.get(index) {
                 self.view = *view;
                 self.content_scroll.set_offset(point(px(0.), px(0.)));
+                self.high_performance_row.set(0.);
                 self.list_scroll.scroll_to(ListOffset::default());
                 self.settings.view = *view;
                 if self.settings.remember_views {
@@ -3527,6 +3966,7 @@ impl Explorer {
             "usage" => self.start_usage(cx),
             "global" => {
                 self.tabs[self.active].global = !self.tabs[self.active].global;
+                self.sync_search_placeholder(cx);
                 if !self.tabs[self.active].query.is_empty() {
                     self.reload(cx);
                 }
@@ -3547,26 +3987,57 @@ impl Explorer {
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
             }
+            "file-window" => {
+                let folders: Vec<PathBuf> = self
+                    .selected
+                    .iter()
+                    .filter_map(|index| self.entries.get(*index))
+                    .filter(|entry| entry.directory)
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                for path in folders {
+                    let tab = Tab {
+                        id: next_tab_id(),
+                        history: History::new(path),
+                        query: String::new(),
+                        global: false,
+                    };
+                    let _ = open_explorer(Some(tab), cx);
+                }
+            }
             "file-cut" => self.copy(true, cx),
             "file-copy" => self.copy(false, cx),
-            "file-paste" => self.paste(cx),
+            "file-paste" | "paste" => self.paste(cx),
             "file-rename" => self.rename_dialog(w, cx),
-            "file-delete" => self.delete_dialog(w, cx),
+            "file-delete" => {
+                if w.modifiers().shift {
+                    let paths = self.paths();
+                    if !paths.is_empty() {
+                        self.show_dialog(Dialog::PermanentDelete(paths), w, cx);
+                    }
+                } else {
+                    self.delete_dialog(w, cx);
+                }
+            }
             "system-menu" => self.system_menu(cx),
-            "grant-access" | "remove-access" => {
+            "grant-access" | "remove-access" | "advanced-share" => {
                 let path = self
                     .paths()
                     .into_iter()
                     .next()
                     .unwrap_or_else(|| self.dir());
                 if !navigation::is_virtual(&path) {
-                    self.run_shell(
-                        shell::Request::SharingAccess {
-                            path,
-                            remove: id == "remove-access",
-                        },
-                        cx,
-                    );
+                    if id == "advanced-share" {
+                        self.run_shell(shell::Request::AdvancedShare { path }, cx);
+                    } else {
+                        self.run_shell(
+                            shell::Request::SharingAccess {
+                                path,
+                                remove: id == "remove-access",
+                            },
+                            cx,
+                        );
+                    }
                 }
             }
             "refresh-folder" => self.reload(cx),
@@ -3660,6 +4131,7 @@ impl Explorer {
                                 group: self.group.clone(),
                                 undo: !self.undo_stack.is_empty(),
                                 redo: !self.redo_stack.is_empty(),
+                                can_paste: false,
                             },
                             cx,
                         );
@@ -3741,13 +4213,22 @@ impl Explorer {
             "properties" => {
                 let mut paths = self.paths();
                 if paths.is_empty() {
-                    if navigation::is_virtual(&self.dir()) {
+                    if navigation::is_app_virtual(&self.dir()) {
                         self.run_shell(shell::Request::SystemProperties, cx);
                         return;
                     }
                     paths.push(self.dir());
                 }
-                self.run_shell(shell::Request::PropertiesMany { paths }, cx);
+                if paths.len() == 1 && rust_explorer::shell_folder::is_shell_path(&paths[0]) {
+                    self.run_shell(
+                        shell::Request::Properties {
+                            path: paths.remove(0),
+                        },
+                        cx,
+                    );
+                } else {
+                    self.run_shell(shell::Request::PropertiesMany { paths }, cx);
+                }
             }
             "pin" => {
                 self.change_quick_access(self.paths(), true, cx);
@@ -3841,12 +4322,17 @@ impl Explorer {
     }
     fn apply_options(&mut self, close: bool, cx: &mut Context<Self>) {
         if let Some(settings) = self.options.clone() {
+            let view = if settings.view != self.settings.view {
+                settings.view
+            } else {
+                self.view
+            };
             self.settings = settings;
             self.theme = Theme::preference(&self.settings.theme);
             self.tree_children.clear();
             self.hidden = self.settings.hidden;
             self.preview_open = self.settings.preview;
-            self.view = self.settings.view;
+            self.view = view;
             self.save_settings(cx);
             self.reload(cx);
             if close {
@@ -3936,6 +4422,11 @@ impl Explorer {
                     settings.separate_process,
                 ),
                 (
+                    "shift-open-tab",
+                    "按住 Shift 打开文件夹时在新标签页中打开",
+                    settings.shift_open_tab,
+                ),
+                (
                     "remember",
                     "记住每个文件夹的查看方式",
                     settings.remember_views,
@@ -3956,6 +4447,11 @@ impl Explorer {
                 ("protected", "显示受保护的操作系统文件", settings.protected),
                 ("checkboxes", "使用复选框以便选择项目", settings.checkboxes),
                 (
+                    "high-performance",
+                    "高性能模式（一屏加缓冲；不适用于中等及以上图标）",
+                    settings.high_performance,
+                ),
+                (
                     "thumbnails",
                     "显示文件缩略图（中等图标及以上）",
                     settings.thumbnails,
@@ -3970,7 +4466,11 @@ impl Explorer {
                     "右键直接显示完整系统菜单",
                     settings.full_system_menu,
                 ),
-                ("full-path", "在窗口标题中显示完整路径", settings.full_path),
+                (
+                    "full-path",
+                    "在窗口标题栏和标签页中显示完整路径",
+                    settings.full_path,
+                ),
                 (
                     "preview",
                     "显示预览窗格（文本、照片、视频帧、PDF）",
@@ -4042,6 +4542,7 @@ impl Explorer {
                         if let Some(s) = &mut v.options {
                             match id {
                                 "single" => s.single_click = !s.single_click,
+                                "shift-open-tab" => s.shift_open_tab = !s.shift_open_tab,
                                 "separate" => s.separate_process = !s.separate_process,
                                 "remember" => s.remember_views = !s.remember_views,
                                 "folders-first" => s.folders_first = !s.folders_first,
@@ -4049,6 +4550,7 @@ impl Explorer {
                                 "hidden" => s.hidden = !s.hidden,
                                 "protected" => s.protected = !s.protected,
                                 "checkboxes" => s.checkboxes = !s.checkboxes,
+                                "high-performance" => s.high_performance = !s.high_performance,
                                 "compact" => s.compact = !s.compact,
                                 "thumbnails" => s.thumbnails = !s.thumbnails,
                                 "full-system-menu" => s.full_system_menu = !s.full_system_menu,

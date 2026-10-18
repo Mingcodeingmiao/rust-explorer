@@ -16,10 +16,22 @@ struct NavRow {
     icon: String,
 }
 fn special(path: &std::path::Path) -> bool {
-    path.to_string_lossy().starts_with("::")
+    path.to_string_lossy().starts_with("::") || rust_explorer::shell_folder::is_shell_path(path)
+}
+/// The application's own virtual pages, not Shell namespace folders.
+pub(super) fn is_app_virtual(path: &std::path::Path) -> bool {
+    matches!(
+        path.to_string_lossy().as_ref(),
+        "::ThisPC" | "::Network" | "::Libraries" | "::QuickAccess"
+    )
+}
+/// Portable devices and other Shell namespace folders need IShellItem
+/// enumeration instead of std::fs.
+pub(super) fn is_shell_folder(path: &std::path::Path) -> bool {
+    !is_app_virtual(path) && rust_explorer::shell_folder::is_shell_path(path)
 }
 pub(super) fn is_virtual(path: &std::path::Path) -> bool {
-    special(path)
+    is_app_virtual(path) || is_shell_folder(path)
 }
 pub(super) fn location_name(path: &std::path::Path) -> String {
     match path.to_string_lossy().as_ref() {
@@ -40,6 +52,8 @@ fn volume_type(volume: &Volume) -> &'static str {
         4 => "网络驱动器",
         5 => "光盘驱动器",
         6 => "RAM 磁盘",
+        7 => "便携设备",
+        8 => "便携设备存储",
         _ => "本地磁盘",
     }
 }
@@ -150,6 +164,7 @@ impl Explorer {
                     group: self.group.clone(),
                     undo: !self.undo_stack.is_empty(),
                     redo: !self.redo_stack.is_empty(),
+                    can_paste: false,
                 },
                 cx,
             );
@@ -196,7 +211,7 @@ impl Explorer {
             .scroll_to_item(self.nav_keyboard_index, ScrollStrategy::Center);
         cx.notify();
     }
-    fn navigate_tree(
+    pub(super) fn navigate_tree(
         &mut self,
         command: rust_explorer::nav_keyboard::Command,
         window: &mut Window,
@@ -247,7 +262,7 @@ impl Explorer {
                 {
                     self.run_shell(shell::Request::Open { path }, cx);
                 } else {
-                    self.navigate(path, cx);
+                    self.navigate_with_modifiers(path, window.modifiers(), cx);
                 }
             }
             Effect::None => {}
@@ -356,7 +371,12 @@ impl Explorer {
         }
         self.volume_busy = true;
         self.volume_tick = Instant::now();
-        let previous: Vec<_> = self.volumes.iter().map(|v| v.path.clone()).collect();
+        let previous: Vec<_> = self
+            .volumes
+            .iter()
+            .filter(|volume| volume.kind != 7)
+            .map(|v| v.path.clone())
+            .collect();
         let capacity = self.volume_capacity_tick.elapsed() > Duration::from_secs(30);
         let task = cx.background_executor().spawn(async move {
             if !capacity && volumes::roots() == previous {
@@ -376,6 +396,10 @@ impl Explorer {
                 cx.notify(); // Repaint even when capacity is unchanged so drive icon epochs refresh.
                 if v.volumes != volumes {
                     let anchor = v.navigation_anchor();
+                    for volume in volumes.iter().filter(|volume| volume.kind == 7) {
+                        v.shell_names
+                            .insert(volume.path.clone(), volume.label.clone());
+                    }
                     v.volumes = volumes;
                     if v.is_home() {
                         v.sync_computer_entries();
@@ -401,6 +425,8 @@ impl Explorer {
                     system: false,
                     link: false,
                     size: 0,
+                    total: None,
+                    free: None,
                     modified: None,
                     created: None,
                     kind: "文件夹".into(),
@@ -418,6 +444,8 @@ impl Explorer {
                     system: false,
                     link: false,
                     size: 0,
+                    total: None,
+                    free: None,
                     modified: None,
                     created: None,
                     kind: "库文件夹".into(),
@@ -442,12 +470,14 @@ impl Explorer {
                     system: false,
                     link: false,
                     size: volume.total.unwrap_or(0),
+                    total: volume.total,
+                    free: volume.free,
                     modified: None,
                     created: None,
-                    kind: if volume.kind == 4 {
-                        "网络位置"
-                    } else {
-                        "驱动器"
+                    kind: match volume.kind {
+                        4 => "网络位置",
+                        7 => "便携设备",
+                        _ => "驱动器",
                     }
                     .into(),
                 })
@@ -497,18 +527,41 @@ impl Explorer {
             return;
         }
         self.tree_loading.insert(path.clone());
+        let shell_path = navigation::is_shell_folder(&path);
         let request = volumes::TreeRequest {
             path: path.clone(),
             hidden: self.hidden,
             protected: self.settings.protected,
         };
         let task = cx.background_executor().spawn(async move {
-            volumes::bounded::<Vec<volumes::TreeEntry>>(
-                "--tree-metadata",
-                &serde_json::to_string(&request).unwrap(),
-                Duration::from_millis(1800),
-            )
-            .map_err(|e| e.to_string())
+            if shell_path {
+                let request = serde_json::to_string(&request.path).unwrap();
+                volumes::bounded::<rust_explorer::shell_folder::Listing>(
+                    "--shell-list",
+                    &request,
+                    Duration::from_millis(8000),
+                )
+                .map(|listing| {
+                    listing
+                        .entries
+                        .into_iter()
+                        .filter(|entry| entry.directory)
+                        .map(|entry| volumes::TreeEntry {
+                            name: entry.name,
+                            path: entry.path,
+                            hidden: entry.hidden,
+                        })
+                        .collect()
+                })
+                .map_err(|e| e.to_string())
+            } else {
+                volumes::bounded::<Vec<volumes::TreeEntry>>(
+                    "--tree-metadata",
+                    &serde_json::to_string(&request).unwrap(),
+                    Duration::from_millis(1800),
+                )
+                .map_err(|e| e.to_string())
+            }
         });
         cx.spawn(async move |view, cx| {
             let children = task.await;
@@ -571,7 +624,7 @@ impl Explorer {
             }
         } else if !self.tree_open.remove(&path) {
             self.tree_open.insert(path.clone());
-            if !special(&path) {
+            if !special(&path) || navigation::is_shell_folder(&path) {
                 self.load_tree(path, cx);
             }
         }
@@ -841,7 +894,7 @@ impl Explorer {
                                 let drop_bounds = this.file_drop_bounds.clone();
                                 div()
                                     .id(("nav", index))
-                                    .w_full()
+                                    .w(ui((width - 20.).max(100.)))
                                     .h(ui(row_height))
                                     .pl(ui(3. + row.depth as f32 * 16.))
                                     .pr_2()
@@ -946,7 +999,14 @@ impl Explorer {
                                             .text_ellipsis()
                                             .child(row.label.clone()),
                                     )
-                                    .when(pinned, |d| d.child(visual::icon("pin", t.muted)))
+                                    .when(pinned, |d| {
+                                        d.child(
+                                            div()
+                                                // Keep the pin clear of the overlay scrollbar.
+                                                .pr(ui(10.))
+                                                .child(visual::icon("pin", t.muted)),
+                                        )
+                                    })
                                     .when(
                                         !pinned
                                             && this
@@ -956,6 +1016,7 @@ impl Explorer {
                                         |d| {
                                             d.child(
                                                 div()
+                                                    .pr(ui(10.))
                                                     .opacity(0.45)
                                                     .child(visual::icon("pin", t.muted)),
                                             )
@@ -974,7 +1035,11 @@ impl Explorer {
                                                     cx,
                                                 );
                                             } else {
-                                                v.navigate(path.clone(), cx);
+                                                v.navigate_with_modifiers(
+                                                    path.clone(),
+                                                    window.modifiers(),
+                                                    cx,
+                                                );
                                             }
                                         }),
                                     )
@@ -1013,6 +1078,8 @@ impl Explorer {
         index: usize,
         volume: &Volume,
         width: f32,
+        window: &Window,
+        volume_columns: &[(String, f32)],
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
@@ -1034,7 +1101,7 @@ impl Explorer {
         } else if content {
             64.
         } else if tiles {
-            40.
+            rust_explorer::layout_metrics::DRIVE_TILE_ICON
         } else {
             48.
         };
@@ -1052,15 +1119,14 @@ impl Explorer {
             }
             _ => 0.,
         };
-        let capacity = volume.total.is_some_and(|n| n > 0)
-            && volume.free.is_some_and(|n| n > 0)
-            && !volume.read_only;
+        let capacity = volume.total.is_some_and(|n| n > 0) && volume.free.is_some();
         let space = match (volume.total, volume.free) {
             (Some(total), Some(free)) => format!(
                 "{} 可用，共 {}",
                 fs::size_label(free),
                 fs::size_label(total)
             ),
+            _ if volume.kind == 7 => "便携设备 / MTP".into(),
             _ => volume
                 .remote
                 .clone()
@@ -1084,9 +1150,9 @@ impl Explorer {
             .when(!details && !tiles, |d| d.p_2().gap_2())
             .when(tiles, |d| {
                 d.h(ui(rust_explorer::layout_metrics::DRIVE_TILE_HEIGHT))
-                    .px_2()
+                    .px_1()
                     .py_1()
-                    .gap_2()
+                    .gap(ui(rust_explorer::layout_metrics::DRIVE_TILE_GAP))
                     .overflow_hidden()
             })
             .when(details, |d| {
@@ -1154,7 +1220,7 @@ impl Explorer {
                     cx.stop_propagation();
                     v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     if e.click_count == 2 || v.settings.single_click {
-                        v.navigate(path.clone(), cx);
+                        v.navigate_with_modifiers(path.clone(), e.modifiers, cx);
                     }
                 }),
             )
@@ -1174,7 +1240,7 @@ impl Explorer {
             );
         if details {
             let kind = volume_type(volume);
-            for (key, cell) in &self.settings.volume_columns {
+            for (key, cell) in volume_columns {
                 let value = match key.as_str() {
                     "name" => volume.label.clone(),
                     "kind" => kind.into(),
@@ -1191,12 +1257,11 @@ impl Explorer {
                     .items_center()
                     .min_w_0();
                 if key == "name" {
-                    field = field.gap_2().child(visual::file_icon_sized(
-                        &volume.path,
-                        true,
-                        t.text,
-                        size,
-                    ));
+                    field = field.gap_2().child(if volume.kind == 8 {
+                        visual::icon_sized("drive", t.text, size)
+                    } else {
+                        visual::file_icon_sized(&volume.path, true, t.text, size)
+                    });
                 }
                 if key == "total" || key == "free" {
                     field = field.justify_end();
@@ -1204,7 +1269,11 @@ impl Explorer {
                 row = row.child(field.child(label(value).min_w_0()));
             }
         } else {
-            row = row.child(visual::file_icon_sized(&volume.path, true, t.text, size));
+            row = row.child(if volume.kind == 8 {
+                visual::icon_sized("drive", t.text, size)
+            } else {
+                visual::file_icon_sized(&volume.path, true, t.text, size)
+            });
             let mut text = div()
                 .min_w_0()
                 .flex()
@@ -1214,25 +1283,17 @@ impl Explorer {
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
                 .child(if grid {
-                    div()
-                        .w_full()
-                        .whitespace_normal()
-                        .text_ellipsis()
-                        .line_clamp(4)
-                        .line_height(ui(20.))
-                        .text_size(ui(match mode {
+                    icon_label(
+                        &volume.label,
+                        (width - 16.).max(24.),
+                        match mode {
                             ViewMode::ExtraLarge => 15.,
                             ViewMode::Large => 14.,
                             _ => 13.,
-                        }))
-                        .child(
-                            volume
-                                .label
-                                .graphemes(true)
-                                .collect::<Vec<_>>()
-                                .join("\u{200b}"),
-                        )
-                        .into_any_element()
+                        },
+                        self.zoom,
+                        window,
+                    )
                 } else {
                     label(volume.label.clone())
                         .text_size(ui(13.))
@@ -1243,13 +1304,16 @@ impl Explorer {
                     text = text.child(
                         div()
                             .h(ui(if content {
-                                20.
+                                24.
                             } else if tiles {
-                                12.
+                                rust_explorer::layout_metrics::DRIVE_TILE_BAR_HEIGHT
                             } else {
-                                16.
+                                19.2
                             }))
                             .w_full()
+                            .when(tiles, |d| {
+                                d.w(ui(rust_explorer::layout_metrics::DRIVE_TILE_BAR_WIDTH))
+                            })
                             .border_1()
                             .border_color(rgb(0xbcbcbc))
                             .bg(rgb(0xe6e6e6))
@@ -1263,7 +1327,7 @@ impl Explorer {
                 text = text.child(
                     label(space)
                         .text_size(ui(12.))
-                        .text_color(rgb(t.muted))
+                        .text_color(rgb(if tiles && t.dark { t.text } else { t.muted }))
                         .when(tiles, |d| d.line_height(ui(14.))),
                 );
                 if content || volume.kind == 5 {
@@ -1287,7 +1351,14 @@ impl Explorer {
         }
         row.into_any_element()
     }
-    fn render_volume_views(&self, mut body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_volume_views(
+        &self,
+        mut body: Stateful<Div>,
+        window: &Window,
+        volumes: &[Volume],
+        volume_columns: &[(String, f32)],
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = self.theme;
         let list = self.view == ViewMode::List;
         let details = self.view == ViewMode::Details;
@@ -1296,27 +1367,20 @@ impl Explorer {
             ViewMode::ExtraLarge | ViewMode::Large | ViewMode::Medium
         );
         let available = (self.layout_width - 20.).max(120.);
-        let table_width: f32 = self
-            .settings
-            .volume_columns
-            .iter()
-            .map(|(_, width)| *width)
-            .sum();
+        let table_width: f32 = volume_columns.iter().map(|(_, width)| *width).sum();
         let grouped = !self.group.is_empty();
         let mut groups: Vec<(String, Vec<(usize, &Volume)>)> = vec![];
         let drive_entries: Vec<_> = self.entries.iter().enumerate().collect();
         for (index, entry) in drive_entries {
-            let Some(volume) = self.volumes.iter().find(|v| v.path == entry.path) else {
+            let Some(volume) = volumes.iter().find(|v| v.path == entry.path) else {
                 continue;
             };
             let title = match self.group.as_str() {
-                "kind" => {
-                    if volume.kind == 4 {
-                        "网络位置".into()
-                    } else {
-                        "设备和驱动器".into()
-                    }
-                }
+                "kind" => match volume.kind {
+                    4 => "网络位置".into(),
+                    7 => "便携设备".into(),
+                    _ => "设备和驱动器".into(),
+                },
                 "name" => volume
                     .label
                     .chars()
@@ -1349,10 +1413,10 @@ impl Explorer {
                 .flex_shrink_0()
                 .border_b_1()
                 .border_color(rgb(t.border));
-            for (index, (key, width)) in self.settings.volume_columns.iter().enumerate() {
+            for (index, (key, width)) in volume_columns.iter().enumerate() {
                 let label = match key.as_str() {
                     "kind" => "\u{7c7b}\u{578b}",
-                    "total" => "\u{603b}\u{5927}\u{5c0f}",
+                    "total" => "\u{603b}\u{7a7a}\u{95f4}",
                     "free" => "\u{53ef}\u{7528}\u{7a7a}\u{95f4}",
                     _ => "\u{540d}\u{79f0}",
                 };
@@ -1519,7 +1583,14 @@ impl Explorer {
                         d.flex_col()
                     });
                 for (index, volume) in items {
-                    content = content.child(self.volume_item(index, volume, width, cx));
+                    content = content.child(self.volume_item(
+                        index,
+                        volume,
+                        width,
+                        window,
+                        volume_columns,
+                        cx,
+                    ));
                 }
                 section = section.child(content);
             }
@@ -1540,7 +1611,7 @@ impl Explorer {
         body.into_any_element()
     }
 
-    pub(super) fn render_computer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_computer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let mut body = div()
             .id("computer-home")
@@ -1717,11 +1788,28 @@ impl Explorer {
                 body = body.child(
                     button(("library", index), e.name.clone(), t)
                         .justify_start()
-                        .on_click(cx.listener(move |v, _, _, cx| v.navigate(path.clone(), cx))),
+                        .on_click(cx.listener(move |v, _, window, cx| {
+                            v.navigate_with_modifiers(path.clone(), window.modifiers(), cx)
+                        })),
                 );
             }
             return body.into_any_element();
         }
-        self.render_volume_views(body, cx)
+        if self.is_device_root() && !self.storage_volumes.is_empty() {
+            let columns = vec![
+                ("name".to_string(), 300.),
+                ("kind".to_string(), 160.),
+                ("free".to_string(), 160.),
+                ("total".to_string(), 160.),
+            ];
+            return self.render_volume_views(body, window, &self.storage_volumes, &columns, cx);
+        }
+        self.render_volume_views(
+            body,
+            window,
+            &self.volumes,
+            &self.settings.volume_columns,
+            cx,
+        )
     }
 }
