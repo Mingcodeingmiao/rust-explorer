@@ -2498,6 +2498,49 @@ impl Explorer {
         }
         cx.notify();
     }
+    fn go_up(&mut self, cx: &mut Context<Self>) {
+        let path = self.dir();
+        if navigation::is_app_virtual(&path) {
+            return;
+        }
+        if navigation::is_shell_folder(&path) {
+            if let Some(parent) =
+                rust_explorer::shell_folder::parent_from_chain(&path, &self.shell_chain)
+            {
+                self.navigate(parent, cx);
+                return;
+            }
+            let generation = self.generation;
+            let task = cx.background_executor().spawn(async move {
+                let request = serde_json::to_string(&path)?;
+                volumes::bounded::<PathBuf>("--shell-parent", &request, Duration::from_secs(5))
+            });
+            cx.spawn(async move |view, cx| {
+                let result = task.await;
+                let _ = view.update(cx, |v, cx| {
+                    if v.generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(parent) => v.navigate(parent, cx),
+                        Err(error) => {
+                            v.error = Some(error.to_string());
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+        } else {
+            self.navigate(
+                path.parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(volumes::computer),
+                cx,
+            );
+        }
+    }
+
     fn update_address_candidates(&mut self, text: String, cx: &mut Context<Self>) {
         let text = rust_explorer::path_completion::resolve_input(&self.dir(), &text)
             .map(|path| path.to_string_lossy().into_owned())
@@ -2966,14 +3009,7 @@ impl Render for Explorer {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                if !navigation::is_virtual(&v.dir()) {
-                    let path = v
-                        .dir()
-                        .parent()
-                        .map(|p| p.to_path_buf())
-                        .unwrap_or_else(volumes::computer);
-                    v.navigate(path, cx);
-                }
+                v.go_up(cx);
             }))
             .on_action(cx.listener(|v, _: &ZoomIn, w, cx| {
                 if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
@@ -3412,16 +3448,7 @@ impl Render for Explorer {
                         v.reload(cx);
                     }
                 }
-                "up" => {
-                    if !navigation::is_virtual(&v.dir()) {
-                        let path = v
-                            .dir()
-                            .parent()
-                            .map(|p| p.to_path_buf())
-                            .unwrap_or_else(volumes::computer);
-                        v.navigate(path, cx);
-                    }
-                }
+                "up" => v.go_up(cx),
                 _ => v.reload(cx),
             });
             nav = nav.child(if id == "refresh" {

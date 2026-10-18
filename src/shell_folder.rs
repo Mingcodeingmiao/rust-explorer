@@ -489,9 +489,74 @@ pub fn is_shell_path(path: &Path) -> bool {
         || value.starts_with("\\\\.\\")
 }
 
+/// PIDL aliases for a device root and its breadcrumb refer to the same item.
+pub fn parent_from_chain(path: &Path, chain: &[(String, PathBuf)]) -> Option<PathBuf> {
+    let current = decode_pidl(path);
+    let index = chain.iter().position(|(_, candidate)| {
+        candidate == path || (current.is_some() && decode_pidl(candidate) == current)
+    })?;
+    if index == 0 {
+        return Some(crate::volumes::computer());
+    }
+    let parent = &chain[index - 1].1;
+    Some(if index == 1 {
+        decode_pidl(parent)
+            .map(|bytes| encode_device_pidl(&bytes))
+            .unwrap_or_else(|| parent.clone())
+    } else {
+        parent.clone()
+    })
+}
+
+/// Resolve a parent through Shell, never by parsing a filesystem separator.
+pub fn parent(path: &Path) -> Result<PathBuf> {
+    let _com = Com::new();
+    let current = item(path)?;
+    let parent = unsafe { current.GetParent() }?;
+    let parsing =
+        unsafe { display_name(&parent, SIGDN_DESKTOPABSOLUTEPARSING) }.unwrap_or_default();
+    if parsing.eq_ignore_ascii_case(THIS_PC)
+        || parsing.eq_ignore_ascii_case("shell:MyComputerFolder")
+    {
+        return Ok(crate::volumes::computer());
+    }
+    if let Some(path) = unsafe { display_name(&parent, SIGDN_FILESYSPATH) } {
+        return Ok(PathBuf::from(path));
+    }
+    let chain = ancestors(&parent)?;
+    let bytes = unsafe { item_pidl(&parent) }?;
+    Ok(if chain.len() == 1 {
+        encode_device_pidl(&bytes)
+    } else {
+        encode_pidl(&bytes)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn up_uses_shell_ancestry_and_restores_device_root_alias() {
+        let root = encode_pidl(&[2, 0, 0, 0]);
+        let storage = encode_pidl(&[2, 0, 1, 0]);
+        let folder = encode_pidl(&[2, 0, 2, 0]);
+        let chain = vec![
+            ("device".into(), root.clone()),
+            ("storage".into(), storage.clone()),
+            ("folder".into(), folder.clone()),
+        ];
+        assert_eq!(parent_from_chain(&folder, &chain), Some(storage.clone()));
+        assert_eq!(
+            parent_from_chain(&storage, &chain),
+            Some(encode_device_pidl(&[2, 0, 0, 0]))
+        );
+        assert_eq!(
+            parent_from_chain(&encode_device_pidl(&[2, 0, 0, 0]), &chain),
+            Some(crate::volumes::computer())
+        );
+        assert_eq!(parent_from_chain(&folder, &[]), None);
+    }
 
     #[test]
     fn pidl_paths_round_trip_and_are_recognized() {

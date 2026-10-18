@@ -13,6 +13,9 @@ pub struct Theme {
     pub accent: u32,
 }
 impl Theme {
+    pub fn active_tab(self) -> u32 {
+        if self.dark { self.input } else { 0xdeebf7 }
+    }
     pub fn preference(preference: &str) -> Self {
         match preference {
             "light" => Self::with_dark(false),

@@ -1937,7 +1937,7 @@ impl Explorer {
                     .flex_shrink_0()
                     .rounded_t(ui(7.))
                     .bg(rgb(if index == self.active {
-                        t.input
+                        t.active_tab()
                     } else {
                         t.chrome
                     }))

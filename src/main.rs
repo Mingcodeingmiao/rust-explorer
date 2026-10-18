@@ -3,6 +3,15 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
+        Some("--shell-parent") => (|| -> anyhow::Result<()> {
+            let path: std::path::PathBuf =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::shell_folder::parent(&path)?)?
+            );
+            Ok(())
+        })(),
         Some("--path-completions") => (|| -> anyhow::Result<()> {
             let text: String = serde_json::from_str(
                 args.get(2)
