@@ -127,7 +127,7 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
 }
 
 fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v3");
+    let root = cache_root().join("thumbnails-v4");
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
@@ -361,7 +361,7 @@ pub fn serve(json: &str) -> Result<()> {
                 shortcut_epoch: item.shortcut_epoch,
             };
             let output = if shortcut {
-                let root = cache_root().join("thumbnails-v3");
+                let root = cache_root().join("thumbnails-v4");
                 std::fs::create_dir_all(&root)?;
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 (&item, &resolved).hash(&mut hash);
@@ -430,9 +430,30 @@ pub fn serve(json: &str) -> Result<()> {
                 .to_string_lossy()
                 .to_ascii_lowercase();
             let (width, height) = png_dimensions(&output)?;
+            let (source_width, source_height) = if !resolved.directory
+                && matches!(
+                    extension.as_str(),
+                    "jpg"
+                        | "jpeg"
+                        | "png"
+                        | "gif"
+                        | "bmp"
+                        | "tif"
+                        | "tiff"
+                        | "webp"
+                        | "heic"
+                        | "heif"
+                        | "avif"
+                ) {
+                crate::native_preview::photo_dimensions(&resolved.path).unwrap_or_default()
+            } else {
+                (0, 0)
+            };
             let presentation = crate::thumbnails::Presentation {
                 directory: resolved.directory,
                 shortcut,
+                source_width,
+                source_height,
                 width,
                 height,
                 video: !resolved.directory

@@ -3,6 +3,17 @@
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
+        Some("--path-completions") => (|| -> anyhow::Result<()> {
+            let text: String = serde_json::from_str(
+                args.get(2)
+                    .ok_or_else(|| anyhow::anyhow!("query missing"))?,
+            )?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::path_completion::collect(&text)?)?
+            );
+            Ok(())
+        })(),
         Some("--open-target") => (|| -> anyhow::Result<()> {
             let path: std::path::PathBuf =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;

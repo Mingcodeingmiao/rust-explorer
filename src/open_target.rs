@@ -13,6 +13,29 @@ pub enum OpenTarget {
     File(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpenDisposition {
+    Current,
+    Tab,
+    Window,
+}
+pub fn folder_disposition(
+    control: bool,
+    shift: bool,
+    shift_tab: bool,
+    separate: bool,
+) -> OpenDisposition {
+    if control {
+        OpenDisposition::Window
+    } else if shift && shift_tab {
+        OpenDisposition::Tab
+    } else if separate {
+        OpenDisposition::Window
+    } else {
+        OpenDisposition::Current
+    }
+}
+
 pub fn is_font(path: &Path) -> bool {
     path.extension().is_some_and(|ext| {
         matches!(
@@ -105,6 +128,17 @@ pub fn launch_font_preview(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_open_modifiers_have_explicit_precedence() {
+        use OpenDisposition::*;
+        assert_eq!(folder_disposition(false, false, true, false), Current);
+        assert_eq!(folder_disposition(false, true, false, false), Current);
+        assert_eq!(folder_disposition(false, true, true, false), Tab);
+        assert_eq!(folder_disposition(false, true, true, true), Tab);
+        assert_eq!(folder_disposition(true, true, true, true), Window);
+        assert_eq!(folder_disposition(true, false, false, false), Window);
+        assert_eq!(folder_disposition(false, false, false, true), Window);
+    }
     #[test]
     fn font_extensions_are_explicit_and_case_insensitive() {
         for name in ["font.TTF", "font.otf", "font.ttc", "font.otc", "font.fon"] {

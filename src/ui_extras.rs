@@ -2,6 +2,7 @@ use super::*;
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use std::cell::RefCell;
 use std::sync::atomic::AtomicU64;
+use unicode_segmentation::UnicodeSegmentation;
 
 thread_local! {static TAB_WINDOWS:RefCell<HashMap<isize,WeakEntity<Explorer>>>=RefCell::new(HashMap::new());}
 pub(super) struct TabDrop {
@@ -277,7 +278,7 @@ impl Render for TabGhost {
                     .text_ellipsis()
                     .child(navigation::location_name(self.tab.history.current())),
             )
-            .child(visual::icon("close", self.theme.text))
+            .child(visual::icon_at("close", self.theme.text, 16. * 2. / 3.))
     }
 }
 
@@ -301,6 +302,9 @@ pub(super) fn open_explorer(
             let view = cx.new(|cx| Explorer::new(w, cx));
             if let Some(hwnd) = native_hwnd(w) {
                 set_application_icon(hwnd);
+                if let Err(error) = rust_explorer::window_frame::install(hwnd) {
+                    eprintln!("{error:#}");
+                }
                 TAB_WINDOWS.with(|windows| {
                     windows.borrow_mut().insert(hwnd, view.downgrade());
                 });
@@ -354,7 +358,58 @@ fn column_label(id: &str, usage: bool) -> &'static str {
     }
 }
 fn wrapped(text: &str) -> String {
-    text.graphemes(true).collect::<Vec<_>>().join("\u{200b}")
+    text.to_owned()
+}
+pub(super) fn icon_label_lines(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    window: &Window,
+) -> Vec<String> {
+    rust_explorer::icon_layout::label_lines(text.graphemes(true), width.max(1.), 4, |line| {
+        let run = TextRun {
+            len: line.len(),
+            font: font("Microsoft YaHei UI"),
+            color: rgb(0).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        f32::from(
+            window
+                .text_system()
+                .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
+                .width,
+        ) / scale
+    })
+}
+pub(super) fn icon_label(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    window: &Window,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .line_height(ui(20.))
+        .text_size(ui(font_size))
+        .children(
+            icon_label_lines(text, width, font_size, scale, window)
+                .into_iter()
+                .map(|line| {
+                    div()
+                        .h(ui(20.))
+                        .w_full()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(line)
+                }),
+        )
+        .into_any_element()
 }
 fn menu_icon(id: &str) -> Option<&'static str> {
     Some(if id.starts_with("view:") {
@@ -386,7 +441,10 @@ fn menu_icon(id: &str) -> Option<&'static str> {
             "submenu:sort-menu" => "sort",
             "pin" | "nav-pin" | "nav-unpin" => "pin",
             "copy-path" | "nav-copy-path" => "copy-path",
-            "select-all" | "select-none" | "select-invert" | "checkboxes" => "select-all",
+            "select-all" => "select-all",
+            "select-none" => "select-none",
+            "select-invert" => "invert-selection",
+            "checkboxes" => "checkbox",
             "properties" | "nav-properties" => "properties",
             "options" => "options",
             "preview-pane" | "details-pane" => "preview",
@@ -473,7 +531,7 @@ impl Explorer {
     pub(super) fn sync_thumbnails(&self) {
         let enabled = matches!(
             self.view,
-            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge
+            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge | ViewMode::Content
         ) && self.settings.thumbnails
             && !self.is_home()
             && !self.loading;
@@ -1015,7 +1073,11 @@ impl Explorer {
                 + 40.
         };
         let widths: Vec<_> = parts.iter().map(|(name, _)| measure(name)).collect();
-        let hidden = rust_explorer::breadcrumb_layout::hidden_prefix(&widths, available, 108.);
+        let hidden = rust_explorer::breadcrumb_layout::hidden_prefix(
+            &widths,
+            (available - 108.).max(0.),
+            48.,
+        );
         *self.hidden_breadcrumbs.borrow_mut() = parts.drain(..hidden).collect();
         let mut crumbs = div()
             .id("breadcrumbs")
@@ -1031,17 +1093,18 @@ impl Explorer {
             .overflow_hidden()
             .cursor_pointer()
             .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
+        crumbs = crumbs
+            .child(
+                div()
+                    .w(ui(28.))
+                    .flex_shrink_0()
+                    .flex()
+                    .justify_center()
+                    .child(visual::icon("computer", t.text)),
+            )
+            .child(visual::icon("chevron-right", t.muted));
         if hidden > 0 {
             crumbs = crumbs
-                .child(
-                    div()
-                        .w(ui(28.))
-                        .flex_shrink_0()
-                        .flex()
-                        .justify_center()
-                        .child(visual::icon("computer", t.text)),
-                )
-                .child(visual::icon("chevron-right", t.muted))
                 .child(
                     button("hidden-crumbs", "", t)
                         .w(ui(32.))
@@ -1070,14 +1133,13 @@ impl Explorer {
                     .id(("crumb", index))
                     .h_full()
                     .min_w_0()
-                    .max_w(ui((available - 90.).max(40.)))
+                    .max_w(ui((available - 160.).max(24.)))
                     .px_2()
                     .flex()
                     .items_center()
                     .rounded(ui(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(t.hover)))
-                    .when(index + 1 == n, |d| d.flex_1())
                     .when(index + 1 < n, |d| d.flex_shrink_0())
                     .child(
                         div()
@@ -1092,11 +1154,11 @@ impl Explorer {
                         v.navigate(path.clone(), cx);
                     })),
             );
-            if index + 1 < n {
-                crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
-            }
+            crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
         }
-        crumbs.into_any_element()
+        crumbs
+            .child(div().min_w(ui(64.)).h_full().flex_1())
+            .into_any_element()
     }
     pub(super) fn save_settings(&self, _: &mut Context<Self>) {
         self.settings.enqueue_save();
@@ -1392,23 +1454,25 @@ impl Explorer {
         self.status = "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整".into();
         let task = cx.background_executor().spawn(async move {
             let mut skipped = 0;
+            let mut hits = 0;
             for e in entries.iter().filter(|e| e.directory) {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let usage = disk_usage::calculate(&e.path, &cancel);
+                let (usage, cached) = disk_usage::calculate_cached(&e.path, &cancel);
+                hits += usize::from(cached);
                 skipped += usage.skipped;
                 let _ = tx.send((generation, e.path.clone(), usage));
             }
-            skipped
+            (skipped, hits)
         });
         cx.spawn(async move |view, cx| {
-            let skipped = task.await;
+            let (skipped, hits) = task.await;
             let _ = view.update(cx, |v, cx| {
                 if v.generation == generation {
                     v.usage_running = false;
                     v.status = format!(
-                        "大小统计结束 · 逻辑字节 · 跳过 {skipped} 项（联接、挂载点或无权限）"
+                        "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
                     );
                     v.rebuild_rows();
                     cx.notify();
@@ -1542,7 +1606,8 @@ impl Explorer {
     }
     fn tab_drop_index(&self, x: f32) -> usize {
         let available = (self.window_width - 300.).max(110.);
-        let width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        let width = (available / self.tabs.len().max(1) as f32 - 4.)
+            .clamp(100., rust_explorer::layout_metrics::TAB_MAX_WIDTH);
         let arrows = if self.tabs.len() as f32 * (width + 4.) > available {
             24.
         } else {
@@ -1600,7 +1665,8 @@ impl Explorer {
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let available = (f32::from(window.viewport_size().width) / self.zoom - 300.).max(110.);
-        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.)
+            .clamp(100., rust_explorer::layout_metrics::TAB_MAX_WIDTH);
         let overflowing = self.tabs.len() as f32 * (tab_width + 4.) > available;
         let mut strip = div()
             .id("tab-strip")
@@ -1686,7 +1752,8 @@ impl Explorer {
                             .child(name),
                     )
                     .child(
-                        button(("close-tab", tab.id), "×", t)
+                        button(("close-tab", tab.id), "", t)
+                            .child(visual::icon_at("close", t.text, 16. * 2. / 3.))
                             .w(ui(24.))
                             .px_1()
                             .flex_shrink_0()
@@ -1701,8 +1768,10 @@ impl Explorer {
             strip = strip.child(button("tabs-left", "‹", t).w(ui(24.)).px_1().on_click(
                 cx.listener(|v, _, _, cx| {
                     let offset = v.tab_scroll.offset();
-                    v.tab_scroll
-                        .set_offset(point(offset.x + px(200. * v.zoom), px(0.)));
+                    v.tab_scroll.set_offset(point(
+                        offset.x + px(rust_explorer::layout_metrics::TAB_MAX_WIDTH * v.zoom),
+                        px(0.),
+                    ));
                     cx.notify();
                 }),
             ));
@@ -1712,8 +1781,10 @@ impl Explorer {
             strip = strip.child(button("tabs-right", "›", t).w(ui(24.)).px_1().on_click(
                 cx.listener(|v, _, _, cx| {
                     let offset = v.tab_scroll.offset();
-                    v.tab_scroll
-                        .set_offset(point(offset.x - px(200. * v.zoom), px(0.)));
+                    v.tab_scroll.set_offset(point(
+                        offset.x - px(rust_explorer::layout_metrics::TAB_MAX_WIDTH * v.zoom),
+                        px(0.),
+                    ));
                     cx.notify();
                 }),
             ));
@@ -2033,13 +2104,15 @@ impl Explorer {
             .flex_shrink_0()
             .min_w_0()
             .line_height(ui(20.))
-            .when(expand, |d| {
-                d.whitespace_normal().text_ellipsis().line_clamp(4)
-            })
+            .when(expand, |d| d.whitespace_normal())
             .when(!expand, |d| {
                 d.whitespace_nowrap().overflow_hidden().text_ellipsis()
             })
-            .child(if expand { wrapped(&name) } else { name })
+            .child(if expand {
+                icon_label(&name, width, 13., self.zoom, window)
+            } else {
+                div().child(name).into_any_element()
+            })
             .on_drag(drag, move |drag, _, w, cx| {
                 let _ = source.update(cx, |v, cx| {
                     v.rename_token += 1;
@@ -2052,6 +2125,9 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if v.activate_file_item(index, e, cx) {
+                        return;
+                    }
                     let rename = v.selected.len() == 1
                         && v.selected.contains(&index)
                         && v.selected_at.elapsed() > Duration::from_millis(500)
@@ -2140,31 +2216,14 @@ impl Explorer {
             cell_width
         };
         let name_lines = if large {
-            let text = wrapped(&natural_name);
-            let run = TextRun {
-                len: text.len(),
-                font: font("Microsoft YaHei UI"),
-                color: rgb(t.text).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            };
-            window
-                .text_system()
-                .shape_text(
-                    text.into(),
-                    px(13. * self.zoom),
-                    &[run],
-                    Some(px((item_width - 24.).max(24.) * self.zoom)),
-                    Some(4),
-                )
-                .ok()
-                .and_then(|lines| {
-                    lines
-                        .first()
-                        .map(|line| (line.wrap_boundaries().len() + 1).min(4) as f32)
-                })
-                .unwrap_or(1.)
+            icon_label_lines(
+                &natural_name,
+                (item_width - 24.).max(24.),
+                13.,
+                self.zoom,
+                window,
+            )
+            .len() as f32
         } else {
             1.
         };
@@ -2256,6 +2315,9 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if v.activate_file_item(index, e, cx) {
+                        return;
+                    }
                     if v.selected.contains(&index)
                         && !e.modifiers.shift
                         && e.click_count == 1
@@ -2448,7 +2510,7 @@ impl Explorer {
                     row.child(checkbox(self, cx))
                 };
             }
-            let key = if large {
+            let key = if large || self.view == ViewMode::Content {
                 rust_explorer::thumbnails::Key::from_entry(
                     entry,
                     visual::thumbnail_pixels(self.view.icon_size()),
@@ -2505,48 +2567,138 @@ impl Explorer {
                         )
                     },
                 );
-            row = row.child(picture);
-            let name_width = (item_width
-                - 24.
-                - if large {
-                    0.
-                } else {
-                    self.view.icon_size() + 8.
-                }
-                - if self.settings.checkboxes && !large {
-                    30.
-                } else {
-                    0.
-                })
-            .max(24.);
-            let mut name = div()
-                .w(ui(name_width))
-                .flex_shrink_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .when(large, |d| d.w_full().text_center())
-                .child(self.name_element(index, entry, name_width, window, cx));
-            if rich {
-                name = name.child(
+            if self.view == ViewMode::Content {
+                let inner = (item_width - 24.).max(0.);
+                // 160 logical pixels = 280 physical pixels at 175% DPI.
+                let image = presentation.source_width > 0 && presentation.source_height > 0;
+                let (first, show_metadata) =
+                    rust_explorer::layout_metrics::content_columns(inner, image);
+                let text_width = (first - self.view.icon_size() - 8.).max(1.);
+                let metadata_width = (inner - first - 16.).clamp(1., 240.);
+                let image_width = (inner - first - metadata_width - 16.).max(1.);
+                let ellipsis = |text: String, width: f32| {
                     div()
-                        .text_color(rgb(t.muted))
-                        .text_size(ui(12.))
+                        .w(ui(width))
+                        .flex_shrink_0()
+                        .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
                         .text_ellipsis()
-                        .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
+                        .child(text)
+                };
+                let mut title = div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.name_element(index, entry, text_width, window, cx));
+                if !entry.directory && !image {
+                    title = title.child(
+                        ellipsis(entry.kind.clone(), text_width)
+                            .text_color(rgb(t.muted))
+                            .text_size(ui(12.)),
+                    );
+                }
+                row = row.child(
+                    div()
+                        .w(ui(first))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .overflow_hidden()
+                        .child(picture)
+                        .child(title),
                 );
-                if self.view == ViewMode::Content {
+                if show_metadata {
+                    if image {
+                        row = row.child(
+                            div()
+                                .w(ui(image_width))
+                                .flex_shrink_0()
+                                .min_w_0()
+                                .flex()
+                                .flex_col()
+                                .text_size(ui(12.))
+                                .text_color(rgb(t.muted))
+                                .child(ellipsis(format!("类型：{}", entry.kind), image_width))
+                                .child(ellipsis(
+                                    format!(
+                                        "分辨率：{} x {}",
+                                        presentation.source_width, presentation.source_height
+                                    ),
+                                    image_width,
+                                )),
+                        );
+                    } else {
+                        row = row.child(div().flex_1());
+                    }
+                    let mut metadata = div()
+                        .w(ui(metadata_width))
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .flex()
+                        .flex_col()
+                        .text_size(ui(12.))
+                        .text_color(rgb(t.muted));
+                    if !image {
+                        metadata = metadata.child(ellipsis(
+                            format!("修改日期：{}", entry.date()),
+                            metadata_width,
+                        ));
+                    }
+                    if !entry.directory {
+                        metadata = metadata.child(ellipsis(
+                            format!("大小：{}", self.entry_size_text(entry)),
+                            metadata_width,
+                        ));
+                    }
+                    row = row.child(metadata);
+                }
+            } else {
+                row = row.child(picture);
+                let name_width = (item_width
+                    - 24.
+                    - if large {
+                        0.
+                    } else {
+                        self.view.icon_size() + 8.
+                    }
+                    - if self.settings.checkboxes && !large {
+                        30.
+                    } else {
+                        0.
+                    })
+                .max(24.);
+                let mut name = div()
+                    .w(ui(name_width))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(large, |d| d.w_full().text_center())
+                    .child(self.name_element(index, entry, name_width, window, cx));
+                if rich {
                     name = name.child(
                         div()
                             .text_color(rgb(t.muted))
                             .text_size(ui(12.))
-                            .child(format!("修改日期：{}", entry.date())),
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
                     );
+                    if self.view == ViewMode::Content {
+                        name = name.child(
+                            div()
+                                .text_color(rgb(t.muted))
+                                .text_size(ui(12.))
+                                .child(format!("修改日期：{}", entry.date())),
+                        );
+                    }
                 }
+                row = row.child(name);
             }
-            row = row.child(name);
         }
         let row = row
             .when(
@@ -3841,12 +3993,17 @@ impl Explorer {
     }
     fn apply_options(&mut self, close: bool, cx: &mut Context<Self>) {
         if let Some(settings) = self.options.clone() {
+            let view = if settings.view != self.settings.view {
+                settings.view
+            } else {
+                self.view
+            };
             self.settings = settings;
             self.theme = Theme::preference(&self.settings.theme);
             self.tree_children.clear();
             self.hidden = self.settings.hidden;
             self.preview_open = self.settings.preview;
-            self.view = self.settings.view;
+            self.view = view;
             self.save_settings(cx);
             self.reload(cx);
             if close {
@@ -3936,6 +4093,11 @@ impl Explorer {
                     settings.separate_process,
                 ),
                 (
+                    "shift-open-tab",
+                    "按住 Shift 打开文件夹时在新标签页中打开",
+                    settings.shift_open_tab,
+                ),
+                (
                     "remember",
                     "记住每个文件夹的查看方式",
                     settings.remember_views,
@@ -3955,6 +4117,11 @@ impl Explorer {
                 ("hidden", "显示隐藏的文件、文件夹和驱动器", settings.hidden),
                 ("protected", "显示受保护的操作系统文件", settings.protected),
                 ("checkboxes", "使用复选框以便选择项目", settings.checkboxes),
+                (
+                    "high-performance",
+                    "高性能模式（一屏加缓冲；不适用于中等及以上图标）",
+                    settings.high_performance,
+                ),
                 (
                     "thumbnails",
                     "显示文件缩略图（中等图标及以上）",
@@ -4042,6 +4209,7 @@ impl Explorer {
                         if let Some(s) = &mut v.options {
                             match id {
                                 "single" => s.single_click = !s.single_click,
+                                "shift-open-tab" => s.shift_open_tab = !s.shift_open_tab,
                                 "separate" => s.separate_process = !s.separate_process,
                                 "remember" => s.remember_views = !s.remember_views,
                                 "folders-first" => s.folders_first = !s.folders_first,
@@ -4049,6 +4217,7 @@ impl Explorer {
                                 "hidden" => s.hidden = !s.hidden,
                                 "protected" => s.protected = !s.protected,
                                 "checkboxes" => s.checkboxes = !s.checkboxes,
+                                "high-performance" => s.high_performance = !s.high_performance,
                                 "compact" => s.compact = !s.compact,
                                 "thumbnails" => s.thumbnails = !s.thumbnails,
                                 "full-system-menu" => s.full_system_menu = !s.full_system_menu,

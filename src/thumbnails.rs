@@ -111,6 +111,8 @@ pub struct Presentation {
     pub video: bool,
     pub width: u32,
     pub height: u32,
+    pub source_width: u32,
+    pub source_height: u32,
 }
 #[derive(Default)]
 struct State {
@@ -270,6 +272,8 @@ impl Loader {
                                 directory: key.directory,
                                 width: 0,
                                 height: 0,
+                                source_width: 0,
+                                source_height: 0,
                                 shortcut: matches!(extension.as_str(), "lnk" | "url"),
                                 video: matches!(
                                     extension.as_str(),

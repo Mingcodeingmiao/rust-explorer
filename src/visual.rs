@@ -89,7 +89,8 @@ impl Icons {
             .spawn(move || {
                 while let Ok(first) = rx.recv() {
                     let mut batch = vec![first];
-                    batch.extend(rx.try_iter().take(31));
+                    // Keep cold-start Shell work inside the helper deadline.
+                    batch.extend(rx.try_iter().take(7));
                     let paths = native_assets::icons(batch.clone());
                     for (key, path) in batch.into_iter().zip(paths) {
                         if results_tx.send((key, path)).is_err() {
@@ -191,6 +192,25 @@ pub fn drain() -> bool {
         changed
     })
 }
+pub fn icon_at(name: &str, color: u32, logical: f32) -> AnyElement {
+    let dark = ICONS.with(|v| v.borrow().dark);
+    if let Some(path) = fluent_icons::path(name, dark) {
+        if name == "close" {
+            return svg()
+                .path(path.to_string_lossy().into_owned())
+                .size(ui(logical))
+                .flex_shrink_0()
+                .text_color(rgb(color))
+                .into_any_element();
+        }
+        return img(path)
+            .size(ui(logical))
+            .flex_shrink_0()
+            .object_fit(ObjectFit::Contain)
+            .into_any_element();
+    }
+    drawn_icon_at(name, color, logical)
+}
 pub fn icon(name: &str, color: u32) -> AnyElement {
     if matches!(name, "home" | "quick-access") {
         return drawn_icon(name, color);
@@ -248,7 +268,13 @@ pub fn icon(name: &str, color: u32) -> AnyElement {
     }
     if matches!(
         name,
-        "chevron-up" | "options" | "zip" | "details-pane" | "select-none" | "invert-selection"
+        "chevron-up"
+            | "options"
+            | "zip"
+            | "details-pane"
+            | "select-all"
+            | "select-none"
+            | "invert-selection"
     ) {
         return drawn_icon(
             match name {
@@ -256,7 +282,7 @@ pub fn icon(name: &str, color: u32) -> AnyElement {
                 "options" => "settings",
                 "zip" => "archive",
                 "details-pane" => "preview",
-                _ => "select-all",
+                _ => name,
             },
             color,
         );
@@ -525,6 +551,9 @@ fn picture_or_draw(path: Option<PathBuf>, name: &str, color: u32) -> AnyElement 
 // Small vector fallbacks, used only until a native resource arrives or when
 // no matching resource exists. They are painted by GPUI, not a browser/font.
 fn drawn_icon(name: &str, color: u32) -> AnyElement {
+    drawn_icon_at(name, color, 16.)
+}
+fn drawn_icon_at(name: &str, color: u32, logical: f32) -> AnyElement {
     let paths: Vec<Vec<(f32, f32)>> = match name {
         "quick-access" => vec![vec![
             (8., 1.),
@@ -608,7 +637,17 @@ fn drawn_icon(name: &str, color: u32) -> AnyElement {
             vec![(1., 12.), (5., 12.), (5., 15.), (1., 15.), (1., 12.)],
             vec![(11., 12.), (15., 12.), (15., 15.), (11., 15.), (11., 12.)],
         ],
-        "view-grid" | "select-all" => vec![
+        "select-all" => vec![
+            vec![(1., 1.), (15., 1.), (15., 15.), (1., 15.), (1., 1.)],
+            vec![(3., 8.), (7., 12.), (13., 4.)],
+        ],
+        "select-none" => vec![vec![(1., 1.), (15., 1.), (15., 15.), (1., 15.), (1., 1.)]],
+        "invert-selection" => vec![
+            vec![(6., 1.), (15., 1.), (15., 10.), (10., 10.)],
+            vec![(1., 6.), (10., 6.), (10., 15.), (1., 15.), (1., 6.)],
+            vec![(3., 10.), (5., 12.), (8., 8.)],
+        ],
+        "view-grid" => vec![
             vec![(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)],
             vec![(10., 2.), (14., 2.), (14., 6.), (10., 6.), (10., 2.)],
             vec![(2., 10.), (6., 10.), (6., 14.), (2., 14.), (2., 10.)],
@@ -859,7 +898,7 @@ fn drawn_icon(name: &str, color: u32) -> AnyElement {
             }
         },
     )
-    .size(ui(16.))
+    .size(ui(logical))
     .flex_shrink_0()
     .into_any_element()
 }

@@ -676,6 +676,23 @@ pub fn font_sample(path: &Path, size: u32) -> Result<Bitmap> {
     result
 }
 
+/// Read original, EXIF-oriented dimensions without decoding the image pixels.
+pub fn photo_dimensions(path: &Path) -> Result<(u32, u32)> {
+    let _runtime = WinRt::new()?;
+    let path: PathBuf = std::path::absolute(path)?.components().collect();
+    let file = StorageFile::GetFileFromPathAsync(&HSTRING::from(path.as_os_str()))?.get()?;
+    let stream = file.OpenReadAsync()?.get()?;
+    let result = (|| {
+        let decoder = BitmapDecoder::CreateAsync(&stream)?.get()?;
+        Ok((
+            decoder.OrientedPixelWidth()?,
+            decoder.OrientedPixelHeight()?,
+        ))
+    })();
+    let _ = stream.Close();
+    result
+}
+
 /// Decode directly to a small, EXIF-oriented bitmap with the Windows image codec.
 pub fn photo_thumbnail(path: &Path, size: u32) -> Result<Bitmap> {
     let _runtime = WinRt::new()?;

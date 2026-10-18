@@ -1,4 +1,46 @@
 //! Pure geometry for small provider images inside Explorer's fixed icon slots.
+/// Wrap at supplied grapheme boundaries, without inserting invisible characters
+/// or asking the Windows text backend to slice a clamped UTF-8 run.
+pub fn label_lines<'a>(
+    parts: impl IntoIterator<Item = &'a str>,
+    width: f32,
+    limit: usize,
+    mut measure: impl FnMut(&str) -> f32,
+) -> Vec<String> {
+    if limit == 0 {
+        return vec![];
+    }
+    let mut lines = vec![String::new()];
+    for part in parts {
+        let last = lines.len() - 1;
+        let candidate = format!("{}{part}", lines[last]);
+        if lines[last].is_empty() || measure(&candidate) <= width {
+            lines[last] = candidate;
+        } else if lines.len() < limit {
+            lines.push(part.to_owned());
+        } else {
+            while !lines[last].is_empty() && measure(&format!("{}…", lines[last])) > width {
+                lines[last].pop();
+            }
+            lines[last].push('…');
+            break;
+        }
+    }
+    lines
+}
+
+#[cfg(test)]
+mod label_tests {
+    use super::*;
+    #[test]
+    fn multibyte_names_are_bounded_without_zero_width_insertions() {
+        let parts = ["文", "件", "夹", "😀", "a", "b", "c", "d", "e"];
+        let lines = label_lines(parts, 2., 4, |s| s.chars().count() as f32);
+        assert_eq!(lines, ["文件", "夹😀", "ab", "c…"]);
+        assert!(lines.iter().all(|line| !line.contains('\u{200b}')));
+    }
+}
+
 pub fn thumbnail_edge(logical: f32, width: u32, height: u32, scale: f32, folder: bool) -> f32 {
     // Shell can return a 48px cached folder composition for a jumbo request.
     // Its bitmap resolution must not change the folder's visual slot size.

@@ -196,7 +196,7 @@ impl Explorer {
             .scroll_to_item(self.nav_keyboard_index, ScrollStrategy::Center);
         cx.notify();
     }
-    fn navigate_tree(
+    pub(super) fn navigate_tree(
         &mut self,
         command: rust_explorer::nav_keyboard::Command,
         window: &mut Window,
@@ -247,7 +247,7 @@ impl Explorer {
                 {
                     self.run_shell(shell::Request::Open { path }, cx);
                 } else {
-                    self.navigate(path, cx);
+                    self.navigate_with_modifiers(path, window.modifiers(), cx);
                 }
             }
             Effect::None => {}
@@ -841,7 +841,7 @@ impl Explorer {
                                 let drop_bounds = this.file_drop_bounds.clone();
                                 div()
                                     .id(("nav", index))
-                                    .w_full()
+                                    .w(ui((width - 20.).max(100.)))
                                     .h(ui(row_height))
                                     .pl(ui(3. + row.depth as f32 * 16.))
                                     .pr_2()
@@ -974,7 +974,11 @@ impl Explorer {
                                                     cx,
                                                 );
                                             } else {
-                                                v.navigate(path.clone(), cx);
+                                                v.navigate_with_modifiers(
+                                                    path.clone(),
+                                                    window.modifiers(),
+                                                    cx,
+                                                );
                                             }
                                         }),
                                     )
@@ -1013,6 +1017,7 @@ impl Explorer {
         index: usize,
         volume: &Volume,
         width: f32,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
@@ -1034,7 +1039,7 @@ impl Explorer {
         } else if content {
             64.
         } else if tiles {
-            40.
+            rust_explorer::layout_metrics::DRIVE_TILE_ICON
         } else {
             48.
         };
@@ -1084,9 +1089,9 @@ impl Explorer {
             .when(!details && !tiles, |d| d.p_2().gap_2())
             .when(tiles, |d| {
                 d.h(ui(rust_explorer::layout_metrics::DRIVE_TILE_HEIGHT))
-                    .px_2()
+                    .px_1()
                     .py_1()
-                    .gap_2()
+                    .gap(ui(rust_explorer::layout_metrics::DRIVE_TILE_GAP))
                     .overflow_hidden()
             })
             .when(details, |d| {
@@ -1154,7 +1159,7 @@ impl Explorer {
                     cx.stop_propagation();
                     v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     if e.click_count == 2 || v.settings.single_click {
-                        v.navigate(path.clone(), cx);
+                        v.navigate_with_modifiers(path.clone(), e.modifiers, cx);
                     }
                 }),
             )
@@ -1214,25 +1219,17 @@ impl Explorer {
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
                 .child(if grid {
-                    div()
-                        .w_full()
-                        .whitespace_normal()
-                        .text_ellipsis()
-                        .line_clamp(4)
-                        .line_height(ui(20.))
-                        .text_size(ui(match mode {
+                    icon_label(
+                        &volume.label,
+                        (width - 16.).max(24.),
+                        match mode {
                             ViewMode::ExtraLarge => 15.,
                             ViewMode::Large => 14.,
                             _ => 13.,
-                        }))
-                        .child(
-                            volume
-                                .label
-                                .graphemes(true)
-                                .collect::<Vec<_>>()
-                                .join("\u{200b}"),
-                        )
-                        .into_any_element()
+                        },
+                        self.zoom,
+                        window,
+                    )
                 } else {
                     label(volume.label.clone())
                         .text_size(ui(13.))
@@ -1245,11 +1242,14 @@ impl Explorer {
                             .h(ui(if content {
                                 20.
                             } else if tiles {
-                                12.
+                                rust_explorer::layout_metrics::DRIVE_TILE_BAR_HEIGHT
                             } else {
                                 16.
                             }))
                             .w_full()
+                            .when(tiles, |d| {
+                                d.w(ui(rust_explorer::layout_metrics::DRIVE_TILE_BAR_WIDTH))
+                            })
                             .border_1()
                             .border_color(rgb(0xbcbcbc))
                             .bg(rgb(0xe6e6e6))
@@ -1263,7 +1263,7 @@ impl Explorer {
                 text = text.child(
                     label(space)
                         .text_size(ui(12.))
-                        .text_color(rgb(t.muted))
+                        .text_color(rgb(if tiles && t.dark { t.text } else { t.muted }))
                         .when(tiles, |d| d.line_height(ui(14.))),
                 );
                 if content || volume.kind == 5 {
@@ -1287,7 +1287,12 @@ impl Explorer {
         }
         row.into_any_element()
     }
-    fn render_volume_views(&self, mut body: Stateful<Div>, cx: &mut Context<Self>) -> AnyElement {
+    fn render_volume_views(
+        &self,
+        mut body: Stateful<Div>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let t = self.theme;
         let list = self.view == ViewMode::List;
         let details = self.view == ViewMode::Details;
@@ -1519,7 +1524,7 @@ impl Explorer {
                         d.flex_col()
                     });
                 for (index, volume) in items {
-                    content = content.child(self.volume_item(index, volume, width, cx));
+                    content = content.child(self.volume_item(index, volume, width, window, cx));
                 }
                 section = section.child(content);
             }
@@ -1540,7 +1545,7 @@ impl Explorer {
         body.into_any_element()
     }
 
-    pub(super) fn render_computer(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_computer(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let mut body = div()
             .id("computer-home")
@@ -1717,11 +1722,13 @@ impl Explorer {
                 body = body.child(
                     button(("library", index), e.name.clone(), t)
                         .justify_start()
-                        .on_click(cx.listener(move |v, _, _, cx| v.navigate(path.clone(), cx))),
+                        .on_click(cx.listener(move |v, _, window, cx| {
+                            v.navigate_with_modifiers(path.clone(), window.modifiers(), cx)
+                        })),
                 );
             }
             return body.into_any_element();
         }
-        self.render_volume_views(body, cx)
+        self.render_volume_views(body, window, cx)
     }
 }
