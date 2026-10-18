@@ -7,7 +7,7 @@
 
 使用 **Rust + GPUI** 编写的 Windows 原生文件管理器，支持多标签、系统右键菜单、缩略图和预览，无需浏览器或 WebView2 运行时。
 
-**当前版本为 0.7.2 预发布版。** 合并了 PR #11 与维护者的本地修改，实际范围和验证限制见[整合记录](docs/pr-11-integration-072.md)及[MTP 实测记录](docs/mtp-tabs-validation-2026-10-18.md)。同一手机内直接复制/移动仍可能返回设备忙；不宣称与 Explorer 完全等价。
+**当前版本为 0.7.2 预发布版。** 合并了 PR #11 与维护者的本地修改，实际范围和验证限制见[整合记录](docs/pr-11-integration-072.md)及[MTP 实测记录](docs/mtp-tabs-validation-2026-10-18.md)。MTP/WPD 设备传输可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
