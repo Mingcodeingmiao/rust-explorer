@@ -4,7 +4,7 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.2 is a pre-release**, combining PR #11 with the maintainer's changes. See [integration validation](docs/pr-11-integration-072.md) and [MTP validation](docs/mtp-tabs-validation-2026-10-18.md). MTP/WPD paths may require serialized device I/O; same-device copy/move depends on device capabilities and can return ERROR_BUSY. Complete transfers one at a time, using the PC as an intermediate location when needed. Default-folder associations remain deferred. It does not claim full Explorer parity.
+Version **0.7.2 is a pre-release**, combining PR #11 with the maintainer's changes. See [integration validation](docs/pr-11-integration-072.md) and [MTP validation](docs/mtp-tabs-validation-2026-10-18.md). MTP/WPD paths may require serialized device I/O; same-device copy/move depends on device capabilities and can return ERROR_BUSY. Complete transfers one at a time, using the PC as an intermediate location when needed. The unpublished development branch adds experimental, opt-in folder/drive associations with backup and recovery; see [scope and recovery](docs/default-folder-browser.md). Public 0.7.2 does not include this feature. It does not claim full Explorer parity.
 
 ## Features
 

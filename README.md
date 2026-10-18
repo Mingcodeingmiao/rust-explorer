@@ -28,7 +28,7 @@
 
 从 [Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) 下载 Windows x64 ZIP，**完整解压**后运行 `rust-explorer.exe`，通常无需管理员权限。发行文件目前未签名，请比对同版本 `SHA256SUMS.txt`。
 
-Everything 集成需要已安装、可用的 Everything 客户端。此整合分支不接管 Win+E，也不替换系统文件管理器；默认文件浏览器关联功能按维护者要求暂缓。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
+Everything 集成需要已安装、可用的 Everything 客户端。不接管 Win+E。本地开发版新增可选的实验性“默认文件夹浏览器”，仅关联普通文件夹和驱动器，包含原值备份和恢复入口，详见[使用与恢复说明](docs/default-folder-browser.md)；公开 0.7.2 尚不包含此功能。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
 
 ## 从源码构建
 

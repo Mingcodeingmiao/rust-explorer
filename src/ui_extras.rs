@@ -4378,6 +4378,45 @@ impl Explorer {
         })
         .detach();
     }
+    fn change_folder_association(
+        &mut self,
+        enable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.association_busy {
+            return;
+        }
+        self.association_busy = true;
+        let hwnd = native_hwnd(window).unwrap_or(0);
+        let task = cx.background_executor().spawn(async move {
+            use windows::{core::PCWSTR, Win32::{Foundation::HWND, UI::WindowsAndMessaging::*}};
+            let message = if enable {
+                "将修改当前用户的普通文件夹和驱动器默认打开方式。Win+E、此电脑等虚拟页面保持系统行为。\n请先将程序放在固定位置，启用后不要移动或删除。\n原始值将备份到本地应用数据目录 RustExplorer\\folder-association。可使用“恢复原样”、--restore-folder-browser，或导入 restore.reg 恢复。\n是否启用？"
+            } else { "恢复启用前的文件夹和驱动器关联？若关联已被其他程序修改，会保留这些修改并报告冲突。" };
+            let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+            let title: Vec<u16> = "Rust Explorer — 文件夹关联".encode_utf16().chain(Some(0)).collect();
+            let answer = unsafe { MessageBoxW(Some(HWND(hwnd as *mut _)), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
+            if answer != IDYES { return Ok(false); }
+            if enable { rust_explorer::default_browser::enable() } else { rust_explorer::default_browser::disable() }.map(|_| true).map_err(|e| format!("{e:#}"))
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |v, cx| {
+                v.association_busy = false;
+                match result {
+                    Ok(true) => {
+                        v.status = "文件夹关联操作完成；恢复入口位于文件夹选项 → 常规".into()
+                    }
+                    Ok(false) => {}
+                    Err(e) => v.error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub(super) fn render_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let settings = self.options.as_ref().unwrap();
@@ -4486,6 +4525,14 @@ impl Explorer {
                     .text_color(rgb(t.muted))
                     .child("浏览文件夹与打开项目"),
             );
+        }
+        if self.options_page == 0 {
+            let status = rust_explorer::default_browser::status()
+                .unwrap_or_else(|e| format!("关联状态读取失败：{e:#}"));
+            body = body.child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().child(format!("默认文件夹浏览器（实验性）：{status}。仅普通文件夹和驱动器；请将程序放在固定位置。操作立即生效，与下方“应用”独立。")))
+                .child(div().flex().flex_wrap().gap_2()
+                    .child(button("association-enable", if self.association_busy { "操作中…" } else { "设为默认文件夹浏览器…" }, t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(true, w, cx))))
+                    .child(button("association-restore", "恢复原样…", t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(false, w, cx)))));
         }
         if self.options_page == 1 {
             let source = rust_explorer::fluent_icons::resource_status();
@@ -4657,7 +4704,7 @@ impl Explorer {
                             .whitespace_normal()
                             .text_size(ui(12.))
                             .text_color(rgb(t.muted))
-                            .child("设置仅作用于 Rust Explorer，不修改系统资源管理器。"),
+                            .child("普通设置仅作用于 Rust Explorer；默认文件夹关联需单独确认，可通过“恢复原样”撤销。"),
                     )
                     .child(
                         div()

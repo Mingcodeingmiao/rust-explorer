@@ -199,6 +199,7 @@ struct Explorer {
     settings: Settings,
     options: Option<Settings>,
     options_page: usize,
+    association_busy: bool,
     options_scroll: ScrollHandle,
     toolbar_overflow: Vec<&'static str>,
     nested_submenu: Option<(String, f32)>,
@@ -422,9 +423,19 @@ impl Explorer {
         cx.notify();
     }
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let initial = std::env::args_os()
+        let folder_handler = std::env::args_os()
             .nth(1)
+            .is_some_and(|a| a == "--open-folder");
+        let initial = std::env::args_os()
+            .nth(if folder_handler { 2 } else { 1 })
             .map(PathBuf::from)
+            .map(|p| {
+                if folder_handler {
+                    rust_explorer::default_browser::folder_argument(&p).unwrap_or(p)
+                } else {
+                    p
+                }
+            })
             .filter(|p| navigation::is_virtual(p) || p.is_dir())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
         let address =
@@ -629,6 +640,7 @@ impl Explorer {
             view,
             options: None,
             options_page: 0,
+            association_busy: false,
             options_scroll: ScrollHandle::new(),
             toolbar_overflow: vec![],
             nested_submenu: None,
