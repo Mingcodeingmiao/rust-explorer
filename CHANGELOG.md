@@ -2,7 +2,9 @@
 
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
-## [Unreleased]
+## [0.7.2] - 2026-10-18
+
+完整说明见 [docs/v0.7.2.md](docs/v0.7.2.md)。
 
 ### Fixed
 

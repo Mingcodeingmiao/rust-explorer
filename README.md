@@ -7,7 +7,7 @@
 
 使用 **Rust + GPUI** 编写的 Windows 原生文件管理器，支持多标签、系统右键菜单、缩略图和预览，无需浏览器或 WebView2 运行时。
 
-**当前版本：0.7.1，早期迭代阶段。** 主要在 Windows 11 x64 上验证，不宣称与 Explorer 完全等价。处理重要文件前请保留备份。
+**当前版本：0.7.2，早期迭代阶段。** 主要在 Windows 11 x64 上验证，不宣称与 Explorer 完全等价。处理重要文件前请保留备份。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -61,7 +61,7 @@ Debug 构建省略 `-Release`。MSYS2 UCRT64 用户安装 `stable-x86_64-pc-wind
 - [贡献指南](CONTRIBUTING.md)、[行为准则](CODE_OF_CONDUCT.md)、[安全报告](SECURITY.md)
 - [快捷键](docs/explorer-shortcuts.md)、[架构](docs/architecture.md)、[撤销/重做](docs/file-history-062.md)
 - [原生预览](docs/native-previews.md)、[系统图标](docs/system-icons.md)、[运行时资源](docs/fluent-icons.md)
-- [0.7.1 更新说明](docs/v0.7.1.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
+- [0.7.2 更新说明](docs/v0.7.2.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
 
 欢迎通过 Issue 模板报告可复现问题，提供版本、Windows build、DPI/缩放、主题和查看模式；上传前移除个人路径及敏感内容。
 

@@ -4,7 +4,7 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.1** is an early-stage release, primarily validated on Windows 11 x64. It does not claim full Explorer parity. Back up important files before trying new builds.
+Version **0.7.2** is an early-stage release, primarily validated on Windows 11 x64. It does not claim full Explorer parity. Back up important files before trying new builds.
 
 ## Features
 
