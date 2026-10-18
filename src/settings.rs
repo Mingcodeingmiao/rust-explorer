@@ -52,6 +52,12 @@ pub struct Settings {
     pub details_pane: bool,
     pub folders_first: bool,
     pub remember_views: bool,
+    /// Keep item widgets alive while scrolling and render the whole list.
+    pub high_performance: bool,
+    /// Shift+double-click (or Shift+Enter) opens folders in a new tab.
+    pub shift_new_tab: bool,
+    /// The user explicitly opted in to the per-user folder association.
+    pub default_browser: bool,
     pub columns: Vec<(String, f32)>,
     pub volume_columns: Vec<(String, f32)>,
     pub volume_sort: String,
@@ -90,6 +96,9 @@ impl Default for Settings {
             details_pane: false,
             folders_first: true,
             remember_views: true,
+            high_performance: false,
+            shift_new_tab: false,
+            default_browser: false,
             columns: vec![
                 ("name".into(), 300.),
                 ("modified".into(), 156.),

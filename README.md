@@ -7,17 +7,17 @@
 
 使用 **Rust + GPUI** 编写的 Windows 原生文件管理器，支持多标签、系统右键菜单、缩略图和预览，无需浏览器或 WebView2 运行时。
 
-**当前版本：0.6.4，早期迭代阶段。** 主要在 Windows 11 x64 上验证，不宣称与 Explorer 完全等价。处理重要文件前请保留备份。
+**当前版本：0.7.1，早期迭代阶段。** 主要在 Windows 11 x64 上验证，不宣称与 Explorer 完全等价。处理重要文件前请保留备份。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
 ## 功能
 
 - 多标签、前进/后退/上级、面包屑地址栏与快捷键。
-- 八种查看模式、列宽调整、排序、分组、筛选、框选与多选。
-- 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面。
-- 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；拖放前确认。
-- 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单。
+- 八种查看模式、列宽调整、排序、分组、筛选、框选与多选；可选高性能固定组件池模式，不支持大图标/中图标/超大图标/内容视图时自动回退传统实现。
+- 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面；可浏览 MTP/便携设备（如 Android 手机）并通过 Shell 命名空间复制、删除项目，支持完整面包屑、左侧树展开、磁盘容量页和 MTP 项目右键菜单。
+- 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；拖放前确认。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
+- 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单；文件夹菜单提供新标签页/新窗口打开，空白菜单提供粘贴。
 - 图片、视频单帧、PDF、字体与文件夹缩略图，链接箭头和隐藏文件半透明。
 - 明色/暗色/跟随系统主题、界面缩放和高 DPI 图标。
 - 可选 Everything 搜索；不可用时明确回退到当前文件夹名称筛选。
@@ -28,7 +28,7 @@
 
 从 [Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) 下载 Windows x64 ZIP，**完整解压**后运行 `rust-explorer.exe`，通常无需管理员权限。发行文件目前未签名，请比对同版本 `SHA256SUMS.txt`。
 
-Everything 集成需要已安装、可用的 Everything 客户端。程序不会接管 Win+E 或替换系统默认文件管理器。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
+Everything 集成需要已安装、可用的 Everything 客户端。程序默认不接管 Win+E，也不替换系统文件管理器；可在「文件夹选项 → 常规」确认风险后启用实验性的默认文件浏览器关联（仅当前用户、可还原）。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
 
 ## 从源码构建
 
@@ -61,7 +61,7 @@ Debug 构建省略 `-Release`。MSYS2 UCRT64 用户安装 `stable-x86_64-pc-wind
 - [贡献指南](CONTRIBUTING.md)、[行为准则](CODE_OF_CONDUCT.md)、[安全报告](SECURITY.md)
 - [快捷键](docs/explorer-shortcuts.md)、[架构](docs/architecture.md)、[撤销/重做](docs/file-history-062.md)
 - [原生预览](docs/native-previews.md)、[系统图标](docs/system-icons.md)、[运行时资源](docs/fluent-icons.md)
-- [0.6.2 验证记录](docs/audit-0.6.2.md)
+- [0.7.1 更新说明](docs/v0.7.1.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
 
 欢迎通过 Issue 模板报告可复现问题，提供版本、Windows build、DPI/缩放、主题和查看模式；上传前移除个人路径及敏感内容。
 

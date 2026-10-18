@@ -241,6 +241,7 @@ struct DragTab {
 }
 struct TabGhost {
     tab: Tab,
+    name: String,
     accepted: Arc<AtomicBool>,
     width: f32,
     theme: Theme,
@@ -259,7 +260,7 @@ impl Render for TabGhost {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div()
             .w(ui(self.width))
-            .h(ui(36.))
+            .h(ui(32.4))
             .px_3()
             .flex()
             .items_center()
@@ -267,6 +268,7 @@ impl Render for TabGhost {
             .rounded_t(ui(7.))
             .bg(rgb(self.theme.input))
             .text_color(rgb(self.theme.text))
+            .text_size(ui(13. * 0.9))
             .child(visual::icon("folder", self.theme.text))
             .child(
                 div()
@@ -275,7 +277,7 @@ impl Render for TabGhost {
                     .whitespace_nowrap()
                     .overflow_hidden()
                     .text_ellipsis()
-                    .child(navigation::location_name(self.tab.history.current())),
+                    .child(self.name.clone()),
             )
             .child(visual::icon("close", self.theme.text))
     }
@@ -291,7 +293,7 @@ pub(super) fn open_explorer(
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Rust Explorer 0.6.4".into()),
+                title: Some(format!("Rust Explorer {}", env!("CARGO_PKG_VERSION")).into()),
                 appears_transparent: true,
                 ..Default::default()
             }),
@@ -334,6 +336,9 @@ pub(super) fn compare_entries(
     .then_with(|| fs::natural_cmp(&a.name, &b.name));
     if descending { value.reverse() } else { value }
 }
+fn is_image_entry(entry: &Entry) -> bool {
+    !entry.directory && matches!(rust_explorer::preview::kind(&entry.path), Kind::Image)
+}
 fn column_sort(id: &str) -> Sort {
     match id {
         "modified" => Sort::Modified,
@@ -354,7 +359,10 @@ fn column_label(id: &str, usage: bool) -> &'static str {
     }
 }
 fn wrapped(text: &str) -> String {
-    text.graphemes(true).collect::<Vec<_>>().join("\u{200b}")
+    // DirectWrite treats the zero-width break opportunities this used to add
+    // as invalid text-run boundaries on some builds and panics. GPUI already
+    // breaks CJK text without them; long Latin runs are ellipsized.
+    text.to_owned()
 }
 fn menu_icon(id: &str) -> Option<&'static str> {
     Some(if id.starts_with("view:") {
@@ -386,7 +394,9 @@ fn menu_icon(id: &str) -> Option<&'static str> {
             "submenu:sort-menu" => "sort",
             "pin" | "nav-pin" | "nav-unpin" => "pin",
             "copy-path" | "nav-copy-path" => "copy-path",
-            "select-all" | "select-none" | "select-invert" | "checkboxes" => "select-all",
+            "select-all" | "checkboxes" => "select-all",
+            "select-none" => "select-none",
+            "select-invert" => "invert-selection",
             "properties" | "nav-properties" => "properties",
             "options" => "options",
             "preview-pane" | "details-pane" => "preview",
@@ -473,7 +483,7 @@ impl Explorer {
     pub(super) fn sync_thumbnails(&self) {
         let enabled = matches!(
             self.view,
-            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge
+            ViewMode::Medium | ViewMode::Large | ViewMode::ExtraLarge | ViewMode::Content
         ) && self.settings.thumbnails
             && !self.is_home()
             && !self.loading;
@@ -535,6 +545,34 @@ impl Explorer {
             _ => 34.,
         }
     }
+    /// High-performance mode keeps a fixed pool of row widgets and only
+    /// changes their data. Grouped lists use variable-height headers, so they
+    /// fall back to the regular measured virtual list.
+    pub(super) fn high_performance_active(&self) -> bool {
+        self.settings.high_performance
+            && self.group.is_empty()
+            && !self.is_home()
+            && matches!(
+                self.view,
+                ViewMode::Details | ViewMode::List | ViewMode::Small | ViewMode::Tiles
+            )
+    }
+    pub(super) fn high_performance_row_height(&self) -> f32 {
+        self.estimated_row_height().max(1.)
+    }
+    pub(super) fn high_performance_max_row(&self) -> f32 {
+        let visible = self.high_performance_visible.get().max(1);
+        self.rows.len().saturating_sub(visible) as f32
+    }
+    pub(super) fn set_high_performance_row(&self, row: f32) {
+        self.high_performance_row
+            .set(row.clamp(0., self.high_performance_max_row()));
+    }
+    pub(super) fn scroll_high_performance_by(&self, pixels: f32) {
+        let row_height = self.high_performance_row_height() * self.zoom;
+        let current = self.high_performance_row.get();
+        self.set_high_performance_row(current + pixels / row_height.max(1.));
+    }
     pub(super) fn set_list_scroll_row(&self, row: f32) {
         let height = self.estimated_row_height() * self.zoom;
         let visible = f32::from(self.list_scroll.viewport_bounds().size.height) / height;
@@ -564,6 +602,21 @@ impl Explorer {
                         return;
                     }
                     let _ = weak.update(cx, |v, cx| {
+                        if v.high_performance_active() && !e.modifiers.control && !e.modifiers.shift
+                        {
+                            let delta = e.delta.pixel_delta(px(40.));
+                            let amount = if f32::from(delta.y).abs() > 0.1 {
+                                f32::from(delta.y)
+                            } else {
+                                f32::from(delta.x)
+                            };
+                            if amount != 0. {
+                                v.scroll_high_performance_by(-amount);
+                                cx.stop_propagation();
+                                cx.notify();
+                                return;
+                            }
+                        }
                         if e.modifiers.control {
                             let delta = f32::from(e.delta.pixel_delta(px(40.)).y);
                             if v.view_wheel_remainder.signum() != delta.signum() {
@@ -764,7 +817,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         if paths.is_empty()
-            || navigation::is_virtual(&destination)
+            || navigation::is_app_virtual(&destination)
             || self.busy
             || self.options.is_some()
             || self.dialog.is_some()
@@ -801,7 +854,7 @@ impl Explorer {
             Some((path, true)) => Some(path),
             Some((_, false)) => None,
             None if self.content_scroll.bounds().contains(&position)
-                && !navigation::is_virtual(&self.dir()) =>
+                && !navigation::is_app_virtual(&self.dir()) =>
             {
                 Some(self.dir())
             }
@@ -915,6 +968,55 @@ impl Explorer {
             }))
             .into_any_element()
     }
+    pub(super) fn high_performance_vertical_scrollbar(
+        &self,
+        height: f32,
+        top: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let total = self.rows.len() as f32;
+        let visible = self.high_performance_visible.get().max(1) as f32;
+        let max = (total - visible).max(0.);
+        if max <= 0.01 || height <= 1. || total <= 0. {
+            return div().into_any_element();
+        }
+        let physical_height = height * self.zoom;
+        let thumb = (physical_height * visible / total.max(1.))
+            .max(28. * self.zoom)
+            .min(physical_height);
+        let travel = (physical_height - thumb).max(1.);
+        let offset = self.high_performance_row.get().clamp(0., max);
+        let thumb_top = offset / max * travel;
+        let t = self.theme;
+        div()
+            .id("high-performance-scrollbar")
+            .absolute()
+            .right_0()
+            .top(ui(top))
+            .h(px(physical_height))
+            .w(ui(12.))
+            .bg(rgb(t.panel))
+            .child(
+                div()
+                    .id("high-performance-thumb")
+                    .absolute()
+                    .top(px(thumb_top))
+                    .left(ui(3.))
+                    .w(ui(6.))
+                    .h(px(thumb))
+                    .rounded(ui(3.))
+                    .bg(rgb(t.muted))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.scroll_drag =
+                                Some((false, e.position.y.into(), offset, max / travel));
+                        }),
+                    ),
+            )
+            .into_any_element()
+    }
     pub(super) fn vertical_scrollbar(&self, cx: &mut Context<Self>) -> AnyElement {
         if self.view == ViewMode::List {
             return div().into_any_element();
@@ -975,7 +1077,24 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
-        let mut parts: Vec<(String, PathBuf)> = if navigation::is_virtual(&self.dir()) {
+        let mut parts: Vec<(String, PathBuf)> = if navigation::is_shell_folder(&self.dir()) {
+            let mut parts = vec![(navigation::computer_name(), volumes::computer())];
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, path)| path == &self.dir())
+            {
+                parts.extend(self.shell_chain.iter().cloned());
+            } else {
+                let label = self
+                    .shell_names
+                    .get(&self.dir())
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(&self.dir()));
+                parts.push((label, self.dir()));
+            }
+            parts
+        } else if navigation::is_app_virtual(&self.dir()) {
             vec![(navigation::location_name(&self.dir()), self.dir())]
         } else {
             let mut parts = vec![(navigation::computer_name(), volumes::computer())];
@@ -1022,7 +1141,7 @@ impl Explorer {
             .flex_1()
             .min_w_0()
             .h(ui(32.))
-            .bg(rgb(t.input))
+            .bg(rgb(t.panel))
             .rounded(ui(4.))
             .flex()
             .items_center()
@@ -1030,18 +1149,11 @@ impl Explorer {
             .px_2()
             .overflow_hidden()
             .cursor_pointer()
-            .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
+            .on_click(cx.listener(|v, _, w, cx| v.focus_address_end(w, cx)))
+            .child(visual::icon("computer-outline", t.muted))
+            .child(visual::icon("chevron-right", t.muted));
         if hidden > 0 {
             crumbs = crumbs
-                .child(
-                    div()
-                        .w(ui(28.))
-                        .flex_shrink_0()
-                        .flex()
-                        .justify_center()
-                        .child(visual::icon("computer", t.text)),
-                )
-                .child(visual::icon("chevron-right", t.muted))
                 .child(
                     button("hidden-crumbs", "", t)
                         .w(ui(32.))
@@ -1077,8 +1189,7 @@ impl Explorer {
                     .rounded(ui(3.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(t.hover)))
-                    .when(index + 1 == n, |d| d.flex_1())
-                    .when(index + 1 < n, |d| d.flex_shrink_0())
+                    .flex_shrink_0()
                     .child(
                         div()
                             .min_w_0()
@@ -1096,7 +1207,21 @@ impl Explorer {
                 crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
             }
         }
-        crumbs.into_any_element()
+        crumbs
+            .child(visual::icon("chevron-right", t.muted))
+            .child(
+                div()
+                    .id("address-tail")
+                    .flex_1()
+                    .min_w(ui(64.))
+                    .h_full()
+                    .cursor_pointer()
+                    .on_click(cx.listener(|v, _, w, cx| {
+                        cx.stop_propagation();
+                        v.focus_address_end(w, cx);
+                    })),
+            )
+            .into_any_element()
     }
     pub(super) fn save_settings(&self, _: &mut Context<Self>) {
         self.settings.enqueue_save();
@@ -1104,6 +1229,7 @@ impl Explorer {
     pub(super) fn rebuild_rows(&mut self) {
         self.thumbnail_viewport.set(None);
         self.rows.clear();
+        self.content_image_present = false;
         if self.filter_folder != self.dir() {
             self.filter_folder = self.dir();
             self.filters = Default::default();
@@ -1129,6 +1255,7 @@ impl Explorer {
         let mut types = BTreeSet::new();
         for (index, e) in self.entries.iter().enumerate() {
             types.insert(e.kind.as_str());
+            self.content_image_present |= is_image_entry(e);
             if !self.filters.matches(e, self.entry_size(e), today) {
                 continue;
             }
@@ -1542,7 +1669,7 @@ impl Explorer {
     }
     fn tab_drop_index(&self, x: f32) -> usize {
         let available = (self.window_width - 300.).max(110.);
-        let width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        let width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 230.);
         let arrows = if self.tabs.len() as f32 * (width + 4.) > available {
             24.
         } else {
@@ -1597,10 +1724,92 @@ impl Explorer {
             });
         }
     }
+    fn tab_full_path(&self, path: &std::path::Path) -> String {
+        if navigation::is_shell_folder(path) {
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, chain_path)| chain_path == path)
+            {
+                let mut out = navigation::computer_name();
+                for (name, _) in &self.shell_chain {
+                    out.push('\\');
+                    out.push_str(name);
+                }
+                out
+            } else {
+                self.shell_names
+                    .get(path)
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(path))
+            }
+        } else if navigation::is_app_virtual(path) {
+            navigation::location_name(path)
+        } else {
+            path.display().to_string()
+        }
+    }
+    fn tab_short_path(&self, path: &std::path::Path) -> String {
+        let last = if navigation::is_shell_folder(path) {
+            if self
+                .shell_chain
+                .last()
+                .is_some_and(|(_, chain_path)| chain_path == path)
+            {
+                self.shell_chain.last().map(|(name, _)| name.clone())
+            } else {
+                self.shell_names.get(path).cloned()
+            }
+        } else {
+            path.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        };
+        last.map(|name| format!("..\\{name}"))
+            .unwrap_or_else(|| self.tab_full_path(path))
+    }
+    fn show_tab_tip(
+        &mut self,
+        path: PathBuf,
+        bounds: Bounds<Pixels>,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        if !self.settings.full_path {
+            self.hide_tab_tip();
+            return;
+        }
+        let Some(hwnd) = native_hwnd(window) else {
+            return;
+        };
+        use windows::Win32::{
+            Foundation::{HWND, RECT},
+            UI::WindowsAndMessaging::GetWindowRect,
+        };
+        let mut rect = RECT::default();
+        if unsafe { GetWindowRect(HWND(hwnd as _), &mut rect) }.is_err() {
+            return;
+        }
+        let scale = window.scale_factor();
+        let text = self.tab_full_path(&path);
+        let x = rect.left + (f32::from(bounds.left()) * scale).round() as i32;
+        let tab_top = rect.top + (f32::from(bounds.top()) * scale).round() as i32;
+        if self.tab_tip.is_none() {
+            self.tab_tip = crate::tab_tip::TabTip::new(scale, self.theme.dark);
+        }
+        if let Some(tip) = &mut self.tab_tip {
+            tip.show(&text, x, tab_top, scale);
+        }
+    }
+    fn hide_tab_tip(&mut self) {
+        if let Some(tip) = &self.tab_tip {
+            tip.hide();
+        }
+    }
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let available = (f32::from(window.viewport_size().width) / self.zoom - 300.).max(110.);
-        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 200.);
+        // 15% wider than the previous 200 px ceiling.
+        let tab_width = (available / self.tabs.len().max(1) as f32 - 4.).clamp(100., 230.);
         let overflowing = self.tabs.len() as f32 * (tab_width + 4.) > available;
         let mut strip = div()
             .id("tab-strip")
@@ -1608,10 +1817,10 @@ impl Explorer {
             .min_w_0()
             .relative()
             .pr(ui(138.))
-            .h(ui(40.))
+            .h(ui(32.4))
             .flex_shrink_0()
             .flex()
-            .items_center()
+            .items_end()
             .bg(rgb(t.chrome));
         let mut tabs = div()
             .id("tabs-scroll")
@@ -1624,17 +1833,52 @@ impl Explorer {
             .gap_1()
             .px_2();
         for (index, tab) in self.tabs.iter().enumerate() {
-            let name = navigation::location_name(tab.history.current());
+            let current = tab.history.current();
+            let full_path = self.tab_full_path(current);
+            let name = if self.settings.full_path {
+                let short = self.tab_short_path(current);
+                let text_space = (tab_width - 84.).max(16.) * self.zoom;
+                let width = |text: &str| {
+                    let run = TextRun {
+                        len: text.len(),
+                        font: font("Microsoft YaHei UI"),
+                        color: rgb(t.text).into(),
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    f32::from(
+                        window
+                            .text_system()
+                            .shape_line(text.to_string().into(), px(11.7 * self.zoom), &[run], None)
+                            .width,
+                    )
+                };
+                if width(&full_path) <= text_space {
+                    full_path.clone()
+                } else {
+                    short
+                }
+            } else {
+                self.shell_names
+                    .get(current)
+                    .cloned()
+                    .unwrap_or_else(|| navigation::location_name(current))
+            };
             let drag = DragTab {
                 tab: tab.clone(),
                 source: cx.entity().downgrade(),
                 accepted: Arc::new(AtomicBool::new(false)),
             };
             let sender = self.drag_tx.clone();
+            let ghost_name = name.clone();
+            let tip_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let tip_bounds_canvas = tip_bounds.clone();
+            let tip_path = current.to_path_buf();
             tabs = tabs.child(
                 div()
                     .id(("tab", tab.id))
-                    .h(ui(36.))
+                    .h(ui(32.4))
                     .w(ui(tab_width))
                     .flex_shrink_0()
                     .rounded_t(ui(7.))
@@ -1648,6 +1892,13 @@ impl Explorer {
                     .px_3()
                     .gap_2()
                     .cursor_pointer()
+                    .on_hover(cx.listener(move |v, hovered, w, cx| {
+                        if *hovered {
+                            v.show_tab_tip(tip_path.clone(), tip_bounds.get(), w, cx);
+                        } else {
+                            v.hide_tab_tip();
+                        }
+                    }))
                     .on_click(cx.listener(move |v, _, _, cx| v.switch_tab(index, cx)))
                     .on_mouse_down(
                         MouseButton::Middle,
@@ -1658,6 +1909,7 @@ impl Explorer {
                         let _ = drag.source.update(cx, |v, _| v.tab_drag = Some(flag));
                         cx.new(|_| TabGhost {
                             tab: drag.tab.clone(),
+                            name: ghost_name.clone(),
                             accepted: drag.accepted.clone(),
                             width: tab_width,
                             theme: t,
@@ -1680,20 +1932,37 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
+                            .text_size(ui(13. * 0.9))
                             .whitespace_nowrap()
                             .overflow_hidden()
-                            .text_ellipsis()
+                            .when(!self.settings.full_path, |d| d.text_ellipsis())
                             .child(name),
                     )
                     .child(
-                        button(("close-tab", tab.id), "×", t)
-                            .w(ui(24.))
-                            .px_1()
+                        div()
+                            .id(("close-tab", tab.id))
+                            .w(ui(22.))
+                            .h(ui(22.))
                             .flex_shrink_0()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(ui(3.))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(rgb(t.hover)))
+                            .child(visual::icon_sized("close", t.muted, 16. * 2. / 3.))
                             .on_click(cx.listener(move |v, _, _, cx| {
                                 cx.stop_propagation();
                                 v.close_tab(index, cx);
                             })),
+                    )
+                    .child(
+                        canvas(
+                            move |bounds, _, _| tip_bounds_canvas.set(bounds),
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .inset_0(),
                     ),
             )
         }
@@ -1723,7 +1992,10 @@ impl Explorer {
             .child(
                 div()
                     .id("caption-drag")
-                    .h_full()
+                    // Leave the top 4 px free of a drag hit region so the
+                    // native top resize border still works; the caption
+                    // buttons themselves remain flush with the window top.
+                    .h(ui(28.4))
                     .w(ui(64.))
                     .flex_1()
                     .min_w(ui(64.))
@@ -2015,6 +2287,7 @@ impl Explorer {
                 .into_any_element();
         }
         let name = self.displayed_name(e);
+        let click_path = e.path.clone();
         let source = cx.entity().downgrade();
         let drag = DragFiles {
             paths: if self.selected.contains(&index) {
@@ -2052,6 +2325,15 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if e.click_count == 2 && e.modifiers.control {
+                        v.selected.insert(index);
+                        v.anchor = index;
+                        v.focus_item = Some(click_path.clone());
+                        v.rename_token += 1;
+                        v.pending_selection_click = None;
+                        v.open_ctrl_selection(cx);
+                        return;
+                    }
                     let rename = v.selected.len() == 1
                         && v.selected.contains(&index)
                         && v.selected_at.elapsed() > Duration::from_millis(500)
@@ -2070,7 +2352,8 @@ impl Explorer {
                     }
                     if e.click_count == 2 || v.settings.single_click {
                         v.rename_token += 1;
-                        v.open_selected(cx);
+                        let new_tab = v.settings.shift_new_tab && e.modifiers.shift;
+                        v.open_selected_with(new_tab, cx);
                     } else if rename {
                         let token = v.rename_token;
                         cx.spawn(async move |view, cx| {
@@ -2110,7 +2393,7 @@ impl Explorer {
             self.view,
             ViewMode::ExtraLarge | ViewMode::Large | ViewMode::Medium
         );
-        let rich = matches!(self.view, ViewMode::Tiles | ViewMode::Content);
+        let rich = self.view == ViewMode::Tiles;
         // Keep grid allocation stable, but paint each item's own content rectangle.
         let natural_name = self.displayed_name(entry);
         let run = TextRun {
@@ -2175,6 +2458,7 @@ impl Explorer {
             self.file_drag.as_ref().and_then(|d| d.target.as_ref()) == Some(&entry.path);
         let drop_bounds = self.file_drop_bounds.clone();
         let drop_path = entry.path.clone();
+        let click_path = entry.path.clone();
         let drop_directory = entry.directory;
         let painted_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
         let mouse_bounds = painted_bounds.clone();
@@ -2205,6 +2489,7 @@ impl Explorer {
                 }))
                 .py_0()
             })
+            .when(self.view == ViewMode::Content, |d| d.h(ui(74.)).py_0())
             .flex()
             .items_center()
             .when(large, |d| {
@@ -2256,6 +2541,15 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
+                    if e.click_count == 2 && e.modifiers.control {
+                        v.selected.insert(index);
+                        v.anchor = index;
+                        v.focus_item = Some(click_path.clone());
+                        v.rename_token += 1;
+                        v.pending_selection_click = None;
+                        v.open_ctrl_selection(cx);
+                        return;
+                    }
                     if v.selected.contains(&index)
                         && !e.modifiers.shift
                         && e.click_count == 1
@@ -2266,7 +2560,8 @@ impl Explorer {
                         v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     }
                     if e.click_count == 2 || v.settings.single_click {
-                        v.open_selected(cx);
+                        let new_tab = v.settings.shift_new_tab && e.modifiers.shift;
+                        v.open_selected_with(new_tab, cx);
                     }
                 }),
             )
@@ -2448,7 +2743,7 @@ impl Explorer {
                     row.child(checkbox(self, cx))
                 };
             }
-            let key = if large {
+            let key = if large || self.view == ViewMode::Content {
                 rust_explorer::thumbnails::Key::from_entry(
                     entry,
                     visual::thumbnail_pixels(self.view.icon_size()),
@@ -2488,65 +2783,161 @@ impl Explorer {
                     )
                 })
                 .when(
-                    (has_thumbnail && presentation.shortcut)
-                        || (entry.link
-                            && !entry.path.extension().is_some_and(|e| {
-                                e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url")
-                            })),
-                    |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .bottom_0()
-                                .size(ui(16.))
-                                .bg(rgb(0xffffff))
-                                .child(visual::icon("shortcut", 0x0067c0)),
-                        )
-                    },
-                );
+                    entry.link
+                        && !entry.path.extension().is_some_and(|e| {
+                            e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url")
+                        }),
+                    |d| d.child(visual::link_badge(self.view.icon_size())),
+                )
+                .when(has_thumbnail && presentation.shortcut && !entry.link, |d| {
+                    d.child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .bottom_0()
+                            .size(ui(16.))
+                            .bg(rgb(0xffffff))
+                            .child(visual::icon("shortcut", 0x0067c0)),
+                    )
+                });
             row = row.child(picture);
-            let name_width = (item_width
-                - 24.
-                - if large {
-                    0.
-                } else {
-                    self.view.icon_size() + 8.
+            if self.view == ViewMode::Content {
+                let layout =
+                    rust_explorer::content_layout::columns(item_width, self.content_image_present);
+                let name_width = (layout.first
+                    - 24.
+                    - self.view.icon_size()
+                    - 8.
+                    - if self.settings.checkboxes { 30. } else { 0. })
+                .max(24.);
+                let first = div()
+                    .w(ui(name_width))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .child(self.name_element(index, entry, name_width, window, cx))
+                    .child(
+                        div()
+                            .text_color(rgb(t.muted))
+                            .text_size(ui(12.))
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(entry.kind.clone()),
+                    );
+                row = row.child(first);
+                if let Some(middle) = layout.middle {
+                    let mut center = div()
+                        .w(ui((middle - 12.).max(40.)))
+                        .flex_shrink_0()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .justify_center();
+                    if is_image_entry(entry) {
+                        let dimensions = key
+                            .as_ref()
+                            .and_then(|key| self.thumbnails.presentation(key))
+                            .map(|presentation| (presentation.width, presentation.height))
+                            .unwrap_or_default();
+                        center = center
+                            .child(
+                                div()
+                                    .text_color(rgb(t.muted))
+                                    .text_size(ui(12.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(format!("类型：{}", entry.kind)),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(t.muted))
+                                    .text_size(ui(12.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(if dimensions.0 > 0 && dimensions.1 > 0 {
+                                        format!("分辨率：{} x {}", dimensions.0, dimensions.1)
+                                    } else {
+                                        "分辨率：—".to_string()
+                                    }),
+                            );
+                    }
+                    row = row.child(center);
                 }
-                - if self.settings.checkboxes && !large {
-                    30.
-                } else {
-                    0.
-                })
-            .max(24.);
-            let mut name = div()
-                .w(ui(name_width))
-                .flex_shrink_0()
-                .min_w_0()
-                .flex()
-                .flex_col()
-                .when(large, |d| d.w_full().text_center())
-                .child(self.name_element(index, entry, name_width, window, cx));
-            if rich {
-                name = name.child(
-                    div()
-                        .text_color(rgb(t.muted))
-                        .text_size(ui(12.))
-                        .overflow_hidden()
-                        .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
-                );
-                if self.view == ViewMode::Content {
+                if let Some(right) = layout.right {
+                    row = row.child(
+                        div()
+                            .w(ui(right))
+                            .flex_shrink_0()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .text_color(rgb(t.muted))
+                                    .text_size(ui(12.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(format!("修改日期：{}", entry.date())),
+                            )
+                            .child(
+                                div()
+                                    .text_color(rgb(t.muted))
+                                    .text_size(ui(12.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_ellipsis()
+                                    .child(format!(
+                                        "大小：{}",
+                                        if entry.directory {
+                                            "—".to_string()
+                                        } else {
+                                            self.entry_size_text(entry)
+                                        }
+                                    )),
+                            ),
+                    );
+                }
+            } else {
+                let name_width = (item_width
+                    - 24.
+                    - if large {
+                        0.
+                    } else {
+                        self.view.icon_size() + 8.
+                    }
+                    - if self.settings.checkboxes && !large {
+                        30.
+                    } else {
+                        0.
+                    })
+                .max(24.);
+                let mut name = div()
+                    .w(ui(name_width))
+                    .flex_shrink_0()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .when(large, |d| d.w_full().text_center())
+                    .child(self.name_element(index, entry, name_width, window, cx));
+                if rich {
                     name = name.child(
                         div()
                             .text_color(rgb(t.muted))
                             .text_size(ui(12.))
-                            .child(format!("修改日期：{}", entry.date())),
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
                     );
                 }
+                row = row.child(name);
             }
-            row = row.child(name);
         }
         let row = row
             .when(
@@ -2866,9 +3257,31 @@ impl Explorer {
                         .selected
                         .first()
                         .is_some_and(|i| self.entries[*i].directory);
+                if navigation::is_shell_folder(&self.dir()) {
+                    let single = self.selected.len() == 1;
+                    let mut items = vec![MenuItem::new("file-open", "打开")];
+                    if folder {
+                        items.push(MenuItem::new("file-tab", "在新标签页中打开"));
+                        items.push(MenuItem::new("file-window", "在新窗口中打开"));
+                    }
+                    items.push(MenuItem::separator());
+                    if folder {
+                        items.push(MenuItem::new("file-cut", "剪切"));
+                        items.push(MenuItem::new("file-copy", "复制"));
+                    } else {
+                        items.push(MenuItem::new("file-copy", "复制"));
+                        items.push(MenuItem::new("file-cut", "剪切"));
+                    }
+                    items.push(MenuItem::new("file-delete", "删除"));
+                    items.push(MenuItem::new("file-rename", "重命名").enable(single));
+                    items.push(MenuItem::separator());
+                    items.push(MenuItem::new("properties", "属性").enable(single));
+                    return items;
+                }
                 vec![
                     MenuItem::new("file-open", "打开"),
                     MenuItem::new("file-tab", "在新标签页中打开").enable(folder),
+                    MenuItem::new("file-window", "在新窗口中打开").enable(folder),
                     MenuItem::new("file-explorer", "在系统资源管理器中打开").enable(folder),
                     MenuItem::separator(),
                     MenuItem::new("file-cut", "剪切"),
@@ -2876,20 +3289,37 @@ impl Explorer {
                     MenuItem::new("file-rename", "重命名")
                         .enable(self.selected.len() == 1 && !navigation::is_virtual(&self.dir())),
                     MenuItem::new("file-delete", "删除")
-                        .enable(!navigation::is_virtual(&self.dir())),
+                        .enable(!navigation::is_app_virtual(&self.dir())),
                     MenuItem::new("copy-path", "复制路径"),
-                    MenuItem::new("pin", "固定到快速访问").enable(folder),
+                    MenuItem::new("pin", "固定到快速访问")
+                        .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
-                        .enable(folder),
+                        .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::separator(),
-                    MenuItem::new("properties", "属性"),
-                    MenuItem::new("system-menu", "显示完整系统菜单"),
+                    MenuItem::new("properties", "属性")
+                        .enable(!navigation::is_shell_folder(&self.dir())),
+                    MenuItem::new("system-menu", "显示完整系统菜单")
+                        .enable(!navigation::is_shell_folder(&self.dir())),
                 ]
             }
-            "access-menu" => vec![
-                MenuItem::new("remove-access", "删除访问权限（系统设置）…"),
-                MenuItem::new("grant-access", "特定用户…"),
-            ],
+            "access-menu" => {
+                let path = self
+                    .selected
+                    .iter()
+                    .next()
+                    .and_then(|index| self.entries.get(*index))
+                    .map(|entry| entry.path.clone())
+                    .unwrap_or_else(|| self.dir());
+                if path.has_root() && path.parent().is_none() {
+                    // Explorer exposes only Advanced Sharing at a drive root.
+                    vec![MenuItem::new("advanced-share", "高级共享…")]
+                } else {
+                    vec![
+                        MenuItem::new("remove-access", "删除访问权限（系统设置）…"),
+                        MenuItem::new("grant-access", "特定用户…"),
+                    ]
+                }
+            }
             "background-menu" => vec![
                 MenuItem::new("undo", "撤销    Ctrl+Z")
                     .enable(!self.undo_stack.is_empty() && !self.busy),
@@ -2901,13 +3331,16 @@ impl Explorer {
                 MenuItem::new("submenu:group", "分组依据                     ›"),
                 MenuItem::new("refresh-folder", "刷新"),
                 MenuItem::separator(),
-                MenuItem::new("file-paste", "粘贴"),
-                MenuItem::new("submenu:new-menu", "新建                         ›"),
+                MenuItem::new("file-paste", "粘贴").enable(self.can_paste()),
+                MenuItem::new("submenu:new-menu", "新建                         ›")
+                    .enable(!navigation::is_virtual(&self.dir())),
                 MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
                     .enable(!navigation::is_virtual(&self.dir())),
                 MenuItem::separator(),
-                MenuItem::new("properties", "属性"),
-                MenuItem::new("system-menu", "显示完整系统菜单"),
+                MenuItem::new("properties", "属性")
+                    .enable(!navigation::is_shell_folder(&self.dir())),
+                MenuItem::new("system-menu", "显示完整系统菜单")
+                    .enable(!navigation::is_shell_folder(&self.dir())),
             ],
             "quick-background-menu" => vec![
                 MenuItem::new("submenu:view-menu", "查看                         ›"),
@@ -2973,11 +3406,15 @@ impl Explorer {
                 {
                     items.push(MenuItem::new("nav-pin", "固定到快速访问"));
                 }
+                let shell_target = self
+                    .context_target
+                    .as_ref()
+                    .is_some_and(|path| navigation::is_shell_folder(path));
                 items.extend([
                     MenuItem::separator(),
                     MenuItem::new("nav-copy-path", "复制文件地址"),
-                    MenuItem::new("nav-properties", "属性"),
-                    MenuItem::new("nav-system-menu", "显示完整系统菜单"),
+                    MenuItem::new("nav-properties", "属性").enable(!shell_target),
+                    MenuItem::new("nav-system-menu", "显示完整系统菜单").enable(!shell_target),
                 ]);
                 items
             }
@@ -3063,11 +3500,15 @@ impl Explorer {
                         "cut" => MenuItem::new("file-cut", "剪切").enable(any),
                         "copy" => MenuItem::new("file-copy", "复制").enable(any),
                         "paste" => MenuItem::new("file-paste", "粘贴")
-                            .enable(!navigation::is_virtual(&self.dir())),
-                        "rename" => MenuItem::new("file-rename", "重命名")
-                            .enable(self.selected.len() == 1 && !self.is_home()),
+                            .enable(!navigation::is_app_virtual(&self.dir())),
+                        "rename" => MenuItem::new("file-rename", "重命名").enable(
+                            self.selected.len() == 1
+                                && !self.is_home()
+                                && !navigation::is_shell_folder(&self.dir()),
+                        ),
                         "share" => MenuItem::new("file-share", "共享").enable(
                             self.selected.len() == 1
+                                && !navigation::is_shell_folder(&self.dir())
                                 && self
                                     .selected
                                     .first()
@@ -3355,6 +3796,34 @@ impl Explorer {
             cx.notify();
             return;
         }
+        if id == "open-new-tab" || id == "open-new-window" {
+            let folders: Vec<PathBuf> = self
+                .selected
+                .iter()
+                .filter_map(|index| self.entries.get(*index))
+                .filter(|entry| entry.directory && !entry.link)
+                .map(|entry| entry.path.clone())
+                .collect();
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+            w.focus(&self.focus);
+            for path in folders {
+                if id == "open-new-tab" {
+                    self.open_tab_path(path, cx);
+                } else {
+                    let tab = Tab {
+                        id: next_tab_id(),
+                        history: History::new(path),
+                        query: String::new(),
+                        global: false,
+                    };
+                    let _ = open_explorer(Some(tab), cx);
+                }
+            }
+            cx.notify();
+            return;
+        }
         if let Some((column, option)) = id
             .strip_prefix("filter-option:")
             .and_then(|s| s.split_once(':'))
@@ -3447,6 +3916,7 @@ impl Explorer {
             if let Some((view, _)) = ViewMode::ALL.get(index) {
                 self.view = *view;
                 self.content_scroll.set_offset(point(px(0.), px(0.)));
+                self.high_performance_row.set(0.);
                 self.list_scroll.scroll_to(ListOffset::default());
                 self.settings.view = *view;
                 if self.settings.remember_views {
@@ -3527,6 +3997,7 @@ impl Explorer {
             "usage" => self.start_usage(cx),
             "global" => {
                 self.tabs[self.active].global = !self.tabs[self.active].global;
+                self.sync_search_placeholder(cx);
                 if !self.tabs[self.active].query.is_empty() {
                     self.reload(cx);
                 }
@@ -3547,26 +4018,57 @@ impl Explorer {
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
             }
+            "file-window" => {
+                let folders: Vec<PathBuf> = self
+                    .selected
+                    .iter()
+                    .filter_map(|index| self.entries.get(*index))
+                    .filter(|entry| entry.directory)
+                    .map(|entry| entry.path.clone())
+                    .collect();
+                for path in folders {
+                    let tab = Tab {
+                        id: next_tab_id(),
+                        history: History::new(path),
+                        query: String::new(),
+                        global: false,
+                    };
+                    let _ = open_explorer(Some(tab), cx);
+                }
+            }
             "file-cut" => self.copy(true, cx),
             "file-copy" => self.copy(false, cx),
-            "file-paste" => self.paste(cx),
+            "file-paste" | "paste" => self.paste(cx),
             "file-rename" => self.rename_dialog(w, cx),
-            "file-delete" => self.delete_dialog(w, cx),
+            "file-delete" => {
+                if w.modifiers().shift {
+                    let paths = self.paths();
+                    if !paths.is_empty() {
+                        self.show_dialog(Dialog::PermanentDelete(paths), w, cx);
+                    }
+                } else {
+                    self.delete_dialog(w, cx);
+                }
+            }
             "system-menu" => self.system_menu(cx),
-            "grant-access" | "remove-access" => {
+            "grant-access" | "remove-access" | "advanced-share" => {
                 let path = self
                     .paths()
                     .into_iter()
                     .next()
                     .unwrap_or_else(|| self.dir());
                 if !navigation::is_virtual(&path) {
-                    self.run_shell(
-                        shell::Request::SharingAccess {
-                            path,
-                            remove: id == "remove-access",
-                        },
-                        cx,
-                    );
+                    if id == "advanced-share" {
+                        self.run_shell(shell::Request::AdvancedShare { path }, cx);
+                    } else {
+                        self.run_shell(
+                            shell::Request::SharingAccess {
+                                path,
+                                remove: id == "remove-access",
+                            },
+                            cx,
+                        );
+                    }
                 }
             }
             "refresh-folder" => self.reload(cx),
@@ -3660,6 +4162,7 @@ impl Explorer {
                                 group: self.group.clone(),
                                 undo: !self.undo_stack.is_empty(),
                                 redo: !self.redo_stack.is_empty(),
+                                can_paste: false,
                             },
                             cx,
                         );
@@ -3741,13 +4244,22 @@ impl Explorer {
             "properties" => {
                 let mut paths = self.paths();
                 if paths.is_empty() {
-                    if navigation::is_virtual(&self.dir()) {
+                    if navigation::is_app_virtual(&self.dir()) {
                         self.run_shell(shell::Request::SystemProperties, cx);
                         return;
                     }
                     paths.push(self.dir());
                 }
-                self.run_shell(shell::Request::PropertiesMany { paths }, cx);
+                if paths.len() == 1 && rust_explorer::shell_folder::is_shell_path(&paths[0]) {
+                    self.run_shell(
+                        shell::Request::Properties {
+                            path: paths.remove(0),
+                        },
+                        cx,
+                    );
+                } else {
+                    self.run_shell(shell::Request::PropertiesMany { paths }, cx);
+                }
             }
             "pin" => {
                 self.change_quick_access(self.paths(), true, cx);
@@ -3846,7 +4358,21 @@ impl Explorer {
             self.tree_children.clear();
             self.hidden = self.settings.hidden;
             self.preview_open = self.settings.preview;
+            let browser = rust_explorer::default_browser::is_enabled();
+            if self.settings.default_browser && !browser {
+                if let Err(error) = rust_explorer::default_browser::enable() {
+                    self.settings.default_browser = false;
+                    self.error = Some(format!("无法设为默认文件浏览器：{error:#}"));
+                }
+            } else if !self.settings.default_browser && browser {
+                let _ = rust_explorer::default_browser::disable();
+            }
             self.view = self.settings.view;
+            if let Some(options) = &mut self.options {
+                options.view = self.settings.view;
+                options.high_performance = self.settings.high_performance;
+                options.default_browser = self.settings.default_browser;
+            }
             self.save_settings(cx);
             self.reload(cx);
             if close {
@@ -3891,6 +4417,101 @@ impl Explorer {
             });
         })
         .detach();
+    }
+    pub(super) fn render_default_browser_prompt(&self, cx: &mut Context<Self>) -> AnyElement {
+        let t = self.theme;
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x00000090))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+            .child(
+                div()
+                    .w(ui(560.))
+                    .max_w_full()
+                    .p_6()
+                    .rounded(ui(10.))
+                    .bg(rgb(t.panel))
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .shadow_lg()
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(
+                        div()
+                            .text_size(ui(19.))
+                            .text_color(rgb(0xe24b4b))
+                            .child("将 Rust Explorer 设为默认文件浏览器？"),
+                    )
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .line_height(ui(23.))
+                            .child("此操作会修改当前用户的文件夹打开方式（目录、文件夹和磁盘驱动器），让它们启动 Rust Explorer。Windows 没有为第三方文件管理器提供受支持的默认浏览器接口，因此可能出现意想不到的副作用：系统搜索、打开/另存为对话框、其他程序调用资源管理器、驱动器属性等行为可能改变，Windows 更新也可能重置或破坏此关联。"),
+                    )
+                    .child(
+                        div()
+                            .whitespace_normal()
+                            .line_height(ui(23.))
+                            .text_color(rgb(t.muted))
+                            .child("程序会备份原有注册表值，可在同一选项中关闭并还原。你需自行承担启用此功能的风险。"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .justify_end()
+                            .gap_2()
+                            .child(button("default-browser-cancel", "取消", t).on_click(
+                                cx.listener(|v, _, _, cx| {
+                                    v.default_browser_prompt = false;
+                                    if let Some(s) = &mut v.options {
+                                        s.default_browser = false;
+                                    }
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(
+                                button(
+                                    "default-browser-confirm",
+                                    "我承担风险，启用",
+                                    t,
+                                )
+                                .bg(rgb(0xa62929))
+                                .text_color(rgb(0xffffff))
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    v.default_browser_prompt = false;
+                                    match rust_explorer::default_browser::enable() {
+                                        Ok(()) => {
+                                            if let Some(s) = &mut v.options {
+                                                s.default_browser = true;
+                                            }
+                                            v.settings.default_browser = true;
+                                            v.settings.enqueue_save();
+                                            v.status =
+                                                "已将 Rust Explorer 设为默认文件浏览器；可在文件夹选项中撤销"
+                                                    .into();
+                                        }
+                                        Err(error) => {
+                                            if let Some(s) = &mut v.options {
+                                                s.default_browser = false;
+                                            }
+                                            v.error = Some(format!(
+                                                "无法设为默认文件浏览器：{error:#}"
+                                            ));
+                                        }
+                                    }
+                                    cx.notify();
+                                })),
+                            ),
+                    ),
+            )
+            .into_any_element()
     }
     pub(super) fn render_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
@@ -3945,8 +4566,23 @@ impl Explorer {
                     "始终将文件夹排列在文件前面",
                     settings.folders_first,
                 ),
+                (
+                    "shift-new-tab",
+                    "按住 Shift 双击文件夹时在新标签页中打开",
+                    settings.shift_new_tab,
+                ),
+                (
+                    "default-browser",
+                    "将 Rust Explorer 设为默认文件浏览器（非系统支持方式，需自行承担风险）",
+                    settings.default_browser,
+                ),
             ],
             1 => vec![
+                (
+                    "high-performance",
+                    "高性能模式（滚动时复用项目组件；大图标、中图标、超大图标和内容视图自动使用传统实现）",
+                    settings.high_performance,
+                ),
                 (
                     "extensions",
                     "显示已知文件类型的扩展名",
@@ -3970,7 +4606,11 @@ impl Explorer {
                     "右键直接显示完整系统菜单",
                     settings.full_system_menu,
                 ),
-                ("full-path", "在窗口标题中显示完整路径", settings.full_path),
+                (
+                    "full-path",
+                    "在窗口标题栏和标签页中显示完整路径",
+                    settings.full_path,
+                ),
                 (
                     "preview",
                     "显示预览窗格（文本、照片、视频帧、PDF）",
@@ -4039,12 +4679,26 @@ impl Explorer {
                     .child(visual::checkbox(checked, t.muted))
                     .child(div().flex_1().min_w_0().whitespace_normal().child(label))
                     .on_click(cx.listener(move |v, _, _, cx| {
+                        let mut disable_browser = false;
+                        let mut ask_browser = false;
                         if let Some(s) = &mut v.options {
                             match id {
                                 "single" => s.single_click = !s.single_click,
                                 "separate" => s.separate_process = !s.separate_process,
                                 "remember" => s.remember_views = !s.remember_views,
                                 "folders-first" => s.folders_first = !s.folders_first,
+                                "shift-new-tab" => s.shift_new_tab = !s.shift_new_tab,
+                                "default-browser" => {
+                                    if s.default_browser {
+                                        s.default_browser = false;
+                                        disable_browser = true;
+                                    } else {
+                                        ask_browser = true;
+                                    }
+                                }
+                                "high-performance" => {
+                                    s.high_performance = !s.high_performance;
+                                }
                                 "extensions" => s.extensions = !s.extensions,
                                 "hidden" => s.hidden = !s.hidden,
                                 "protected" => s.protected = !s.protected,
@@ -4056,6 +4710,15 @@ impl Explorer {
                                 "preview" => s.preview = !s.preview,
                                 _ => {}
                             }
+                        }
+                        if disable_browser {
+                            v.status = match rust_explorer::default_browser::disable() {
+                                Ok(()) => "已取消默认文件浏览器设置".into(),
+                                Err(error) => format!("无法还原文件夹关联：{error:#}"),
+                            };
+                        }
+                        if ask_browser {
+                            v.default_browser_prompt = true;
                         }
                         cx.notify();
                     })),
@@ -4166,6 +4829,10 @@ impl Explorer {
                             .justify_between()
                             .child(button("options-defaults", "还原默认值", t).on_click(
                                 cx.listener(|v, _, _, cx| {
+                                    if rust_explorer::default_browser::is_enabled() {
+                                        let _ = rust_explorer::default_browser::disable();
+                                    }
+                                    v.settings.default_browser = false;
                                     v.options = Some(Settings::default());
                                     cx.notify();
                                 }),

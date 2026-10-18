@@ -192,21 +192,24 @@ pub fn drain() -> bool {
     })
 }
 pub fn icon(name: &str, color: u32) -> AnyElement {
-    if matches!(name, "home" | "quick-access") {
-        return drawn_icon(name, color);
+    icon_sized(name, color, 16.)
+}
+pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
+    if matches!(name, "home" | "quick-access" | "computer-outline") {
+        return drawn_icon_sized(name, color, logical);
     }
     let dark = ICONS.with(|v| v.borrow().dark);
     if let Some(path) = fluent_icons::path(name, dark) {
         if matches!(name, "close" | "pin" | "unpin") {
             return svg()
                 .path(path.to_string_lossy().into_owned())
-                .size(ui(16.))
+                .size(ui(logical))
                 .flex_shrink_0()
                 .text_color(rgb(color))
                 .into_any_element();
         }
         return img(path)
-            .size(ui(16.))
+            .size(ui(logical))
             .flex_shrink_0()
             .object_fit(ObjectFit::Contain)
             .into_any_element();
@@ -243,22 +246,26 @@ pub fn icon(name: &str, color: u32) -> AnyElement {
             | "chevron-left"
             | "check"
             | "checkbox"
+            | "select-all"
+            | "select-none"
+            | "select-invert"
     ) {
-        return drawn_icon(name, color);
+        return drawn_icon_sized(name, color, logical);
     }
     if matches!(
         name,
-        "chevron-up" | "options" | "zip" | "details-pane" | "select-none" | "invert-selection"
+        "chevron-up" | "options" | "zip" | "details-pane" | "invert-selection"
     ) {
-        return drawn_icon(
+        return drawn_icon_sized(
             match name {
                 "chevron-up" => "chevron-up",
                 "options" => "settings",
                 "zip" => "archive",
                 "details-pane" => "preview",
-                _ => "select-all",
+                _ => "select-invert",
             },
             color,
+            logical,
         );
     }
     let path = ICONS.with(|v| {
@@ -266,7 +273,7 @@ pub fn icon(name: &str, color: u32) -> AnyElement {
         let key = IconRequest::ui(name, v.pixels);
         v.get(key)
     });
-    picture_or_draw(path, name, color)
+    picture_or_draw_sized(path, name, color, logical)
 }
 pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
     file_icon_sized(path, directory, color, 16.)
@@ -274,7 +281,13 @@ pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
 /// Badge for reparse links whose shared class icon has no Shell overlay.
 /// Do not add to .lnk/.url icons: their per-item Shell bitmap owns its arrow.
 pub fn link_badge(logical: f32) -> AnyElement {
-    let edge = (logical * 0.36).clamp(8., 18.);
+    // Extra-large overlays are twice the previous 18 px cap; small/list/detail
+    // icons all use the same 8 px overlay.
+    let edge = if logical >= 140. {
+        36.
+    } else {
+        (logical * 0.36).clamp(8., 18.)
+    };
     div()
         .absolute()
         .left_0()
@@ -511,21 +524,55 @@ pub fn associated_app_icon(path: &Path, color: u32, logical: f32) -> AnyElement 
         })
         .into_any_element()
 }
-fn picture_or_draw(path: Option<PathBuf>, name: &str, color: u32) -> AnyElement {
+fn picture_or_draw_sized(
+    path: Option<PathBuf>,
+    name: &str,
+    color: u32,
+    logical: f32,
+) -> AnyElement {
     if let Some(path) = path {
         img(path)
-            .size(ui(16.))
+            .size(ui(logical))
             .flex_shrink_0()
             .object_fit(ObjectFit::Contain)
             .into_any_element()
     } else {
-        drawn_icon(name, color)
+        drawn_icon_sized(name, color, logical)
     }
+}
+fn drawn_icon(name: &str, color: u32) -> AnyElement {
+    drawn_icon_sized(name, color, 16.)
 }
 // Small vector fallbacks, used only until a native resource arrives or when
 // no matching resource exists. They are painted by GPUI, not a browser/font.
-fn drawn_icon(name: &str, color: u32) -> AnyElement {
+fn drawn_icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
     let paths: Vec<Vec<(f32, f32)>> = match name {
+        "computer-outline" => vec![
+            vec![(1., 2.), (15., 2.), (15., 11.), (1., 11.), (1., 2.)],
+            vec![(8., 11.), (8., 14.)],
+            vec![(4., 14.), (12., 14.)],
+        ],
+        "select-none" => vec![
+            vec![(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)],
+            vec![(10., 2.), (14., 2.), (14., 6.), (10., 6.), (10., 2.)],
+            vec![(2., 10.), (6., 10.), (6., 14.), (2., 14.), (2., 10.)],
+            vec![(10., 10.), (14., 10.), (14., 14.), (10., 14.), (10., 10.)],
+        ],
+        "select-invert" => vec![
+            vec![(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)],
+            vec![(10., 2.), (14., 2.), (14., 6.), (10., 6.), (10., 2.)],
+            vec![(2., 10.), (6., 10.), (6., 14.), (2., 14.), (2., 10.)],
+            vec![(10., 10.), (14., 10.), (14., 14.), (10., 14.), (10., 10.)],
+            vec![(7., 7.), (13., 13.)],
+            vec![(13., 7.), (7., 13.)],
+        ],
+        "select-all" => vec![
+            vec![(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)],
+            vec![(10., 2.), (14., 2.), (14., 6.), (10., 6.), (10., 2.)],
+            vec![(2., 10.), (6., 10.), (6., 14.), (2., 14.), (2., 10.)],
+            vec![(10., 10.), (14., 10.), (14., 14.), (10., 14.), (10., 10.)],
+            vec![(6., 8.), (9., 11.), (14., 5.)],
+        ],
         "quick-access" => vec![vec![
             (8., 1.),
             (10., 6.),
@@ -608,7 +655,7 @@ fn drawn_icon(name: &str, color: u32) -> AnyElement {
             vec![(1., 12.), (5., 12.), (5., 15.), (1., 15.), (1., 12.)],
             vec![(11., 12.), (15., 12.), (15., 15.), (11., 15.), (11., 12.)],
         ],
-        "view-grid" | "select-all" => vec![
+        "view-grid" => vec![
             vec![(2., 2.), (6., 2.), (6., 6.), (2., 6.), (2., 2.)],
             vec![(10., 2.), (14., 2.), (14., 6.), (10., 6.), (10., 2.)],
             vec![(2., 10.), (6., 10.), (6., 14.), (2., 14.), (2., 10.)],
@@ -859,7 +906,7 @@ fn drawn_icon(name: &str, color: u32) -> AnyElement {
             }
         },
     )
-    .size(ui(16.))
+    .size(ui(logical))
     .flex_shrink_0()
     .into_any_element()
 }

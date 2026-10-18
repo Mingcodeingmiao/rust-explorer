@@ -71,9 +71,20 @@ impl TextInput {
         self.marked_range = None;
         cx.notify();
     }
+    pub fn set_placeholder(&mut self, placeholder: String, cx: &mut Context<Self>) {
+        if self.placeholder.as_ref() == placeholder {
+            return;
+        }
+        self.placeholder = placeholder.into();
+        cx.notify();
+    }
     pub fn focus_select_all(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.select_all(&SelectAll, window, cx);
+    }
+    pub fn focus_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        self.move_to(self.content.len(), cx);
     }
     pub fn focus_filename(&mut self, window: &mut Window, cx: &mut Context<Self>, directory: bool) {
         self.focus_select_all(window, cx);

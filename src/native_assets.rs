@@ -33,16 +33,20 @@ impl IconRequest {
         }
     }
     pub fn file(path: &Path, directory: bool, pixels: u32) -> Self {
-        // Shell class icons are shared by extension; avoid per-file extension handlers.
-        let per_item = path.is_absolute()
-            && matches!(
-                path.extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_ascii_lowercase()
-                    .as_str(),
-                "exe" | "lnk" | "url" | "ico" | "cur"
-            );
+        // Shell class icons are shared by extension; avoid per-file extension
+        // handlers. Portable-device child folders/files use generic stock icons
+        // so a phone folder does not issue one slow Shell icon request each.
+        let shell_root = path.to_string_lossy().starts_with("mtp-root:");
+        let per_item = shell_root
+            || (path.is_absolute()
+                && matches!(
+                    path.extension()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("")
+                        .to_ascii_lowercase()
+                        .as_str(),
+                    "exe" | "lnk" | "url" | "ico" | "cur"
+                ));
         let key = if per_item || (directory && path.has_root() && path.parent().is_none()) {
             path.to_path_buf()
         } else if directory {
@@ -61,7 +65,7 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            epoch: if directory && path.has_root() && path.parent().is_none() {
+            epoch: if shell_root || (directory && path.has_root() && path.parent().is_none()) {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -116,7 +120,7 @@ fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("RustExplorer/cache/native-v6-r2")
+        .join("RustExplorer/cache/native-v6-r3")
 }
 fn cache_path(key: impl Hash) -> Result<PathBuf> {
     let root = cache_root();

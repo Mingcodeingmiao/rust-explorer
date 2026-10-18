@@ -57,6 +57,8 @@ fn main() -> Result<()> {
             link: false,
             system: false,
             size: i,
+            total: None,
+            free: None,
             modified: None,
             created: None,
             kind: "TXT 文件".into(),

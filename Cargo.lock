@@ -3852,11 +3852,12 @@ dependencies = [
 
 [[package]]
 name = "rust-explorer"
-version = "0.6.4"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "chrono",
  "embed-resource",
+ "encoding_rs",
  "gpui",
  "image",
  "libloading",

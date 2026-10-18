@@ -21,6 +21,23 @@ mod native_menu;
 #[path = "sharing_native.rs"]
 mod sharing_native;
 
+/// Resolve portable-device PIDL paths as well as ordinary parsing names.
+fn is_folder(path: &Path) -> bool {
+    if crate::shell_folder::is_shell_path(path) {
+        crate::shell_folder::is_folder(path)
+    } else {
+        path.is_dir()
+    }
+}
+fn item(path: &Path) -> Result<IShellItem> {
+    if crate::shell_folder::is_shell_path(path) {
+        crate::shell_folder::item(path)
+    } else {
+        unsafe {
+            SHCreateItemFromParsingName(PCWSTR(wide(path).as_ptr()), None).map_err(Into::into)
+        }
+    }
+}
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     value
@@ -86,6 +103,10 @@ pub enum Request {
     Share {
         paths: Vec<PathBuf>,
     },
+    /// Opens the classic Sharing property page (Advanced Sharing).
+    AdvancedShare {
+        path: PathBuf,
+    },
     Shortcut {
         target: PathBuf,
         destination: PathBuf,
@@ -120,6 +141,8 @@ pub enum Request {
         undo: bool,
         #[serde(default)]
         redo: bool,
+        #[serde(default)]
+        can_paste: bool,
     },
     SharingAccess {
         path: PathBuf,
@@ -336,26 +359,52 @@ pub fn dispatch(request: Request) -> Result<()> {
             copy_only,
             mode,
         } => unsafe {
-            anyhow::ensure!(destination.is_dir(), "目标文件夹不存在");
-            let target = std::fs::canonicalize(&destination)?;
-            let target_key = target.to_string_lossy().to_lowercase();
-            // Resolve junctions before rejecting a drop onto itself or a descendant.
-            for path in &paths {
-                let source = std::fs::canonicalize(path)?;
-                let key = source.to_string_lossy().to_lowercase();
-                anyhow::ensure!(
-                    target_key != key && !target_key.starts_with(&(key + "\\")),
-                    "不能将项目放入自身或其子文件夹"
-                );
+            let destination_shell = crate::shell_folder::is_shell_path(&destination);
+            let target = if destination_shell {
+                None
+            } else {
+                anyhow::ensure!(destination.is_dir(), "目标文件夹不存在");
+                Some(std::fs::canonicalize(&destination)?)
+            };
+            if let Some(target) = &target {
+                let target_key = target.to_string_lossy().to_lowercase();
+                // Resolve junctions before rejecting a drop onto itself or a descendant.
+                for path in paths
+                    .iter()
+                    .filter(|path| !crate::shell_folder::is_shell_path(path))
+                {
+                    let source = std::fs::canonicalize(path)?;
+                    let key = source.to_string_lossy().to_lowercase();
+                    anyhow::ensure!(
+                        target_key != key && !target_key.starts_with(&(key + "\\")),
+                        "不能将项目放入自身或其子文件夹"
+                    );
+                }
             }
+            let shell_namespace = destination_shell
+                || paths
+                    .iter()
+                    .any(|path| crate::shell_folder::is_shell_path(path));
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-            let _history = crate::file_history::Recorder::attach(&op, &paths)?;
-            op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0))?;
-            let dst: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(wide(&destination).as_ptr()), None)?;
-            let target_volume = volume_identity(&target);
+            let _history = if shell_namespace {
+                None
+            } else {
+                Some(crate::file_history::Recorder::attach(&op, &paths)?)
+            };
+            op.SetOperationFlags(if shell_namespace {
+                FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0)
+            } else {
+                FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0)
+            })?;
+            let dst: IShellItem = item(&destination)?;
+            let target_volume = target.as_ref().and_then(|path| volume_identity(path));
             for path in paths {
+                let source_shell = crate::shell_folder::is_shell_path(&path);
                 if mode == TransferMode::Link {
+                    anyhow::ensure!(
+                        !destination_shell && !source_shell,
+                        "无法在便携设备上创建快捷方式"
+                    );
                     let stem = path
                         .file_name()
                         .unwrap_or(path.as_os_str())
@@ -374,16 +423,22 @@ pub fn dispatch(request: Request) -> Result<()> {
                     }
                     let persist: IPersistFile = link.cast()?;
                     persist.Save(PCWSTR(wide(&link_path).as_ptr()), false)?;
-                    _history.created(&link_path);
+                    if let Some(history) = &_history {
+                        history.created(&link_path);
+                    }
                     continue;
                 }
-                let src: IShellItem =
-                    SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()), None)?;
+                let src: IShellItem = item(&path)?;
                 let moving = mode == TransferMode::Move
                     || (mode == TransferMode::Auto
                         && !copy_only
+                        && !source_shell
+                        && !destination_shell
                         && target_volume.is_some()
-                        && volume_identity(&std::fs::canonicalize(&path)?) == target_volume);
+                        && std::fs::canonicalize(&path)
+                            .ok()
+                            .and_then(|path| volume_identity(&path))
+                            == target_volume);
                 if moving {
                     op.MoveItem(&src, &dst, None, None)?;
                 } else {
@@ -416,6 +471,7 @@ pub fn dispatch(request: Request) -> Result<()> {
             }
             Ok(())
         }
+        Request::AdvancedShare { path } => advanced_share(&path),
         Request::Shortcut {
             target,
             destination,
@@ -455,6 +511,7 @@ pub fn dispatch(request: Request) -> Result<()> {
             group,
             undo,
             redo,
+            can_paste,
         } => context_menu_options(
             &paths,
             &folder,
@@ -471,6 +528,9 @@ pub fn dispatch(request: Request) -> Result<()> {
                 group,
                 undo,
                 redo,
+                folder: false,
+                folder_insert: 0,
+                can_paste,
             }),
         ),
         Request::ComputerMenu {
@@ -516,6 +576,9 @@ pub fn dispatch(request: Request) -> Result<()> {
                 group: String::new(),
                 undo: true,
                 redo: true,
+                folder: false,
+                folder_insert: 0,
+                can_paste: false,
             }),
         ),
         Request::SharingAccess { path, remove } => sharing_access(&path, remove),
@@ -531,18 +594,28 @@ pub fn dispatch(request: Request) -> Result<()> {
             destination,
             moving,
         } => unsafe {
+            let shell_namespace = crate::shell_folder::is_shell_path(&destination)
+                || paths
+                    .iter()
+                    .any(|path| crate::shell_folder::is_shell_path(path));
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .context("创建文件操作")?;
-            let _history = crate::file_history::Recorder::attach(&op, &paths)?;
-            op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0))
-                .context("设置文件操作标志")?;
-            let dst: IShellItem =
-                SHCreateItemFromParsingName(PCWSTR(wide(&destination).as_ptr()), None)
-                    .context("解析目标文件夹")?;
+            // Portable-device operations have no meaningful filesystem undo
+            // record; let the Shell perform the copy/delete directly.
+            let _history = if shell_namespace {
+                None
+            } else {
+                Some(crate::file_history::Recorder::attach(&op, &paths)?)
+            };
+            let flags = if shell_namespace {
+                FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0)
+            } else {
+                FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0)
+            };
+            op.SetOperationFlags(flags).context("设置文件操作标志")?;
+            let dst: IShellItem = item(&destination).context("解析目标文件夹")?;
             for path in paths {
-                let src: IShellItem =
-                    SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()), None)
-                        .context("解析源文件")?;
+                let src: IShellItem = item(&path).context("解析源文件")?;
                 if moving {
                     op.MoveItem(&src, &dst, None, None).context("安排移动")?;
                 } else {
@@ -564,12 +637,13 @@ pub fn dispatch(request: Request) -> Result<()> {
                 FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0,
             ))?;
             for path in paths {
-                anyhow::ensure!(
-                    path.is_absolute() && path.parent().is_some(),
-                    "Refuse permanent deletion of a volume root"
-                );
-                let item: IShellItem =
-                    SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()), None)?;
+                if !crate::shell_folder::is_shell_path(&path) {
+                    anyhow::ensure!(
+                        path.is_absolute() && path.parent().is_some(),
+                        "Refuse permanent deletion of a volume root"
+                    );
+                }
+                let item = item(&path)?;
                 op.DeleteItem(&item, None)?;
             }
             op.PerformOperations()?;
@@ -579,17 +653,29 @@ pub fn dispatch(request: Request) -> Result<()> {
             Ok(())
         },
         Request::Delete { paths } => unsafe {
+            let shell_namespace = paths
+                .iter()
+                .any(|path| crate::shell_folder::is_shell_path(path));
+            let recycle = !shell_namespace && can_recycle(&paths);
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-            let _history = crate::file_history::Recorder::attach(&op, &paths)?;
-            op.SetOperationFlags(FILEOPERATION_FLAGS(
-                FOF_ALLOWUNDO.0
-                    | FOFX_ADDUNDORECORD.0
-                    | FOFX_RECYCLEONDELETE.0
-                    | FOF_WANTNUKEWARNING.0,
-            ))?;
+            let _history = if recycle {
+                Some(crate::file_history::Recorder::attach(&op, &paths)?)
+            } else {
+                None
+            };
+            let flags = if shell_namespace || !recycle {
+                FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0 | FOF_WANTNUKEWARNING.0)
+            } else {
+                FILEOPERATION_FLAGS(
+                    FOF_ALLOWUNDO.0
+                        | FOFX_ADDUNDORECORD.0
+                        | FOFX_RECYCLEONDELETE.0
+                        | FOF_WANTNUKEWARNING.0,
+                )
+            };
+            op.SetOperationFlags(flags)?;
             for path in paths {
-                let item: IShellItem =
-                    SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()), None)?;
+                let item = item(&path)?;
                 op.DeleteItem(&item, None)?;
             }
             op.PerformOperations()?;
@@ -600,10 +686,22 @@ pub fn dispatch(request: Request) -> Result<()> {
         },
         Request::Rename { path, name } => unsafe {
             crate::fs::valid_name(&name)?;
+            let shell_namespace = crate::shell_folder::is_shell_path(&path);
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
-            let _history = crate::file_history::Recorder::attach(&op, std::slice::from_ref(&path))?;
-            op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0))?;
-            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(wide(&path).as_ptr()), None)?;
+            let _history = if shell_namespace {
+                None
+            } else {
+                Some(crate::file_history::Recorder::attach(
+                    &op,
+                    std::slice::from_ref(&path),
+                )?)
+            };
+            op.SetOperationFlags(if shell_namespace {
+                FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0)
+            } else {
+                FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0)
+            })?;
+            let item = item(&path)?;
             op.RenameItem(&item, PCWSTR(wide(&name).as_ptr()), None)?;
             op.PerformOperations()?;
             if op.GetAnyOperationsAborted()?.as_bool() {
@@ -634,6 +732,9 @@ fn volume_identity(path: &Path) -> Option<String> {
 }
 
 pub fn open(path: &Path) -> Result<()> {
+    if crate::shell_folder::is_shell_path(path) {
+        return crate::shell_folder::open(path);
+    }
     if crate::open_target::is_font(path) {
         return crate::open_target::launch_font_preview(path);
     }
@@ -650,7 +751,9 @@ pub fn open(path: &Path) -> Result<()> {
     let path_wide = wide(path);
     let mut info = SHELLEXECUTEINFOW {
         cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOASYNC,
+        // INVOKEIDLIST lets portable-device items open through their Shell
+        // namespace handler instead of being treated as string paths.
+        fMask: SEE_MASK_NOASYNC | SEE_MASK_INVOKEIDLIST,
         lpVerb: w!("open"),
         lpFile: PCWSTR(path_wide.as_ptr()),
         nShow: SW_SHOWNORMAL.0,
@@ -661,6 +764,9 @@ pub fn open(path: &Path) -> Result<()> {
     Ok(())
 }
 pub fn properties(path: &Path) -> Result<()> {
+    if crate::shell_folder::is_shell_path(path) {
+        return crate::shell_folder::properties(path);
+    }
     unsafe {
         let path = wide(path);
         let mut info = SHELLEXECUTEINFOW {
@@ -675,6 +781,28 @@ pub fn properties(path: &Path) -> Result<()> {
         pump_property_windows();
     }
     Ok(())
+}
+
+pub fn advanced_share(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_absolute() && path.is_dir(),
+        "请选择要设置共享的文件夹或驱动器"
+    );
+    unsafe {
+        if SHObjectProperties(
+            None,
+            SHOP_FILEPATH,
+            PCWSTR(wide(path).as_ptr()),
+            w!("Sharing"),
+        )
+        .as_bool()
+        {
+            pump_property_windows();
+            Ok(())
+        } else {
+            bail!("Windows 无法打开高级共享设置")
+        }
+    }
 }
 
 pub fn properties_many(paths: &[PathBuf]) -> Result<()> {
@@ -809,6 +937,38 @@ unsafe fn put_data(format: u32, bytes: &[u8]) -> Result<()> {
         }
         Ok(()) // Windows owns memory after SetClipboardData succeeds.
     }
+}
+/// A drive without a usable recycle bin (many USB sticks, network shares)
+/// must be treated as permanent deletion before the operation starts.
+pub fn can_recycle(paths: &[PathBuf]) -> bool {
+    use windows::Win32::UI::Shell::{SHQUERYRBINFO, SHQueryRecycleBinW};
+    unsafe {
+        for path in paths {
+            if crate::shell_folder::is_shell_path(path) {
+                return false;
+            }
+            let mut root = [0u16; 32768];
+            if windows::Win32::Storage::FileSystem::GetVolumePathNameW(
+                PCWSTR(wide(path).as_ptr()),
+                &mut root,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            let mut info = SHQUERYRBINFO {
+                cbSize: std::mem::size_of::<SHQUERYRBINFO>() as u32,
+                ..Default::default()
+            };
+            if SHQueryRecycleBinW(PCWSTR(root.as_ptr()), &mut info).is_err() {
+                return false;
+            }
+        }
+    }
+    true
+}
+pub fn has_file_clipboard() -> bool {
+    unsafe { IsClipboardFormatAvailable(15).is_ok() }
 }
 pub fn copy_to_clipboard(paths: &[PathBuf], cut: bool) -> Result<()> {
     if paths.is_empty() {
@@ -1188,7 +1348,7 @@ fn context_menu_options(
     computer: bool,
     expanded: bool,
     inspect: bool,
-    options: Option<native_menu::Options>,
+    mut options: Option<native_menu::Options>,
 ) -> Result<()> {
     unsafe {
         let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
@@ -1271,6 +1431,19 @@ fn context_menu_options(
         )
         .ok()?;
         MENU.with(|v| *v.borrow_mut() = Some(menu.clone()));
+        if let Some(options) = &mut options {
+            options.folder = !paths.is_empty() && paths.iter().any(|path| is_folder(path));
+            options.folder_insert = if options.folder {
+                (0..GetMenuItemCount(Some(popup.0)))
+                    .find(|position| {
+                        canonical_verb(&menu, GetMenuItemID(popup.0, *position)) == "open"
+                    })
+                    .map(|position| position as u32 + 1)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+        }
         let commands = if let Some(options) = &options {
             // Shell view commands need our own IShellView state; keep all other
             // provider commands, including the real New and sharing submenus.

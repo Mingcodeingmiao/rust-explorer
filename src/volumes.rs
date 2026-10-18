@@ -215,7 +215,7 @@ pub fn bounded<T: serde::de::DeserializeOwned>(
     Ok(serde_json::from_slice(&output)?)
 }
 pub fn snapshot() -> Vec<Volume> {
-    roots()
+    let mut result: Vec<Volume> = roots()
         .into_iter()
         .map(|path| {
             let basic = basic(&path);
@@ -226,7 +226,29 @@ pub fn snapshot() -> Vec<Volume> {
             )
             .unwrap_or(basic)
         })
-        .collect()
+        .collect();
+    // Portable/MTP devices have no filesystem path; list them through the
+    // Shell namespace in an isolated helper.
+    if let Ok(devices) =
+        bounded::<Vec<(String, PathBuf)>>("--shell-devices", "", Duration::from_millis(2500))
+    {
+        for (label, path) in devices {
+            if result.iter().any(|volume| volume.path == path) {
+                continue;
+            }
+            result.push(Volume {
+                path,
+                label,
+                kind: 7,
+                total: None,
+                free: None,
+                filesystem: "MTP".into(),
+                remote: None,
+                read_only: false,
+            });
+        }
+    }
+    result
 }
 #[derive(Serialize, Deserialize)]
 pub struct TreeRequest {

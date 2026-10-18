@@ -60,28 +60,7 @@ pub fn text(path: &Path) -> Result<TextPreview> {
         .read_to_end(&mut bytes)?;
     let truncated = bytes.len() > LIMIT;
     bytes.truncate(LIMIT);
-    let text = if bytes.starts_with(&[0xff, 0xfe]) {
-        String::from_utf16_lossy(
-            &bytes[2..]
-                .chunks_exact(2)
-                .map(|v| u16::from_le_bytes([v[0], v[1]]))
-                .collect::<Vec<_>>(),
-        )
-    } else if bytes.starts_with(&[0xfe, 0xff]) {
-        String::from_utf16_lossy(
-            &bytes[2..]
-                .chunks_exact(2)
-                .map(|v| u16::from_be_bytes([v[0], v[1]]))
-                .collect::<Vec<_>>(),
-        )
-    } else {
-        if bytes.contains(&0) {
-            bail!("二进制内容，无法作为文本预览");
-        }
-        String::from_utf8_lossy(&bytes)
-            .trim_start_matches('\u{feff}')
-            .to_owned()
-    };
+    let text = decode(&bytes)?;
     let lines = text
         .lines()
         .take(6000)
@@ -92,6 +71,66 @@ pub fn text(path: &Path) -> Result<TextPreview> {
         truncated: truncated || text.lines().count() > 6000,
     })
 }
+
+fn utf16(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|value| {
+            if little_endian {
+                u16::from_le_bytes([value[0], value[1]])
+            } else {
+                u16::from_be_bytes([value[0], value[1]])
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
+}
+
+/// Pick an encoding without relying on the system ANSI code page. BOMs win,
+/// then UTF-8, then a NUL-pattern check for BOM-less UTF-16, and finally
+/// GB18030, which is a superset of GB2312/GBK used by Chinese text files.
+fn decode(bytes: &[u8]) -> Result<String> {
+    if bytes.starts_with(&[0xef, 0xbb, 0xbf]) {
+        return Ok(String::from_utf8_lossy(&bytes[3..])
+            .trim_start_matches('\u{feff}')
+            .to_owned());
+    }
+    if bytes.starts_with(&[0xff, 0xfe]) {
+        return Ok(utf16(&bytes[2..], true)
+            .trim_start_matches('\u{feff}')
+            .to_owned());
+    }
+    if bytes.starts_with(&[0xfe, 0xff]) {
+        return Ok(utf16(&bytes[2..], false)
+            .trim_start_matches('\u{feff}')
+            .to_owned());
+    }
+    if bytes.contains(&0) {
+        let even_nuls = bytes.iter().step_by(2).filter(|byte| **byte == 0).count();
+        let odd_nuls = bytes
+            .iter()
+            .skip(1)
+            .step_by(2)
+            .filter(|byte| **byte == 0)
+            .count();
+        let pairs = bytes.len() / 2;
+        if pairs > 2 && odd_nuls * 4 > pairs * 3 && even_nuls * 8 < pairs {
+            return Ok(utf16(bytes, true).trim_start_matches('\u{feff}').to_owned());
+        }
+        if pairs > 2 && even_nuls * 4 > pairs * 3 && odd_nuls * 8 < pairs {
+            return Ok(utf16(bytes, false)
+                .trim_start_matches('\u{feff}')
+                .to_owned());
+        }
+        bail!("二进制内容，无法作为文本预览");
+    }
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        return Ok(text.trim_start_matches('\u{feff}').to_owned());
+    }
+    let (text, _, _) = encoding_rs::GB18030.decode(bytes);
+    Ok(text.trim_start_matches('\u{feff}').to_owned())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,5 +141,20 @@ mod tests {
         assert_eq!(kind(Path::new("x.svg")), Kind::Unsupported);
         assert_eq!(kind(Path::new("x.OTF")), Kind::Font);
         assert_eq!(kind(Path::new("x.ttc")), Kind::Font);
+    }
+
+    #[test]
+    fn decodes_utf8_utf16_and_gb2312() {
+        assert_eq!(decode("纯文本".as_bytes()).unwrap(), "纯文本");
+        assert_eq!(
+            decode(&[0xff, 0xfe, 0x2d, 0x4e, 0x87, 0x65]).unwrap(),
+            "中文"
+        );
+        // "中文测试" in GB2312/GBK.
+        assert_eq!(
+            decode(&[0xd6, 0xd0, 0xce, 0xc4, 0xb2, 0xe2, 0xca, 0xd4]).unwrap(),
+            "中文测试"
+        );
+        assert!(decode(&[0x00, 0x01, 0x02, 0x00]).is_err());
     }
 }
