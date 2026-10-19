@@ -16,6 +16,7 @@ pub mod native_assets;
 pub mod native_preview;
 pub mod nav_keyboard;
 pub mod new_file;
+pub mod official_icons;
 pub mod open_target;
 pub mod path_completion;
 pub mod preview;

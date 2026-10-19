@@ -1,27 +1,22 @@
-"""Export the original generated artwork at Windows icon resolutions."""
-from pathlib import Path
-import shutil
-import sys
-from PIL import Image
+"""Pack the checked-in Microsoft Fluent PNG rasterizations into a Windows ICO.
 
-root = Path(__file__).resolve().parents[1]
-folder = root / 'resources' / 'app-icon'
-folder.mkdir(parents=True, exist_ok=True)
-master = folder / 'rust-explorer-master.png'
-if len(sys.argv) > 1:
-    if master.exists():
-        raise SystemExit('Master already exists; preserve the original artwork.')
-    shutil.copy2(sys.argv[1], master)
-image = Image.open(master).convert('RGBA')
-assert image.width == image.height
-assert image.getextrema()[3][0] == 0, 'Artwork must contain transparent pixels'
+Artwork provenance: resources/fluent-icons/SOURCES.json (app-folder).
+This script does not accept replacement artwork or copy Windows resources.
+"""
+from pathlib import Path
+import struct
+
+folder = Path(__file__).resolve().parents[1] / 'resources/app-icon'
 sizes = [16, 20, 24, 32, 40, 48, 64, 96, 128, 192, 256]
+offset = 6 + 16 * len(sizes)
+entries = []
+payload = bytearray()
 for size in sizes:
-    image.resize((size, size), Image.Resampling.LANCZOS).save(folder / f'rust-explorer-{size}.png')
-image.save(folder / 'rust-explorer.ico', format='ICO', sizes=[(n, n) for n in sizes])
-with Image.open(folder / 'rust-explorer.ico') as icon:
-    assert icon.ico.sizes() == {(n, n) for n in sizes}
-    for size in sizes:
-        frame = icon.ico.getimage((size, size))
-        assert frame.mode == 'RGBA' and frame.size == (size, size)
-print('Exported transparent PNGs and ICO:', ', '.join(map(str, sizes)))
+    png = (folder / f'rust-explorer-{size}.png').read_bytes()
+    assert png[:8] == b'\x89PNG\r\n\x1a\n'
+    assert struct.unpack('>II', png[16:24]) == (size, size)
+    entries.append(struct.pack('<BBBBHHII', size % 256, size % 256, 0, 0, 1, 32, len(png), offset))
+    offset += len(png)
+    payload.extend(png)
+(folder / 'rust-explorer.ico').write_bytes(struct.pack('<HHH', 0, 1, len(sizes)) + b''.join(entries) + payload)
+print('Packed official Fluent fallback ICO:', ', '.join(map(str, sizes)))

@@ -16,3 +16,9 @@ Binary packaging includes this file, `NOTICE`, `LICENSE`, and the pinyin notice.
 For GNU bundles, `libgcc_s_seh-1.dll` is covered by GPL-3.0-or-later with the GCC Runtime Library Exception 3.1; `libwinpthread-1.dll` uses the mingw-w64 winpthreads permissive license. License texts are retained in `resources/licenses/` and included by the packager. Upstream sources are available from [GCC](https://gcc.gnu.org/git.html) and [mingw-w64](https://www.mingw-w64.org/downloads/). No claim is made that the application's Apache-2.0 license replaces these terms.
 
 The original application icon is AI-assisted artwork created for this project, not extracted from Windows. Its source and generation notes are in [resources/app-icon](resources/app-icon/README.md). The project's Apache-2.0 license grants rights only to the extent held by its contributors and does not grant rights to third-party trademarks.
+
+## Microsoft Fluent UI System Icons
+
+Toolbar fallback SVGs and the embedded application fallback icon use unmodified Microsoft Fluent UI System Icons artwork (MIT). Source commit and per-file URLs are recorded in `resources/fluent-icons/SOURCES.json`; full license is in `resources/fluent-icons/LICENSE`. Application PNG/ICO variants are rasterizations of the upstream Document Folder SVG.
+
+Installed Windows artwork and system icon fonts are referenced at runtime only and are not redistributed.

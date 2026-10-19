@@ -2,7 +2,7 @@
 //!
 //! No Windows artwork is embedded, copied or written to the application cache.
 //! These private package paths can change with Windows updates, so callers must
-//! retain their own vector fallback when `path` returns `None`.
+//! use the embedded Microsoft Fluent assets when `path` returns `None`.
 use anyhow::{Result, ensure};
 use std::{
     collections::HashMap,
@@ -284,6 +284,12 @@ pub struct Assets;
 #[cfg(feature = "desktop")]
 impl gpui::AssetSource for Assets {
     fn load(&self, requested: &str) -> gpui::Result<Option<std::borrow::Cow<'static, [u8]>>> {
+        if let Some(name) = requested
+            .strip_prefix("fluent/")
+            .and_then(|p| p.strip_suffix(".svg"))
+        {
+            return Ok(crate::official_icons::bytes(name).map(std::borrow::Cow::Borrowed));
+        }
         let requested = std::path::Path::new(requested);
         if !catalog()
             .read()

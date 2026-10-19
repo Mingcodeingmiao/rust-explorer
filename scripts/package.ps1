@@ -19,6 +19,7 @@ foreach ($name in @('README.md', 'README.en.md', 'LICENSE', 'NOTICE', 'THIRD_PAR
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\pinyin-LICENSE.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\files-MIT.txt') -Destination $staging
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\LICENSE') -Destination (Join-Path $staging 'FluentUI-System-Icons-LICENSE.txt')
 if (Test-Path -LiteralPath (Join-Path $staging 'Everything64.dll')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\Everything-SDK-License.txt') -Destination $staging
 }

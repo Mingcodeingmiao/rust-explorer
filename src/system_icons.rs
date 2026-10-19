@@ -399,6 +399,43 @@ fn desktop_icon(size: u32) -> Result<IconBitmap> {
     bitmap(icon.0, size)
 }
 
+pub fn has_ui_icon(name: &str) -> bool {
+    matches!(
+        name,
+        "network"
+            | "recycle-bin"
+            | "folder"
+            | "folder-open"
+            | "drive"
+            | "search"
+            | "rename"
+            | "delete"
+            | "computer"
+            | "computer-colored"
+            | "desktop"
+            | "video"
+            | "video-file"
+            | "image"
+            | "image-file"
+            | "audio"
+            | "audio-file"
+            | "file"
+            | "up"
+            | "refresh"
+            | "new-folder"
+            | "cut"
+            | "copy"
+            | "paste"
+            | "preview"
+            | "home"
+            | "downloads"
+            | "documents"
+            | "pictures"
+            | "music"
+            | "videos"
+            | "close"
+    )
+}
 pub fn ui_icon(name: &str, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
     if name == "desktop" {

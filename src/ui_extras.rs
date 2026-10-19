@@ -17,7 +17,19 @@ pub(super) fn native_hwnd(window: &Window) -> Option<isize> {
     }
 }
 
-fn set_application_icon(handle: isize) {
+// WM_SETICON borrows its HICON: keep extracted system handles alive with the
+// owning Explorer entity and release them when the window closes.
+pub(super) struct ApplicationIcons(Vec<windows::Win32::UI::WindowsAndMessaging::HICON>);
+impl Drop for ApplicationIcons {
+    fn drop(&mut self) {
+        for icon in self.0.drain(..) {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(icon);
+            }
+        }
+    }
+}
+fn set_application_icon(handle: isize) -> ApplicationIcons {
     use windows::{
         Win32::{
             Foundation::{HINSTANCE, HWND, LPARAM, WPARAM},
@@ -26,23 +38,52 @@ fn set_application_icon(handle: isize) {
         },
         core::PCWSTR,
     };
+    let mut owned = ApplicationIcons(Vec::new());
     unsafe {
         let hwnd = HWND(handle as *mut _);
-        let Ok(module) = GetModuleHandleW(None) else {
-            return;
-        };
         let dpi = GetDpiForWindow(hwnd).max(96);
-        for (kind, logical_size) in [(ICON_SMALL, 32u32), (ICON_BIG, 48u32)] {
+        let mut windows_path = [0u16; 32768];
+        let len = windows::Win32::System::SystemInformation::GetWindowsDirectoryW(Some(
+            &mut windows_path,
+        )) as usize;
+        let explorer = if len > 0 && len < windows_path.len() {
+            PathBuf::from(String::from_utf16_lossy(&windows_path[..len])).join("explorer.exe")
+        } else {
+            PathBuf::new()
+        };
+        use std::os::windows::ffi::OsStrExt;
+        let path: Vec<u16> = explorer.as_os_str().encode_wide().chain(Some(0)).collect();
+        let mut filename = [0u16; 260];
+        if path.len() <= filename.len() {
+            filename[..path.len()].copy_from_slice(&path);
+        }
+        for (kind, logical_size) in [(ICON_SMALL, 16u32), (ICON_BIG, 32u32)] {
             let size = ((logical_size * dpi + 48) / 96) as i32;
-            if let Ok(icon) = LoadImageW(
-                Some(HINSTANCE(module.0)),
-                PCWSTR(101usize as *const u16),
-                IMAGE_ICON,
-                size,
-                size,
-                LR_SHARED,
-            ) {
-                // LR_SHARED resources belong to the executable for its lifetime.
+            let mut icon = [HICON::default()];
+            let extracted = !explorer.as_os_str().is_empty()
+                && path.len() <= filename.len()
+                && PrivateExtractIconsW(&filename, 0, size, size, Some(&mut icon), None, 0) == 1
+                && !icon[0].is_invalid();
+            let native = if extracted {
+                owned.0.push(icon[0]);
+                Some(icon[0])
+            } else {
+                GetModuleHandleW(None)
+                    .ok()
+                    .and_then(|module| {
+                        LoadImageW(
+                            Some(HINSTANCE(module.0)),
+                            PCWSTR(101usize as *const u16),
+                            IMAGE_ICON,
+                            size,
+                            size,
+                            LR_SHARED,
+                        )
+                        .ok()
+                    })
+                    .map(|h| HICON(h.0))
+            };
+            if let Some(icon) = native {
                 SendMessageW(
                     hwnd,
                     WM_SETICON,
@@ -52,6 +93,7 @@ fn set_application_icon(handle: isize) {
             }
         }
     }
+    owned
 }
 
 static TAB_ID: AtomicU64 = AtomicU64::new(1);
@@ -311,7 +353,9 @@ pub(super) fn open_explorer_request(
         move |w, cx| {
             let view = cx.new(|cx| Explorer::new(w, launch, cx));
             if let Some(hwnd) = native_hwnd(w) {
-                set_application_icon(hwnd);
+                view.update(cx, |v, _| {
+                    v.application_icons = Some(set_application_icon(hwnd))
+                });
                 if let Err(error) = rust_explorer::window_frame::install(hwnd) {
                     eprintln!("{error:#}");
                 } else {
@@ -1237,7 +1281,7 @@ impl Explorer {
                     .flex_shrink_0()
                     .flex()
                     .justify_center()
-                    .child(visual::icon("computer-outline", t.text)),
+                    .child(visual::icon("computer", t.text)),
             )
             .child(visual::icon("chevron-right", t.muted));
         if hidden > 0 {

@@ -251,6 +251,7 @@ struct Explorer {
     drag_rx: mpsc::Receiver<TabDrop>,
     drag_tx: mpsc::Sender<TabDrop>,
     own_window: Option<AnyWindowHandle>,
+    application_icons: Option<ApplicationIcons>,
     tab_drag: Option<Arc<AtomicBool>>,
     tab_tip: Option<crate::tab_tip::TabTip>,
     volumes: Vec<Volume>,
@@ -320,6 +321,9 @@ struct Explorer {
     shell_clipboard: Option<(Vec<PathBuf>, bool)>,
     shell_clipboard_seq: u32,
     list_scroll: ListState,
+    // A refresh of the same tab/location keeps its viewport while the replacement
+    // listing loads. Navigation and searches still start at the top.
+    reload_scope: Option<(u64, PathBuf, String)>,
     zoom: f32,
     layout_width: f32,
     layout_mode: Option<(ViewMode, bool)>,
@@ -711,6 +715,7 @@ impl Explorer {
             drag_rx,
             drag_tx,
             own_window: Some(window.window_handle()),
+            application_icons: None,
             tab_drag: None,
             tab_tip: None,
             volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
@@ -788,6 +793,7 @@ impl Explorer {
             shell_clipboard: None,
             shell_clipboard_seq: 0,
             list_scroll: ListState::new(0, ListAlignment::Top, px(160.)),
+            reload_scope: None,
             zoom: 1.,
             layout_width: 0.,
             layout_mode: None,
@@ -1032,6 +1038,13 @@ impl Explorer {
     }
     fn reload(&mut self, cx: &mut Context<Self>) {
         let path = self.dir();
+        let scope = (
+            self.tabs[self.active].id,
+            path.clone(),
+            self.tabs[self.active].query.clone(),
+        );
+        let preserve_viewport = self.reload_scope.as_ref() == Some(&scope);
+        self.reload_scope = Some(scope);
         if self.tabs[self.active]
             .reveal_targets
             .iter()
@@ -1049,9 +1062,10 @@ impl Explorer {
         self.usage_running = false;
         self.usage_enabled = false;
         self.inline_rename = None;
-        if self.settings.high_performance {
+        if !preserve_viewport {
             self.content_scroll.set_offset(point(px(0.), px(0.)));
             self.high_performance_row.set(0.);
+            self.home_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.dialog = None;
         self.popup = None;
@@ -1084,9 +1098,11 @@ impl Explorer {
         self.selected.clear();
         self.focus_item = None;
         self.keyboard_cursor = None;
-        self.entries = Arc::new(vec![]);
+        if !preserve_viewport {
+            self.entries = Arc::new(vec![]);
+            self.list_scroll.reset(0);
+        }
         self.clear_preview();
-        self.list_scroll.reset(0);
         let query = self.tabs[self.active].query.clone();
         if navigation::is_app_virtual(&path) && query.trim().is_empty() {
             self.loading = false;
@@ -1727,6 +1743,12 @@ impl Explorer {
             } => Some(paths.clone()),
             _ => None,
         };
+        // A cancelled batch may already have deleted some items. Always list
+        // again once the native operation finishes, including partial failures.
+        let deletion = matches!(
+            &request,
+            shell::Request::Delete { .. } | shell::Request::PermanentDelete { .. }
+        );
         let menu_paths = if let shell::Request::Menu { paths, folder, .. }
         | shell::Request::ThemedMenu { paths, folder, .. } = &request
         {
@@ -1903,8 +1925,12 @@ impl Explorer {
                     cx.notify();
                     return;
                 }
+                let native_refresh = result.as_ref().is_ok_and(|value| value == "refresh");
                 if let Err(e) = result {
                     this.error = Some(e.to_string());
+                    if deletion {
+                        this.reload(cx);
+                    }
                     cx.notify();
                 } else {
                     if let Some(paths) = moving_paths {
@@ -1914,7 +1940,7 @@ impl Explorer {
                             shell::clear_clipboard();
                         }
                     }
-                    if refresh {
+                    if refresh || native_refresh {
                         this.reload(cx);
                     } else {
                         cx.notify();
@@ -2130,6 +2156,38 @@ impl Explorer {
         {
             return;
         }
+        if matches!(dialog, Dialog::NewFolder) {
+            if self.busy {
+                return;
+            }
+            self.busy = true;
+            let parent = self.dir();
+            let original_parent = parent.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { fs::create_numbered_folder(&parent) });
+            cx.spawn(async move |view, cx| {
+                let result = task.await;
+                let _ = view.update(cx, |this, cx| {
+                    this.busy = false;
+                    match result {
+                        Ok(path) => {
+                            if this.dir() == original_parent {
+                                this.pending_select = Some(path.clone());
+                            }
+                            this.run_shell(shell::Request::RecordCreated { path }, cx);
+                        }
+                        Err(error) => {
+                            this.error = Some(error.to_string());
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let name = match &dialog {
             Dialog::RenameVolume { initial, .. } => initial.clone(),
             Dialog::Rename(path) => {
@@ -2189,8 +2247,13 @@ impl Explorer {
     }
     fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.dialog_input.read(cx).value();
-        if matches!(self.dialog, Some(Dialog::RenameVolume { .. })) {
-            if let Err(error) = volume_label::validate(&name, "") {
+        if let Some(Dialog::RenameVolume { path, .. }) = &self.dialog {
+            let filesystem = if volume_label::is_network_drive(path) {
+                "NETWORK"
+            } else {
+                ""
+            };
+            if let Err(error) = volume_label::validate(&name, filesystem) {
                 self.error = Some(error.to_string());
                 cx.notify();
                 return;
@@ -3390,96 +3453,107 @@ impl Render for Explorer {
                     );
                 }
             }))
-            .on_mouse_move(cx.listener(|v, event: &MouseMoveEvent, w, cx| {
-                if event.pressed_button == Some(MouseButton::Left) && v.marquee.is_some() {
-                    v.update_marquee(event.position, cx);
-                }
-                if event.pressed_button == Some(MouseButton::Right) {
-                    let right = v
-                        .right_file_drag
-                        .as_ref()
-                        .map(|r| (r.index, r.paths.clone(), r.start, r.active));
-                    if let Some((index, paths, start, active)) = right {
-                        if active || (event.position - start).magnitude() > 4. {
-                            if !active {
-                                if !v.selected.contains(&index) {
-                                    v.select(index, false, false, w, cx);
+            .on_mouse_move({
+                let listener = cx.listener(|v, event: &MouseMoveEvent, w, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) && v.marquee.is_some() {
+                        v.update_marquee(event.position, cx);
+                    }
+                    if event.pressed_button == Some(MouseButton::Right) {
+                        let right = v
+                            .right_file_drag
+                            .as_ref()
+                            .map(|r| (r.index, r.paths.clone(), r.start, r.active));
+                        if let Some((index, paths, start, active)) = right {
+                            if active || (event.position - start).magnitude() > 4. {
+                                if !active {
+                                    if !v.selected.contains(&index) {
+                                        v.select(index, false, false, w, cx);
+                                    }
+                                    if let Some(right) = &mut v.right_file_drag {
+                                        right.active = true;
+                                    }
                                 }
-                                if let Some(right) = &mut v.right_file_drag {
-                                    right.active = true;
-                                }
+                                v.update_file_drag(paths, event.position, event.modifiers, cx);
                             }
-                            v.update_file_drag(paths, event.position, event.modifiers, cx);
                         }
                     }
-                }
-                if let Some((start, width)) = v.preview_resize {
-                    if event.dragging() {
-                        v.settings.preview_width = (width
-                            - (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(180., 900.);
+                    if let Some((start, width)) = v.preview_resize {
+                        if event.dragging() {
+                            v.settings.preview_width = (width
+                                - (f32::from(event.position.x) - start) / v.zoom)
+                                .clamp(180., 900.);
+                            cx.notify();
+                        }
+                    }
+                    if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
+                        let mut p = handle.offset();
+                        p.y = px((*offset - (f32::from(event.position.y) - *start) * *ratio)
+                            .clamp(-f32::from(handle.max_offset().height), 0.));
+                        handle.set_offset(p);
                         cx.notify();
                     }
-                }
-                if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
-                    let mut p = handle.offset();
-                    p.y = px((*offset - (f32::from(event.position.y) - *start) * *ratio)
-                        .clamp(-f32::from(handle.max_offset().height), 0.));
-                    handle.set_offset(p);
-                    cx.notify();
-                }
-                if let Some((handle, start, offset, ratio)) = &v.aux_horizontal_drag {
-                    let mut p = handle.offset();
-                    p.x = px((*offset - (f32::from(event.position.x) - *start) * *ratio)
-                        .clamp(-f32::from(handle.max_offset().width), 0.));
-                    handle.set_offset(p);
-                    cx.notify();
-                }
-                if let Some((horizontal, start, offset, ratio)) = v.scroll_drag {
-                    let delta = if horizontal {
-                        f32::from(event.position.x)
-                    } else {
-                        f32::from(event.position.y)
-                    } - start;
-                    if horizontal {
-                        let mut point = v.content_scroll.offset();
-                        point.x = px(offset - delta * ratio);
-                        v.content_scroll.set_offset(point);
-                    } else if v.high_performance_active() {
-                        v.set_high_performance_row(offset + delta * ratio);
-                    } else {
-                        v.set_list_scroll_row(offset + delta * ratio);
-                    }
-                    cx.notify();
-                }
-                if let Some((start, width)) = v.sidebar_resize {
-                    if event.dragging() {
-                        v.settings.sidebar_width = (width
-                            + (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(140., 600.);
+                    if let Some((handle, start, offset, ratio)) = &v.aux_horizontal_drag {
+                        let mut p = handle.offset();
+                        p.x = px((*offset - (f32::from(event.position.x) - *start) * *ratio)
+                            .clamp(-f32::from(handle.max_offset().width), 0.));
+                        handle.set_offset(p);
                         cx.notify();
                     }
-                }
-                if let Some((index, start, width)) = v.volume_columns_resize {
-                    if event.dragging() {
-                        if let Some((_, column_width)) = v.settings.volume_columns.get_mut(index) {
-                            *column_width = (width
+                    if let Some((horizontal, start, offset, ratio)) = v.scroll_drag {
+                        let delta = if horizontal {
+                            f32::from(event.position.x)
+                        } else {
+                            f32::from(event.position.y)
+                        } - start;
+                        if horizontal {
+                            let mut point = v.content_scroll.offset();
+                            point.x = px(offset - delta * ratio);
+                            v.content_scroll.set_offset(point);
+                        } else if v.high_performance_active() {
+                            v.set_high_performance_row(offset + delta * ratio);
+                        } else {
+                            v.set_list_scroll_row(offset + delta * ratio);
+                        }
+                        cx.notify();
+                    }
+                    if let Some((start, width)) = v.sidebar_resize {
+                        if event.dragging() {
+                            v.settings.sidebar_width = (width
+                                + (f32::from(event.position.x) - start) / v.zoom)
+                                .clamp(140., 600.);
+                            cx.notify();
+                        }
+                    }
+                    if let Some((index, start, width)) = v.volume_columns_resize {
+                        if event.dragging() {
+                            if let Some((_, column_width)) =
+                                v.settings.volume_columns.get_mut(index)
+                            {
+                                *column_width = (width
+                                    + (f32::from(event.position.x) - start) / v.zoom)
+                                    .clamp(64., 1200.);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    if let Some((index, start, width)) = v.columns_resize {
+                        if event.dragging() {
+                            v.settings.columns[index].1 = (width
                                 + (f32::from(event.position.x) - start) / v.zoom)
                                 .clamp(64., 1200.);
+                            v.invalidate_list();
+                            cx.notify();
                         }
-                        cx.notify();
+                    }
+                });
+                // Passive movement needs only GPUI's hover hit testing. Avoid
+                // updating the entire Explorer entity for every raw mouse event.
+                move |event: &MouseMoveEvent, window, cx: &mut App| {
+                    if event.pressed_button.is_some() {
+                        listener(event, window, cx);
                     }
                 }
-                if let Some((index, start, width)) = v.columns_resize {
-                    if event.dragging() {
-                        v.settings.columns[index].1 = (width
-                            + (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(64., 1200.);
-                        v.invalidate_list();
-                        cx.notify();
-                    }
-                }
-            }))
+            })
             .capture_any_mouse_up(cx.listener(|v, e: &MouseUpEvent, w, cx| {
                 if e.button == MouseButton::Left {
                     if let Some(drag) = v.marquee.take() {

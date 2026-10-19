@@ -130,6 +130,10 @@ fn main() {
                     Ok(())
                 })
         }
+        Some("--rename-volume-admin") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少驱动器重命名请求"))
+            .and_then(|value| rust_explorer::volume_label::rename_admin(value)),
         Some("--shell-stdin") => rust_explorer::shell::read_request(std::io::stdin().lock())
             .and_then(rust_explorer::shell::dispatch),
         Some("--shell") => args
