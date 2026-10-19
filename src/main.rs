@@ -1,8 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+use anyhow::Context;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
+        Some("--open-folder") => args
+            .get(2)
+            .context("缺少文件夹路径")
+            .and_then(|path| rust_explorer::shell_bridge::open(std::path::Path::new(path))),
         Some("--folder-association-guard") => rust_explorer::default_browser::guard_main(
             args.get(2).map(String::as_str).unwrap_or(""),
         ),

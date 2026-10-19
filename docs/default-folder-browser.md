@@ -77,6 +77,12 @@
 
 本轮核对 Directory、Drive、Folder 的全部非空 HKCU 值，最终保持测试前关联。未测试 Win+E、真实网络共享或手机内部传输；UNC 参数解析由自动测试覆盖。
 
+## Shell 定位桥接（2026-10-19 集成）
+
+默认关联仍使用原来的 `--open-folder` 命令，新增内置 Shell COM 桥接；不增加注册表地址，也不改变旧版恢复日志格式。收到系统选择回调时定位文件，普通目录请求先打开目录并短暂保留接收迟到选择的能力。内部图形入口与外部目录入口分离，避免递归。桥接不可用时回退到直接打开目录。
+
+已通过一次最多 25 秒的真实关联试用：`SHOpenFolderAndSelectItems` 自动启动 RE 并高亮文件；主动恢复后，Directory/Drive/Folder 的完整快照与试用前一致。仍不接管通用 Folder、Win+E 或不支持的虚拟目录；不保证写死 Explorer 的第三方程序兼容。
+
 ## 参考
 
 - [File Types](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)：当前用户注册与关联通知。

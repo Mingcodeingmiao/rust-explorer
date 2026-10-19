@@ -39,7 +39,7 @@ pub fn parse(args: &[OsString]) -> Result<Option<LaunchRequest>> {
         let mut values = vec![OsString::from(&text[8..])];
         values.extend_from_slice(&args[1..]);
         (true, values)
-    } else if lower == "--open-folder" {
+    } else if matches!(lower.as_str(), "--open-folder" | "--browse-folder") {
         (false, args[1..].to_vec())
     } else if !text.starts_with('-') && Path::new(first).exists() {
         (false, vec![first.clone()])

@@ -2,6 +2,8 @@
 
 这是参考 Files 的独立实验，不参与主程序 Cargo 构建，不覆盖现有测试包，不安装默认关联。调查和实测日期为 2026-10-19。
 
+后续集成已把共享 COM 实现移到 `native/shell_bridge/`，MIT 许可移到 `resources/files-MIT.txt`。主程序的 `--open-folder` 已静态链接并调用此桥接，实验启动器和探针仍可独立复测。以下为最初独立实验记录；集成行为见 [外部定位说明](../../docs/external-reveal.md)。
+
 ## 备份与安全边界
 
 实验前已将提交 `d1618b12e3b3a664c284914c0f5f06568fbc45fc` 的源码 ZIP、完整 Git bundle、可运行预览目录、当前 Directory/Drive 注册表导出及 SHA-256 清单保存在本地 `artifacts/before-shell-bridge-20261019-101254/`。当时 HKCU 的 Folder 类不存在，未创建或导入它。bundle 已验证完整；备份 EXE 与当前预览 EXE 哈希相同。

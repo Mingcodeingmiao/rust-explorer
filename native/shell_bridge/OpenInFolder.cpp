@@ -477,13 +477,10 @@ HRESULT OpenInFolder::NotifyShellOfNavigation(PCIDLIST_ABSOLUTE pidl)
 	LocalVariant empty;
 	RETURN_IF_FAILED(m_shellWindows->RegisterPending(GetCurrentThreadId(), &pidlVariant, &empty, SWC_BROWSER, &m_pendingCookie));
 	m_isPendingRegistered = true;
-    std::fprintf(stderr, "PENDING %ld\n", m_pendingCookie);
 	RETURN_IF_FAILED(m_shellWindows->Register(static_cast<IDispatch*>(this), HandleToLong(m_hwnd), SWC_BROWSER, &m_shellWindowCookie));
 	m_isRegistered = true;
-    std::fprintf(stderr, "REGISTERED %ld HWND %p\n", m_shellWindowCookie, m_hwnd);
 
 	RETURN_IF_FAILED(m_shellWindows->OnNavigate(m_shellWindowCookie, &pidlVariant));
-    std::fprintf(stderr, "NAVIGATED\n");
 
 	return S_OK;
 }

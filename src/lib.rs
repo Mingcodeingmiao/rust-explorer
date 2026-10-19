@@ -23,6 +23,7 @@ pub mod quick_access;
 pub mod search;
 pub mod settings;
 pub mod shell;
+pub mod shell_bridge;
 pub mod shell_folder;
 pub mod system_icons;
 pub mod theme;
