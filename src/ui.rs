@@ -342,6 +342,20 @@ impl Drop for Explorer {
 }
 
 impl Explorer {
+    fn navigate_history(&mut self, direction: NavigationDirection, cx: &mut Context<Self>) {
+        if self.options.is_some() || (self.dialog.is_some() && self.inline_rename.is_none()) {
+            return;
+        }
+        let history = &mut self.tabs[self.active].history;
+        let changed = match direction {
+            NavigationDirection::Back => history.back(),
+            NavigationDirection::Forward => history.forward(),
+        };
+        if changed {
+            self.reload(cx);
+        }
+    }
+
     pub(super) fn begin_marquee(
         &mut self,
         event: &MouseDownEvent,
@@ -2986,20 +3000,10 @@ impl Render for Explorer {
                 }
             }))
             .on_action(cx.listener(|v, _: &Back, _, cx| {
-                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
-                    return;
-                }
-                if v.tabs[v.active].history.back() {
-                    v.reload(cx);
-                }
+                v.navigate_history(NavigationDirection::Back, cx);
             }))
             .on_action(cx.listener(|v, _: &Forward, _, cx| {
-                if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
-                    return;
-                }
-                if v.tabs[v.active].history.forward() {
-                    v.reload(cx);
-                }
+                v.navigate_history(NavigationDirection::Forward, cx);
             }))
             .on_action(cx.listener(|v, _: &Up, _, cx| {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
@@ -3214,7 +3218,12 @@ impl Render for Explorer {
             }));
 
         root = root
-            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, _| {
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, cx| {
+                if let MouseButton::Navigate(direction) = e.button {
+                    v.navigate_history(direction, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 v.marquee = None;
                 v.pending_selection_click = None;
                 v.right_file_drag = None;
@@ -3435,14 +3444,10 @@ impl Render for Explorer {
         ] {
             let click = cx.listener(move |v, _, _, cx| match id {
                 "back" => {
-                    if v.tabs[v.active].history.back() {
-                        v.reload(cx);
-                    }
+                    v.navigate_history(NavigationDirection::Back, cx);
                 }
                 "forward" => {
-                    if v.tabs[v.active].history.forward() {
-                        v.reload(cx);
-                    }
+                    v.navigate_history(NavigationDirection::Forward, cx);
                 }
                 "up" => v.go_up(cx),
                 _ => v.reload(cx),
