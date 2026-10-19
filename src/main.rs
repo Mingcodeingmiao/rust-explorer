@@ -2,12 +2,8 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    if args.get(1).is_some_and(|s| s == "--open-folder") {
-        let valid = args
-            .get(2)
-            .ok_or_else(|| anyhow::anyhow!("Folder argument missing"))
-            .and_then(|p| rust_explorer::default_browser::folder_argument(std::path::Path::new(p)));
-        if let Err(error) = valid {
+    {
+        if let Err(error) = rust_explorer::launch_request::current() {
             eprintln!("{error:#}");
             std::process::exit(1);
         }

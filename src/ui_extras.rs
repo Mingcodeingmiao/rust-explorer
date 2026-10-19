@@ -313,6 +313,8 @@ pub(super) fn open_explorer(
             }
             view.update(cx, |v, cx| {
                 if let Some(tab) = tab {
+                    v.external_reveal.clear();
+                    v.reveal_pending = false;
                     v.tabs = vec![tab];
                     v.active = 0;
                     v.search

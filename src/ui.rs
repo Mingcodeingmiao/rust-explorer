@@ -239,6 +239,9 @@ struct Explorer {
     usage_enabled: bool,
     inline_rename: Option<PathBuf>,
     pending_select: Option<PathBuf>,
+    external_reveal: Vec<PathBuf>,
+    reveal_pending: bool,
+    reveal_scroll: Option<PathBuf>,
     pending_rename: bool,
     rename_token: u64,
     selected_at: Instant,
@@ -426,17 +429,23 @@ impl Explorer {
         let folder_handler = std::env::args_os()
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
-        let initial = std::env::args_os()
-            .nth(if folder_handler { 2 } else { 1 })
-            .map(PathBuf::from)
-            .map(|p| {
-                if folder_handler {
-                    rust_explorer::default_browser::folder_argument(&p).unwrap_or(p)
-                } else {
-                    p
-                }
+        let launch = rust_explorer::launch_request::current().ok().flatten();
+        let initial = launch
+            .as_ref()
+            .map(|r| r.folder.clone())
+            .or_else(|| {
+                std::env::args_os()
+                    .nth(if folder_handler { 2 } else { 1 })
+                    .map(PathBuf::from)
+                    .map(|p| {
+                        if folder_handler {
+                            rust_explorer::default_browser::folder_argument(&p).unwrap_or(p)
+                        } else {
+                            p
+                        }
+                    })
+                    .filter(|p| navigation::is_virtual(p) || p.is_dir())
             })
-            .filter(|p| navigation::is_virtual(p) || p.is_dir())
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
@@ -683,6 +692,9 @@ impl Explorer {
             usage_enabled: false,
             inline_rename: None,
             pending_select: None,
+            reveal_pending: launch.as_ref().is_some_and(|r| !r.select.is_empty()),
+            external_reveal: launch.map(|r| r.select).unwrap_or_default(),
+            reveal_scroll: None,
             pending_rename: false,
             rename_token: 0,
             selected_at: Instant::now(),
@@ -965,6 +977,7 @@ impl Explorer {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
+        let reveal = self.external_reveal.clone();
         self.generation += 1;
         let generation = self.generation;
         let path = self.dir();
@@ -1080,10 +1093,10 @@ impl Explorer {
                     (result.entries, status)
                 };
                 if !hidden {
-                    entries.retain(|v| !v.hidden);
+                    entries.retain(|v| !v.hidden || reveal.contains(&v.path));
                 }
                 if !protected {
-                    entries.retain(|e| !e.system);
+                    entries.retain(|e| !e.system || reveal.contains(&e.path));
                 }
                 fs::sort(&mut entries, sort, descending);
                 if !folders_first {
@@ -1159,6 +1172,20 @@ impl Explorer {
                         }
                         this.entries = Arc::new(entries);
                         this.rebuild_rows();
+                        if this.reveal_pending {
+                            for target in &this.external_reveal {
+                                if let Some(index) =
+                                    this.entries.iter().position(|e| &e.path == target)
+                                {
+                                    this.selected.insert(index);
+                                    this.anchor = index;
+                                    this.keyboard_cursor = Some(target.clone());
+                                    this.focus_item = Some(target.clone());
+                                    this.reveal_scroll = Some(target.clone());
+                                }
+                            }
+                            this.reveal_pending = false;
+                        }
                         if let Some(path) = this.pending_select.take() {
                             if let Some(index) = this
                                 .entries
@@ -2787,7 +2814,13 @@ impl Render for Explorer {
             };
             window.set_window_title(&title);
         } else {
-            window.set_window_title(concat!("Rust Explorer ", env!("CARGO_PKG_VERSION")));
+            let path = self.dir();
+            let title = self
+                .shell_names
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| navigation::location_name(&path));
+            window.set_window_title(&title);
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 177.).max(100.);
         if (available - self.layout_width).abs() > 0.5
@@ -2800,6 +2833,14 @@ impl Render for Explorer {
             self.layout_mode = Some((self.view, self.settings.compact));
             self.rebuild_rows();
             self.list_scroll.scroll_to(offset);
+        }
+        if let Some(path) = self.reveal_scroll.take() {
+            if let Some(index) = self.entries.iter().position(|e| e.path == path) {
+                if let Some(row) = self.rows.iter().position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index)) || matches!(r,DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i==index)))) {
+                    self.set_high_performance_row(row as f32);
+                    self.list_scroll.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+                }
+            }
         }
         self.sync_thumbnails();
         let recycle = self.settings.high_performance
