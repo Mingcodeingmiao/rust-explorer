@@ -3633,6 +3633,7 @@ impl Explorer {
         x: f32,
         y: f32,
         level: usize,
+        viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
@@ -3644,11 +3645,14 @@ impl Explorer {
         };
         let mut panel = div()
             .id(("popup-panel", level))
+            // A submenu can overlap an earlier panel after flipping at a window edge.
+            // Its hitbox must block the obscured rows' hover and click handlers too.
+            .occlude()
             .absolute()
             .left(px(x))
             .top(px(y))
             .w(ui(260.))
-            .max_h(ui(580.))
+            .max_h(px((viewport_height - y - 8.).max(1.).min(580. * self.zoom)))
             .overflow_y_scroll()
             .py_2()
             .px_1()
@@ -3810,7 +3814,7 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .child(self.menu_panel(&kind, x, y, 0, cx));
+            .child(self.menu_panel(&kind, x, y, 0, max_y, cx));
         if let Some((sub, offset)) = &self.submenu {
             if self
                 .menu_items(&kind)
@@ -3825,7 +3829,7 @@ impl Explorer {
                 };
                 let child_y =
                     (y + offset * self.zoom).min((max_y - child_height - 8.).max(40. * self.zoom));
-                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, cx));
+                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, max_y, cx));
                 if let Some((nested, offset)) = &self.nested_submenu {
                     if self
                         .menu_items(sub)
@@ -3843,7 +3847,8 @@ impl Explorer {
                             };
                         let nested_y = (child_y + offset * self.zoom)
                             .min((max_y - height - 8.).max(40. * self.zoom));
-                        overlay = overlay.child(self.menu_panel(nested, nested_x, nested_y, 2, cx));
+                        overlay = overlay
+                            .child(self.menu_panel(nested, nested_x, nested_y, 2, max_y, cx));
                     }
                 }
             }
