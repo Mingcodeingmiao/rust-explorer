@@ -172,11 +172,7 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
-        if self.selected_click_to_end
-            && !self.content.is_empty()
-            && self.selected_range == (0..self.content.len())
-            && !event.modifiers.shift
-        {
+        if self.selected_click_to_end && !self.content.is_empty() && !event.modifiers.shift {
             self.is_selecting = false;
             self.move_to(self.content.len(), cx);
             return;

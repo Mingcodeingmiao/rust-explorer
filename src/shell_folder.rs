@@ -328,6 +328,7 @@ fn item_entry(item: &IShellItem) -> Option<Entry> {
         };
     }
     Some(Entry {
+        recycle: None,
         path,
         name,
         directory,
@@ -441,9 +442,45 @@ pub fn list(path: &Path) -> Result<Listing> {
     let recycle = is_recycle_bin_path(path);
     let entries = items
         .iter()
-        .filter_map(item_entry)
-        .map(|mut entry| {
+        .filter_map(|item| item_entry(item).map(|entry| (item, entry)))
+        .map(|(item, mut entry)| {
             if recycle {
+                if let Ok(properties) = item.cast::<IShellItem2>() {
+                    let mut origin = PROPERTYKEY::default();
+                    let mut deleted = PROPERTYKEY::default();
+                    use windows::Win32::UI::Shell::PropertiesSystem::PSGetPropertyKeyFromName;
+                    let original_location = unsafe {
+                        PSGetPropertyKeyFromName(
+                            windows::core::w!("System.Recycle.DeletedFrom"),
+                            &mut origin,
+                        )
+                        .ok()
+                        .and_then(|_| properties.GetString(&origin).ok())
+                        .map(|value| take_pwstr(value))
+                        .unwrap_or_default()
+                    };
+                    let date = unsafe {
+                        PSGetPropertyKeyFromName(
+                            windows::core::w!("System.Recycle.DateDeleted"),
+                            &mut deleted,
+                        )
+                        .ok()
+                        .and_then(|_| properties.GetFileTime(&deleted).ok())
+                        .and_then(file_time)
+                    };
+                    entry.recycle = Some(crate::fs::RecycleInfo {
+                        original_location,
+                        deleted: date,
+                    });
+                    // Recycled folders have a stored aggregate size. Do not
+                    // reinterpret their size/free-space properties as a drive.
+                    entry.size = unsafe { properties.GetUInt64(&PKEY_SIZE) }.unwrap_or(0);
+                    entry.total = None;
+                    entry.free = None;
+                    if entry.directory {
+                        entry.kind = "文件夹".into();
+                    }
+                }
                 if let Some(filename) = Path::new(&entry.name).file_name() {
                     entry.name = filename.to_string_lossy().into_owned();
                 }

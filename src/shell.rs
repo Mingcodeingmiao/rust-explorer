@@ -72,6 +72,7 @@ pub enum TransferMode {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Request {
+    EmptyRecycleBin,
     History {
         transaction: crate::file_history::Transaction,
     },
@@ -374,6 +375,10 @@ mod protocol_tests {
 pub fn dispatch(request: Request) -> Result<()> {
     let _com = Com::new()?;
     match request {
+        Request::EmptyRecycleBin => unsafe {
+            // Keep Windows confirmation, progress and errors enabled.
+            SHEmptyRecycleBinW(None, PCWSTR::null(), 0).map_err(Into::into)
+        },
         Request::History { transaction } => crate::file_history::apply(transaction),
         Request::RecordCreated { path } => crate::file_history::record_created(&path),
         Request::QuickAccessPin { path, pinned } => crate::quick_access::set_pinned(&path, pinned),
@@ -811,7 +816,11 @@ pub fn open(path: &Path) -> Result<()> {
 }
 pub fn properties(path: &Path) -> Result<()> {
     if crate::shell_folder::is_shell_path(path) {
-        return crate::shell_folder::properties(path);
+        crate::shell_folder::properties(path)?;
+        unsafe {
+            pump_property_windows();
+        }
+        return Ok(());
     }
     unsafe {
         let path = wide(path);

@@ -418,6 +418,7 @@ impl Explorer {
             self.quick_access_items()
                 .into_iter()
                 .map(|(name, path)| Entry {
+                    recycle: None,
                     path,
                     name,
                     directory: true,
@@ -437,6 +438,7 @@ impl Explorer {
                 .iter()
                 .filter(|(n, _)| matches!(n.as_str(), "文档" | "图片" | "音乐" | "视频"))
                 .map(|(label, path)| Entry {
+                    recycle: None,
                     path: path.clone(),
                     name: label.clone(),
                     directory: true,
@@ -463,6 +465,7 @@ impl Explorer {
                             .contains(&self.tabs[self.active].query.to_lowercase())
                 })
                 .map(|volume| Entry {
+                    recycle: None,
                     path: volume.path.clone(),
                     name: volume.label.clone(),
                     directory: true,

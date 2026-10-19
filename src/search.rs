@@ -222,6 +222,7 @@ pub fn sdk_query(query: &str) -> Result<SearchResult> {
             };
             let link = crate::fs::link_from_attributes(&path, get_attrs(i));
             entries.push(Entry {
+                recycle: None,
                 path,
                 name,
                 directory,

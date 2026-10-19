@@ -12,7 +12,14 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecycleInfo {
+    pub original_location: String,
+    pub deleted: Option<SystemTime>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
+    #[serde(default)]
+    pub recycle: Option<RecycleInfo>,
     pub path: PathBuf,
     pub name: String,
     pub directory: bool,
@@ -62,6 +69,7 @@ impl Entry {
                 .unwrap_or("文件".into())
         };
         Ok(Self {
+            recycle: None,
             path,
             name,
             directory,

@@ -2153,10 +2153,52 @@ impl Explorer {
         }
         strip.child(controls).into_any_element()
     }
-    fn column_widths(&self, _available: f32) -> Vec<(String, f32)> {
+    pub(super) fn column_widths(&self, available: f32) -> Vec<(String, f32)> {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            let scale = (available / 1120.).max(1.);
+            return [
+                ("name", 260.),
+                ("original", 270.),
+                ("deleted", 170.),
+                ("size", 100.),
+                ("kind", 150.),
+                ("modified", 170.),
+            ]
+            .into_iter()
+            .map(|(id, width)| (id.to_string(), width * scale))
+            .collect();
+        }
         self.settings.columns.clone()
     }
     pub(super) fn render_header(&self, available: f32, cx: &mut Context<Self>) -> AnyElement {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            let mut header = div()
+                .h(ui(34.))
+                .flex_shrink_0()
+                .flex()
+                .border_b_1()
+                .border_color(rgb(self.theme.border));
+            for (id, width) in self.column_widths(available) {
+                header = header.child(
+                    div()
+                        .w(ui(width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(rgb(self.theme.border))
+                        .child(match id.as_str() {
+                            "original" => "原位置",
+                            "deleted" => "删除日期",
+                            "kind" => "项目类型",
+                            _ => column_label(&id, false),
+                        }),
+                );
+            }
+            return header.into_any_element();
+        }
         let t = self.theme;
         let widths = self.column_widths(available);
         let total: f32 = widths.iter().map(|(_, w)| *w).sum();
@@ -2726,6 +2768,15 @@ impl Explorer {
                         "modified" => entry.date(),
                         "created" => format_date(entry.created),
                         "kind" => entry.kind.clone(),
+                        "size" if entry.recycle.is_some() => fs::size_label(entry.size),
+                        "original" => entry
+                            .recycle
+                            .as_ref()
+                            .map(|info| info.original_location.clone())
+                            .unwrap_or_default(),
+                        "deleted" => {
+                            format_date(entry.recycle.as_ref().and_then(|info| info.deleted))
+                        }
                         "size" => self.entry_size_text(entry),
                         _ => String::new(),
                     };
@@ -4501,6 +4552,13 @@ impl Explorer {
             .flex()
             .flex_col()
             .gap_2();
+        if self.options_page == 0 {
+            body = body.child(
+                div()
+                    .py_2()
+                    .child(format!("当前软件版本：{}", env!("CARGO_PKG_VERSION"))),
+            );
+        }
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
                 (

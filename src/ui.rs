@@ -564,6 +564,16 @@ impl Explorer {
         );
         subscriptions.push(
             cx.on_blur(&address.focus_handle(cx), window, |this, _, cx| {
+                if this.address.read(cx).value().is_empty() {
+                    let path = this.dir();
+                    let value = this
+                        .shell_names
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| path.display().to_string());
+                    this.address
+                        .update(cx, |input, cx| input.set_value(value, cx));
+                }
                 this.editing_address = false;
                 cx.notify();
             }),
@@ -1009,6 +1019,9 @@ impl Explorer {
                 },
             );
         }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&path) {
+            self.view = ViewMode::Details;
+        }
         if volumes::is_computer(&path) && !volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
             if !self.settings.remember_views {
@@ -1387,6 +1400,10 @@ impl Explorer {
         else {
             return;
         };
+        if rust_explorer::shell_folder::is_recycle_bin_path(&entry.path) {
+            self.preview = Preview::Message("回收站项目\n双击查看系统属性".into());
+            return;
+        }
         if entry.directory {
             self.preview = Preview::Message("文件夹\n双击打开".into());
             return;
@@ -1592,6 +1609,10 @@ impl Explorer {
         disposition: rust_explorer::open_target::OpenDisposition,
         cx: &mut Context<Self>,
     ) {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&entry.path) {
+            self.run_shell(shell::Request::Properties { path: entry.path }, cx);
+            return;
+        }
         if entry.directory && rust_explorer::shell_folder::is_shell_path(&entry.path) {
             self.shell_names
                 .insert(entry.path.clone(), entry.name.clone());
@@ -1679,7 +1700,8 @@ impl Explorer {
     fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
         let invalidates_usage = matches!(
             &request,
-            shell::Request::History { .. }
+            shell::Request::EmptyRecycleBin
+                | shell::Request::History { .. }
                 | shell::Request::RecordCreated { .. }
                 | shell::Request::Copy { .. }
                 | shell::Request::Transfer { .. }
@@ -3679,7 +3701,7 @@ impl Render for Explorer {
                 div()
                     .id(id)
                     .w(ui(30.))
-                    .h(ui(25.6))
+                    .h(ui(32.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -3687,7 +3709,7 @@ impl Render for Explorer {
                     .rounded(ui(4.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(t.hover)))
-                    .child(visual::icon_sized("refresh", t.text, 12.8))
+                    .child(visual::icon_sized("refresh", t.text, 16.))
                     .on_click(click)
             } else {
                 button(id, label, t).on_click(click)
@@ -3941,6 +3963,27 @@ impl Render for Explorer {
                     })),
             );
         root = root.child(toolbar);
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            root = root.child(
+                div()
+                    .h(ui(40.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .px_3()
+                    .border_b_1()
+                    .border_color(rgb(t.border))
+                    .child(
+                        button("empty-recycle-bin", "清空回收站", t).on_click(cx.listener(
+                            |v, _, _, cx| {
+                                if !v.busy {
+                                    v.run_shell(shell::Request::EmptyRecycleBin, cx);
+                                }
+                            },
+                        )),
+                    ),
+            );
+        }
 
         let sidebar = self.render_sidebar(sidebar_width, cx);
 
@@ -3981,7 +4024,10 @@ impl Render for Explorer {
                 );
         } else {
             let table_width = if self.view == ViewMode::Details {
-                self.settings.columns.iter().map(|(_, w)| *w).sum::<f32>()
+                self.column_widths(available)
+                    .iter()
+                    .map(|(_, w)| *w)
+                    .sum::<f32>()
             } else if self.view == ViewMode::List {
                 self.layout_width.max(
                     self.rows

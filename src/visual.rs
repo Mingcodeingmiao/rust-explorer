@@ -196,7 +196,7 @@ pub fn icon_at(name: &str, color: u32, logical: f32) -> AnyElement {
     icon_sized(name, color, logical)
 }
 pub fn icon(name: &str, color: u32) -> AnyElement {
-    icon_sized(name, color, 16.)
+    icon_sized(name, color, if name == "pin" { 18. } else { 16. })
 }
 pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
     // Never use the legacy red-X icon or Win10 toolbar raster resources.
