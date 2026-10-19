@@ -996,7 +996,15 @@ mod tests {
         )
         .unwrap();
         assert!(!command.contains(r"\\?\"));
-        assert!(command.starts_with(&format!("\"{}\"", exe.display())));
+        let (registered_exe, arguments) =
+            command.strip_prefix('"').unwrap().split_once('"').unwrap();
+        // TEMP can use an 8.3 alias on hosted Windows runners. Verify the same
+        // executable and exact arguments rather than the original path spelling.
+        assert_eq!(
+            PathBuf::from(registered_exe).canonicalize().unwrap(),
+            exe.canonicalize().unwrap()
+        );
+        assert_eq!(arguments.trim_end_matches('\0'), " --open-folder \"%1\\.\"");
         fs::remove_file(exe).unwrap();
         fs::remove_dir(dir).unwrap();
     }
