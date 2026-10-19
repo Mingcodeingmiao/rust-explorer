@@ -102,6 +102,7 @@ fn decode_pidl(path: &Path) -> Option<Vec<u8>> {
     let text = path.to_string_lossy();
     let text = text
         .strip_prefix("mtp-root:")
+        .or_else(|| text.strip_prefix("recycle:"))
         .or_else(|| text.strip_prefix("mtp:"))?;
     if text.len() % 2 != 0 {
         return None;
@@ -437,8 +438,44 @@ pub fn list(path: &Path) -> Result<Listing> {
                 .map(|value| value.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "便携设备".into());
-    let entries = items.iter().filter_map(item_entry).collect::<Vec<_>>();
-    let parents = ancestors(&root).unwrap_or_default();
+    let recycle = is_recycle_bin_path(path);
+    let entries = items
+        .iter()
+        .filter_map(item_entry)
+        .map(|mut entry| {
+            if recycle {
+                if let Some(filename) = Path::new(&entry.name).file_name() {
+                    entry.name = filename.to_string_lossy().into_owned();
+                }
+                if let Some(bytes) = decode_pidl(&entry.path) {
+                    entry.path = encode_pidl_with_prefix(&bytes, "recycle:");
+                }
+                // The bin is a user-facing listing even when its physical storage
+                // has hidden/system attributes.
+                entry.hidden = false;
+                entry.system = false;
+            }
+            entry
+        })
+        .collect::<Vec<_>>();
+    let mut parents = ancestors(&root).unwrap_or_default();
+    if recycle {
+        if let Ok(bin) =
+            item(Path::new("shell:RecycleBinFolder")).and_then(|bin| unsafe { item_pidl(&bin) })
+        {
+            if let Some(index) = parents
+                .iter()
+                .position(|(_, p)| decode_pidl(p).as_ref() == Some(&bin))
+            {
+                parents.drain(..index);
+            }
+        }
+        for (_, p) in &mut parents {
+            if let Some(bytes) = decode_pidl(p) {
+                *p = encode_pidl_with_prefix(&bytes, "recycle:");
+            }
+        }
+    }
     Ok(Listing {
         name,
         entries,
@@ -482,11 +519,18 @@ pub fn device_paths() -> Result<Vec<(String, PathBuf)>> {
 pub fn is_shell_path(path: &Path) -> bool {
     let value = path.to_string_lossy();
     value.starts_with("mtp:")
+        || value.starts_with("recycle:")
         || value.starts_with("mtp-root:")
         || value.starts_with("::{")
         || value.starts_with("shell:")
         || value.starts_with("\\\\?\\")
         || value.starts_with("\\\\.\\")
+}
+pub fn is_recycle_bin_path(path: &Path) -> bool {
+    let value = path.to_string_lossy();
+    value.eq_ignore_ascii_case("shell:RecycleBinFolder")
+        || value.eq_ignore_ascii_case("::{645FF040-5081-101B-9F08-00AA002F954E}")
+        || value.starts_with("recycle:")
 }
 
 /// PIDL aliases for a device root and its breadcrumb refer to the same item.
@@ -499,6 +543,9 @@ pub fn parent_from_chain(path: &Path, chain: &[(String, PathBuf)]) -> Option<Pat
         return Some(crate::volumes::computer());
     }
     let parent = &chain[index - 1].1;
+    if is_recycle_bin_path(path) {
+        return Some(parent.clone());
+    }
     Some(if index == 1 {
         decode_pidl(parent)
             .map(|bytes| encode_device_pidl(&bytes))
@@ -510,6 +557,12 @@ pub fn parent_from_chain(path: &Path, chain: &[(String, PathBuf)]) -> Option<Pat
 
 /// Resolve a parent through Shell, never by parsing a filesystem separator.
 pub fn parent(path: &Path) -> Result<PathBuf> {
+    if path
+        .to_string_lossy()
+        .eq_ignore_ascii_case("shell:RecycleBinFolder")
+    {
+        return Ok(crate::volumes::computer());
+    }
     let _com = Com::new();
     let current = item(path)?;
     let parent = unsafe { current.GetParent() }?;
@@ -525,6 +578,9 @@ pub fn parent(path: &Path) -> Result<PathBuf> {
     }
     let chain = ancestors(&parent)?;
     let bytes = unsafe { item_pidl(&parent) }?;
+    if is_recycle_bin_path(path) {
+        return Ok(encode_pidl_with_prefix(&bytes, "recycle:"));
+    }
     Ok(if chain.len() == 1 {
         encode_device_pidl(&bytes)
     } else {
@@ -556,6 +612,22 @@ mod tests {
             Some(crate::volumes::computer())
         );
         assert_eq!(parent_from_chain(&folder, &[]), None);
+    }
+    #[test]
+    fn recycle_namespace_stays_in_app_and_keeps_its_parent_alias() {
+        assert!(is_recycle_bin_path(Path::new("shell:RecycleBinFolder")));
+        assert!(is_recycle_bin_path(Path::new(
+            "::{645FF040-5081-101B-9F08-00AA002F954E}"
+        )));
+        let root = encode_pidl_with_prefix(&[2, 0, 1, 0], "recycle:");
+        let child = encode_pidl_with_prefix(&[2, 0, 2, 0], "recycle:");
+        assert!(is_shell_path(&child));
+        let chain = vec![
+            ("bin".into(), root.clone()),
+            ("child".into(), child.clone()),
+        ];
+        assert_eq!(parent_from_chain(&child, &chain), Some(root));
+        assert_eq!(decode_pidl(&child), Some(vec![2, 0, 2, 0]));
     }
 
     #[test]

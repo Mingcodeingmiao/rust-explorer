@@ -199,6 +199,16 @@ pub fn icon(name: &str, color: u32) -> AnyElement {
     icon_sized(name, color, 16.)
 }
 pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
+    // Never use the legacy red-X icon or Win10 toolbar raster resources.
+    if name == "close"
+        || (!rust_explorer::system_icons::windows_11()
+            && matches!(
+                name,
+                "cut" | "copy" | "paste" | "rename" | "share" | "delete"
+            ))
+    {
+        return drawn_icon_sized(name, color, logical);
+    }
     if let Some((font, glyph)) = system_glyph(name) {
         return div()
             .size(ui(logical))
@@ -214,7 +224,9 @@ pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
             .into_any_element();
     }
     let dark = ICONS.with(|v| v.borrow().dark);
-    if let Some(path) = fluent_icons::path(name, dark) {
+    if let Some(path) = fluent_icons::path(name, dark)
+        .filter(|_| !matches!(name, "network" | "computer" | "computer-colored" | "pin"))
+    {
         if matches!(name, "close" | "pin" | "unpin") {
             return svg()
                 .path(path.to_string_lossy().into_owned())
@@ -489,6 +501,11 @@ fn drawn_icon(name: &str, color: u32) -> AnyElement {
 // Official Microsoft SVGs are embedded, so missing Windows assets never require
 // network access or a hand-drawn substitute.
 fn drawn_icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
+    let name = if name == "address-computer" {
+        "computer-outline"
+    } else {
+        name
+    };
     let name = if rust_explorer::official_icons::bytes(name).is_some() {
         name
     } else {
@@ -518,6 +535,7 @@ fn system_glyph(name: &str) -> Option<(&'static str, char)> {
         "forward" => '\u{e72a}',
         "up" => '\u{e74a}',
         "refresh" => '\u{e72c}',
+        "address-computer" => '\u{e7f4}',
         "search" => '\u{e721}',
         _ => return None,
     };

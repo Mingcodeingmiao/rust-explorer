@@ -399,10 +399,22 @@ fn desktop_icon(size: u32) -> Result<IconBitmap> {
     bitmap(icon.0, size)
 }
 
+pub fn windows_11() -> bool {
+    static VERSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| unsafe {
+        use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
+        };
+        GetVersionExW(&mut version).is_ok() && version.dwBuildNumber >= 22000
+    })
+}
 pub fn has_ui_icon(name: &str) -> bool {
     matches!(
         name,
         "network"
+            | "pin"
             | "recycle-bin"
             | "folder"
             | "folder-open"
@@ -438,13 +450,18 @@ pub fn has_ui_icon(name: &str) -> bool {
 }
 pub fn ui_icon(name: &str, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
+    match name {
+        "network" => return resource_icon("imageres.dll", 25, size),
+        "pin" => return resource_icon("imageres.dll", 5100, size),
+        "computer" | "computer-colored" => return resource_icon("imageres.dll", 109, size),
+        _ => {}
+    }
     if name == "desktop" {
         if let Ok(icon) = desktop_icon(size) {
             return Ok(icon);
         }
     }
     let stock = match name {
-        "network" => Some(SIID_WORLD),
         "recycle-bin" => Some(SIID_RECYCLER),
         "folder" => Some(SIID_FOLDER),
         "folder-open" => Some(SIID_FOLDEROPEN),

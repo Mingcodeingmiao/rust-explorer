@@ -251,7 +251,6 @@ struct Explorer {
     drag_rx: mpsc::Receiver<TabDrop>,
     drag_tx: mpsc::Sender<TabDrop>,
     own_window: Option<AnyWindowHandle>,
-    application_icons: Option<ApplicationIcons>,
     tab_drag: Option<Arc<AtomicBool>>,
     tab_tip: Option<crate::tab_tip::TabTip>,
     volumes: Vec<Volume>,
@@ -458,6 +457,7 @@ impl Explorer {
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
+        address.update(cx, |input, _| input.selected_click_to_end = true);
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
         let mut subscriptions = vec![];
@@ -715,7 +715,6 @@ impl Explorer {
             drag_rx,
             drag_tx,
             own_window: Some(window.window_handle()),
-            application_icons: None,
             tab_drag: None,
             tab_tip: None,
             volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
@@ -1001,10 +1000,6 @@ impl Explorer {
         cx.notify();
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if path == PathBuf::from("shell:RecycleBinFolder") {
-            self.run_shell(shell::Request::Open { path }, cx);
-            return;
-        }
         if self.settings.remember_views {
             self.view = self.settings.folder_views.get(&path).copied().unwrap_or(
                 if volumes::is_computer(&path) {
@@ -1722,19 +1717,26 @@ impl Explorer {
             self.busy = true;
         }
         self.error = None;
-        let refresh = !matches!(
-            &request,
-            shell::Request::Open { .. }
-                | shell::Request::FontPreview { .. }
-                | shell::Request::SystemProperties
-                | shell::Request::Share { .. }
-                | shell::Request::Properties { .. }
-                | shell::Request::PropertiesMany { .. }
-                | shell::Request::SharingAccess { .. }
-                | shell::Request::AdvancedShare { .. }
-                | shell::Request::Menu { .. }
-                | shell::Request::ThemedMenu { .. }
-        );
+        let recycle_menu = match &request {
+            shell::Request::Menu { folder, .. } | shell::Request::ThemedMenu { folder, .. } => {
+                rust_explorer::shell_folder::is_recycle_bin_path(folder)
+            }
+            _ => false,
+        };
+        let refresh = recycle_menu
+            || !matches!(
+                &request,
+                shell::Request::Open { .. }
+                    | shell::Request::FontPreview { .. }
+                    | shell::Request::SystemProperties
+                    | shell::Request::Share { .. }
+                    | shell::Request::Properties { .. }
+                    | shell::Request::PropertiesMany { .. }
+                    | shell::Request::SharingAccess { .. }
+                    | shell::Request::AdvancedShare { .. }
+                    | shell::Request::Menu { .. }
+                    | shell::Request::ThemedMenu { .. }
+            );
         let moving_paths = match &request {
             shell::Request::Copy {
                 paths,
@@ -1956,10 +1958,17 @@ impl Explorer {
         if self.busy {
             return;
         }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            self.system_menu(cx);
+            return;
+        }
         // The native MTP namespace menu is incomplete and can misbehave. Use
         // the app-owned item menu for portable-device items even when the
         // "full system menu" option is enabled.
-        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+        if navigation::is_shell_folder(&self.dir())
+            && !rust_explorer::shell_folder::is_recycle_bin_path(&self.dir())
+            && !self.selected.is_empty()
+        {
             self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
             self.submenu = None;
             cx.notify();
@@ -1998,7 +2007,10 @@ impl Explorer {
         cx.notify();
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
-        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+        if navigation::is_shell_folder(&self.dir())
+            && !rust_explorer::shell_folder::is_recycle_bin_path(&self.dir())
+            && !self.selected.is_empty()
+        {
             self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
             self.submenu = None;
             cx.notify();
@@ -2815,14 +2827,6 @@ impl Explorer {
         self.address_generation = self.address_generation.wrapping_add(1);
         self.address
             .update(cx, |v, cx| v.focus_select_all(window, cx));
-        self.address_candidates.clear();
-        cx.notify();
-    }
-    fn focus_address_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_address = true;
-        self.address_choice = None;
-        self.address_generation = self.address_generation.wrapping_add(1);
-        self.address.update(cx, |v, cx| v.focus_end(window, cx));
         self.address_candidates.clear();
         cx.notify();
     }
@@ -3696,7 +3700,35 @@ impl Render for Explorer {
                 .relative()
                 .flex_1()
                 .relative()
-                .child(self.address.clone())
+                .flex()
+                .items_center()
+                .child(div().flex_1().min_w_0().child(self.address.clone()))
+                .child(
+                    div()
+                        .id("clear-address")
+                        .w(ui(28.))
+                        .h(ui(28.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(visual::icon_sized("close", t.text, 12.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v, _, w, cx| {
+                                cx.stop_propagation();
+                                v.address_candidates.clear();
+                                v.address_choice = None;
+                                v.address_generation = v.address_generation.wrapping_add(1);
+                                v.address.update(cx, |input, cx| {
+                                    input.set_value(String::new(), cx);
+                                    input.focus_end(w, cx);
+                                });
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .child(
                     canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
                         .absolute()

@@ -46,6 +46,8 @@ pub struct TextInput {
     last_line_height: Pixels,
     is_selecting: bool,
     pub compact: bool,
+    /// Address bars collapse their initial whole-path selection at the end.
+    pub selected_click_to_end: bool,
 }
 
 impl TextInput {
@@ -62,6 +64,7 @@ impl TextInput {
             last_line_height: px(20.),
             is_selecting: false,
             compact: false,
+            selected_click_to_end: false,
         }
     }
     fn suggest_previous(&mut self, _: &SuggestPrevious, _: &mut Window, cx: &mut Context<Self>) {
@@ -169,6 +172,15 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if self.selected_click_to_end
+            && !self.content.is_empty()
+            && self.selected_range == (0..self.content.len())
+            && !event.modifiers.shift
+        {
+            self.is_selecting = false;
+            self.move_to(self.content.len(), cx);
+            return;
+        }
         self.is_selecting = true;
 
         if event.modifiers.shift {

@@ -1112,6 +1112,16 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 struct Pidl(*mut Common::ITEMIDLIST);
+fn menu_pidl(path: &Path) -> Result<Pidl> {
+    let pointer = if crate::shell_folder::is_shell_path(path) {
+        let bytes = crate::shell_folder::pidl(path)?;
+        unsafe { ILClone(bytes.as_ptr().cast()) }
+    } else {
+        unsafe { ILCreateFromPathW(PCWSTR(wide(path).as_ptr())) }
+    };
+    anyhow::ensure!(!pointer.is_null(), "无法读取 Shell 菜单项目");
+    Ok(Pidl(pointer))
+}
 impl Drop for Pidl {
     fn drop(&mut self) {
         unsafe {
@@ -1481,7 +1491,7 @@ fn context_menu_options(
             let children = [ILFindLastID(pidl.0) as *const Common::ITEMIDLIST];
             parent.GetUIObjectOf(hwnd, &children, None)?
         } else if paths.is_empty() {
-            let pidl = Pidl(ILCreateFromPathW(PCWSTR(wide(folder).as_ptr())));
+            let pidl = menu_pidl(folder)?;
             if pidl.0.is_null() {
                 bail!("无法读取文件夹菜单");
             }
@@ -1491,7 +1501,7 @@ fn context_menu_options(
         } else {
             let mut items = Vec::new();
             for path in paths {
-                let pidl = Pidl(ILCreateFromPathW(PCWSTR(wide(path).as_ptr())));
+                let pidl = menu_pidl(path)?;
                 if pidl.0.is_null() {
                     bail!("无法读取文件菜单");
                 }
@@ -1673,7 +1683,7 @@ fn context_menu_options(
             }
             let mut info = CMINVOKECOMMANDINFOEX {
                 cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                fMask: SEE_MASK_UNICODE,
+                fMask: SEE_MASK_UNICODE | SEE_MASK_NOASYNC,
                 hwnd,
                 lpVerb: PCSTR((command as usize - 1) as *const u8),
                 lpVerbW: PCWSTR((command as usize - 1) as *const u16),

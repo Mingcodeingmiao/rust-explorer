@@ -19,6 +19,6 @@ The original application icon is AI-assisted artwork created for this project, n
 
 ## Microsoft Fluent UI System Icons
 
-Toolbar fallback SVGs and the embedded application fallback icon use unmodified Microsoft Fluent UI System Icons artwork (MIT). Source commit and per-file URLs are recorded in `resources/fluent-icons/SOURCES.json`; full license is in `resources/fluent-icons/LICENSE`. Application PNG/ICO variants are rasterizations of the upstream Document Folder SVG.
+Toolbar fallback SVGs use unmodified Microsoft Fluent UI System Icons artwork (MIT). Source commit and per-file URLs are recorded in `resources/fluent-icons/SOURCES.json`; full license is in `resources/fluent-icons/LICENSE`. The application icon uses the project’s original generated artwork.
 
 Installed Windows artwork and system icon fonts are referenced at runtime only and are not redistributed.

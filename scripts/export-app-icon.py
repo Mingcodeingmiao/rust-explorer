@@ -1,6 +1,6 @@
-"""Pack the checked-in Microsoft Fluent PNG rasterizations into a Windows ICO.
+"""Pack the checked-in original application PNG rasterizations into a Windows ICO.
 
-Artwork provenance: resources/fluent-icons/SOURCES.json (app-folder).
+Artwork: resources/app-icon/rust-explorer-master.png (original generated logo).
 This script does not accept replacement artwork or copy Windows resources.
 """
 from pathlib import Path
@@ -19,4 +19,4 @@ for size in sizes:
     offset += len(png)
     payload.extend(png)
 (folder / 'rust-explorer.ico').write_bytes(struct.pack('<HHH', 0, 1, len(sizes)) + b''.join(entries) + payload)
-print('Packed official Fluent fallback ICO:', ', '.join(map(str, sizes)))
+print('Packed application ICO:', ', '.join(map(str, sizes)))
