@@ -10,7 +10,7 @@ pub(super) struct TabDrop {
     pub accepted: bool,
     pub position: (i32, i32),
 }
-fn native_hwnd(window: &Window) -> Option<isize> {
+pub(super) fn native_hwnd(window: &Window) -> Option<isize> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
         _ => None,
@@ -32,7 +32,7 @@ fn set_application_icon(handle: isize) {
             return;
         };
         let dpi = GetDpiForWindow(hwnd).max(96);
-        for (kind, logical_size) in [(ICON_SMALL, 32u32), (ICON_BIG, 48u32)] {
+        for (kind, logical_size) in [(ICON_SMALL, 16u32), (ICON_BIG, 32u32)] {
             let size = ((logical_size * dpi + 48) / 96) as i32;
             if let Ok(icon) = LoadImageW(
                 Some(HINSTANCE(module.0)),
@@ -42,7 +42,6 @@ fn set_application_icon(handle: isize) {
                 size,
                 LR_SHARED,
             ) {
-                // LR_SHARED resources belong to the executable for its lifetime.
                 SendMessageW(
                     hwnd,
                     WM_SETICON,
@@ -288,8 +287,16 @@ pub(super) fn open_explorer(
     tab: Option<Tab>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<Explorer>> {
+    open_explorer_request(tab, None, cx)
+}
+pub(super) fn open_explorer_request(
+    tab: Option<Tab>,
+    launch: Option<rust_explorer::launch_request::LaunchRequest>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<Explorer>> {
     let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-    cx.open_window(
+    let external = launch.is_some();
+    let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
@@ -301,11 +308,13 @@ pub(super) fn open_explorer(
             ..Default::default()
         },
         move |w, cx| {
-            let view = cx.new(|cx| Explorer::new(w, cx));
+            let view = cx.new(|cx| Explorer::new(w, launch, cx));
             if let Some(hwnd) = native_hwnd(w) {
                 set_application_icon(hwnd);
                 if let Err(error) = rust_explorer::window_frame::install(hwnd) {
                     eprintln!("{error:#}");
+                } else {
+                    rust_explorer::instance::advertise(hwnd);
                 }
                 TAB_WINDOWS.with(|windows| {
                     windows.borrow_mut().insert(hwnd, view.downgrade());
@@ -313,6 +322,8 @@ pub(super) fn open_explorer(
             }
             view.update(cx, |v, cx| {
                 if let Some(tab) = tab {
+                    v.external_reveal = tab.reveal_targets.clone();
+                    v.reveal_pending = !v.external_reveal.is_empty();
                     v.tabs = vec![tab];
                     v.active = 0;
                     v.search
@@ -322,7 +333,18 @@ pub(super) fn open_explorer(
             });
             view
         },
-    )
+    )?;
+    if external {
+        // GPUI applies initial visibility after the constructor closure returns.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| {
+                if let Some(hwnd) = native_hwnd(window) {
+                    rust_explorer::instance::reveal_window(hwnd);
+                }
+            });
+        });
+    }
+    Ok(handle)
 }
 pub(super) fn compare_entries(
     a: &Entry,
@@ -1206,7 +1228,7 @@ impl Explorer {
             .px_2()
             .overflow_hidden()
             .cursor_pointer()
-            .on_click(cx.listener(|v, _, w, cx| v.focus_address_end(w, cx)));
+            .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
         crumbs = crumbs
             .child(
                 div()
@@ -1214,7 +1236,14 @@ impl Explorer {
                     .flex_shrink_0()
                     .flex()
                     .justify_center()
-                    .child(visual::icon("computer-outline", t.text)),
+                    .child(visual::icon(
+                        if rust_explorer::system_icons::windows_11() {
+                            "computer"
+                        } else {
+                            "address-computer"
+                        },
+                        t.text,
+                    )),
             )
             .child(visual::icon("chevron-right", t.muted));
         if hidden > 0 {
@@ -1554,6 +1583,7 @@ impl Explorer {
         }
         if self.usage_running {
             self.usage_cancel.store(true, Ordering::Relaxed);
+            self.usage_revision = self.usage_revision.wrapping_add(1);
             self.usage_running = false;
             self.status = "统计已停止；* 表示跳过项目或部分结果".into();
             cx.notify();
@@ -1563,10 +1593,17 @@ impl Explorer {
         self.usage_running = true;
         self.usage.clear();
         self.usage_cancel = Arc::new(AtomicBool::new(false));
+        self.usage_revision = self.usage_revision.wrapping_add(1);
         let cancel = self.usage_cancel.clone();
         let entries = self.entries.clone();
         let tx = self.usage_tx.clone();
-        let generation = self.generation;
+        let generation = self.usage_revision;
+        disk_usage::invalidate_paths(
+            entries
+                .iter()
+                .filter(|e| e.directory)
+                .map(|e| e.path.as_path()),
+        );
         self.status = "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整".into();
         let task = cx.background_executor().spawn(async move {
             let mut skipped = 0;
@@ -1585,7 +1622,7 @@ impl Explorer {
         cx.spawn(async move |view, cx| {
             let (skipped, hits) = task.await;
             let _ = view.update(cx, |v, cx| {
-                if v.generation == generation {
+                if v.usage_revision == generation {
                     v.usage_running = false;
                     v.status = format!(
                         "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
@@ -1974,13 +2011,18 @@ impl Explorer {
                         cx.stop_propagation();
                         v.accept_tab(drag, index, cx);
                     }))
-                    .child(visual::icon(
+                    .child(visual::icon_at(
                         if navigation::is_virtual(tab.history.current()) {
                             "computer"
                         } else {
                             "folder"
                         },
                         0xeac054,
+                        if current == std::path::Path::new("::QuickAccess") {
+                            12.
+                        } else {
+                            16.
+                        },
                     ))
                     .child(
                         div()
@@ -1993,10 +2035,11 @@ impl Explorer {
                             .child(name),
                     )
                     .child(
-                        button(("close-tab", tab.id), "", t)
-                            .child(visual::icon_at("close", t.text, 16. * 2. / 3.))
-                            .w(ui(24.))
-                            .px_1()
+                        div()
+                            .id(("close-tab", tab.id))
+                            .child(visual::icon_at("close", t.text, 16. * 2. / 3. * 1.27))
+                            .size(ui(24.))
+                            .hover(move |s| s.bg(rgb(t.hover)))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
@@ -2116,10 +2159,52 @@ impl Explorer {
         }
         strip.child(controls).into_any_element()
     }
-    fn column_widths(&self, _available: f32) -> Vec<(String, f32)> {
+    pub(super) fn column_widths(&self, available: f32) -> Vec<(String, f32)> {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            let scale = (available / 1120.).max(1.);
+            return [
+                ("name", 260.),
+                ("original", 270.),
+                ("deleted", 170.),
+                ("size", 100.),
+                ("kind", 150.),
+                ("modified", 170.),
+            ]
+            .into_iter()
+            .map(|(id, width)| (id.to_string(), width * scale))
+            .collect();
+        }
         self.settings.columns.clone()
     }
     pub(super) fn render_header(&self, available: f32, cx: &mut Context<Self>) -> AnyElement {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            let mut header = div()
+                .h(ui(34.))
+                .flex_shrink_0()
+                .flex()
+                .border_b_1()
+                .border_color(rgb(self.theme.border));
+            for (id, width) in self.column_widths(available) {
+                header = header.child(
+                    div()
+                        .w(ui(width))
+                        .h_full()
+                        .flex_shrink_0()
+                        .px_3()
+                        .flex()
+                        .items_center()
+                        .border_r_1()
+                        .border_color(rgb(self.theme.border))
+                        .child(match id.as_str() {
+                            "original" => "原位置",
+                            "deleted" => "删除日期",
+                            "kind" => "项目类型",
+                            _ => column_label(&id, false),
+                        }),
+                );
+            }
+            return header.into_any_element();
+        }
         let t = self.theme;
         let widths = self.column_widths(available);
         let total: f32 = widths.iter().map(|(_, w)| *w).sum();
@@ -2689,6 +2774,15 @@ impl Explorer {
                         "modified" => entry.date(),
                         "created" => format_date(entry.created),
                         "kind" => entry.kind.clone(),
+                        "size" if entry.recycle.is_some() => fs::size_label(entry.size),
+                        "original" => entry
+                            .recycle
+                            .as_ref()
+                            .map(|info| info.original_location.clone())
+                            .unwrap_or_default(),
+                        "deleted" => {
+                            format_date(entry.recycle.as_ref().and_then(|info| info.deleted))
+                        }
                         "size" => self.entry_size_text(entry),
                         _ => String::new(),
                     };
@@ -3539,6 +3633,7 @@ impl Explorer {
         x: f32,
         y: f32,
         level: usize,
+        viewport_height: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
@@ -3550,11 +3645,14 @@ impl Explorer {
         };
         let mut panel = div()
             .id(("popup-panel", level))
+            // A submenu can overlap an earlier panel after flipping at a window edge.
+            // Its hitbox must block the obscured rows' hover and click handlers too.
+            .occlude()
             .absolute()
             .left(px(x))
             .top(px(y))
             .w(ui(260.))
-            .max_h(ui(580.))
+            .max_h(px((viewport_height - y - 8.).max(1.).min(580. * self.zoom)))
             .overflow_y_scroll()
             .py_2()
             .px_1()
@@ -3716,7 +3814,7 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .child(self.menu_panel(&kind, x, y, 0, cx));
+            .child(self.menu_panel(&kind, x, y, 0, max_y, cx));
         if let Some((sub, offset)) = &self.submenu {
             if self
                 .menu_items(&kind)
@@ -3731,7 +3829,7 @@ impl Explorer {
                 };
                 let child_y =
                     (y + offset * self.zoom).min((max_y - child_height - 8.).max(40. * self.zoom));
-                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, cx));
+                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, max_y, cx));
                 if let Some((nested, offset)) = &self.nested_submenu {
                     if self
                         .menu_items(sub)
@@ -3749,7 +3847,8 @@ impl Explorer {
                             };
                         let nested_y = (child_y + offset * self.zoom)
                             .min((max_y - height - 8.).max(40. * self.zoom));
-                        overlay = overlay.child(self.menu_panel(nested, nested_x, nested_y, 2, cx));
+                        overlay = overlay
+                            .child(self.menu_panel(nested, nested_x, nested_y, 2, max_y, cx));
                     }
                 }
             }
@@ -3786,6 +3885,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     };
                     let _ = open_explorer(Some(tab), cx);
                 }
@@ -3983,6 +4083,7 @@ impl Explorer {
                         history: History::new(path.clone()),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     });
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
@@ -4001,6 +4102,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     };
                     let _ = open_explorer(Some(tab), cx);
                 }
@@ -4073,6 +4175,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     });
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
@@ -4085,6 +4188,7 @@ impl Explorer {
                             history: History::new(path),
                             query: String::new(),
                             global: false,
+                            reveal_targets: Vec::new(),
                         }),
                         cx,
                     );
@@ -4243,6 +4347,7 @@ impl Explorer {
                     history: History::new(self.dir()),
                     query: String::new(),
                     global: false,
+                    reveal_targets: Vec::new(),
                 };
                 let _ = open_explorer(Some(tab), cx);
             }
@@ -4378,6 +4483,55 @@ impl Explorer {
         })
         .detach();
     }
+    fn change_folder_association(
+        &mut self,
+        enable: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.association_busy {
+            return;
+        }
+        self.association_busy = true;
+        let hwnd = native_hwnd(window).unwrap_or(0);
+        let task = cx.background_executor().spawn(async move {
+            use windows::{core::PCWSTR, Win32::{Foundation::HWND, UI::WindowsAndMessaging::*}};
+            let message = if enable {
+                "将限时试用当前用户的普通文件夹和驱动器默认打开方式。Win+E、此电脑等虚拟页面保持系统行为。\n请先将程序放在固定位置，启用后不要移动或删除。\n未在 120 秒内确认保留，独立恢复进程会自动恢复原样，即使 RE 已退出。\n原始值及独立恢复程序位于本地应用数据目录 RustExplorer\\folder-association。\n是否开始试用？"
+            } else { "恢复启用前的文件夹和驱动器关联？若关联已被其他程序修改，会保留这些修改并报告冲突。" };
+            let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+            let title: Vec<u16> = "Rust Explorer — 文件夹关联".encode_utf16().chain(Some(0)).collect();
+            let answer = unsafe { MessageBoxW(Some(HWND(hwnd as *mut _)), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
+            if answer != IDYES { return Ok(false); }
+            if enable {
+                rust_explorer::default_browser::enable().map_err(|e| format!("{e:#}"))?;
+                if rust_explorer::default_browser::trial_pending() {
+                    let keep: Vec<u16> = "临时接管已启用。请在 Windows 资源管理器中双击普通文件夹、驱动器，确认 RE 正常打开。\n是否保留此设置？\n选择“否”或 120 秒内未确认，会自动恢复原样。".encode_utf16().chain(Some(0)).collect();
+                    let answer = unsafe { MessageBoxW(None, PCWSTR(keep.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) };
+                    if answer == IDYES { rust_explorer::default_browser::confirm_trial().map_err(|e| format!("{e:#}"))?; }
+                    else if rust_explorer::default_browser::trial_pending() { rust_explorer::default_browser::disable().map_err(|e| format!("{e:#}"))?; return Ok(false); }
+                    else { return Ok(false); }
+                }
+            } else { rust_explorer::default_browser::disable().map_err(|e| format!("{e:#}"))?; }
+            Ok(true)
+        });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |v, cx| {
+                v.association_busy = false;
+                match result {
+                    Ok(true) => {
+                        v.status = "文件夹关联操作完成；恢复入口位于文件夹选项 → 常规".into()
+                    }
+                    Ok(false) => {}
+                    Err(e) => v.error = Some(e),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub(super) fn render_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let settings = self.options.as_ref().unwrap();
@@ -4409,8 +4563,46 @@ impl Explorer {
             .flex()
             .flex_col()
             .gap_2();
+        if self.options_page == 0 {
+            body = body.child(
+                div()
+                    .py_2()
+                    .child(format!("当前软件版本：{}", env!("CARGO_PKG_VERSION"))),
+            );
+        }
+        if self.options_page == 0 {
+            body = body.child(div().py_2().child("启动时打开"));
+            for (page, label) in [
+                ("home", "主文件夹"),
+                ("this-pc", "此电脑"),
+                ("quick-access", "快速访问"),
+            ] {
+                let selected = settings.startup_page == page;
+                body = body.child(
+                    button(SharedString::from(format!("startup-page-{page}")), label, t)
+                        .flex_shrink_0()
+                        .when(selected, |d| d.bg(rgb(t.selection)))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            if let Some(s) = &mut v.options {
+                                s.startup_page = page.into();
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
+                (
+                    "quick-access-new-tab",
+                    "默认在新标签页中打开快速访问的文件夹",
+                    settings.quick_access_new_tab,
+                ),
+                (
+                    "new-tab-this-pc",
+                    "新标签页打开此电脑（关闭时打开当前目录）",
+                    settings.new_tab_this_pc,
+                ),
                 (
                     "single",
                     "通过单击打开项目（指向时选定请使用复选框）",
@@ -4487,6 +4679,33 @@ impl Explorer {
                     .child("浏览文件夹与打开项目"),
             );
         }
+        if self.options_page == 0 {
+            let status = rust_explorer::default_browser::status()
+                .unwrap_or_else(|e| format!("关联状态读取失败：{e:#}"));
+            body = body.child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().child(format!("默认文件夹浏览器（实验性）：{status}。仅普通文件夹和驱动器。先试用 120 秒，确认后保留，超时自动恢复；与下方“应用”独立。")))
+                .child(div().flex().flex_wrap().gap_2()
+                    .child(button("association-enable", if self.association_busy { "操作中…" } else { "试用默认文件夹浏览器…" }, t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(true, w, cx))))
+                    .child(button("association-restore", "恢复原样…", t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(false, w, cx)))));
+            body = body.child(
+                button("association-recovery-folder", "打开恢复文件夹", t).on_click(cx.listener(
+                    |v, _, _, cx| {
+                        match rust_explorer::default_browser::recovery_directory().and_then(
+                            |path| {
+                                std::fs::create_dir_all(&path)?;
+                                Ok(path)
+                            },
+                        ) {
+                            Ok(path) => {
+                                v.options = None;
+                                v.open_tab_path(path, cx);
+                            }
+                            Err(e) => v.error = Some(e.to_string()),
+                        }
+                        cx.notify();
+                    },
+                )),
+            );
+        }
         if self.options_page == 1 {
             let source = rust_explorer::fluent_icons::resource_status();
             body = body.child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(format!(
@@ -4541,6 +4760,10 @@ impl Explorer {
                     .on_click(cx.listener(move |v, _, _, cx| {
                         if let Some(s) = &mut v.options {
                             match id {
+                                "quick-access-new-tab" => {
+                                    s.quick_access_new_tab = !s.quick_access_new_tab
+                                }
+                                "new-tab-this-pc" => s.new_tab_this_pc = !s.new_tab_this_pc,
                                 "single" => s.single_click = !s.single_click,
                                 "shift-open-tab" => s.shift_open_tab = !s.shift_open_tab,
                                 "separate" => s.separate_process = !s.separate_process,
@@ -4657,7 +4880,7 @@ impl Explorer {
                             .whitespace_normal()
                             .text_size(ui(12.))
                             .text_color(rgb(t.muted))
-                            .child("设置仅作用于 Rust Explorer，不修改系统资源管理器。"),
+                            .child("普通设置仅作用于 Rust Explorer；默认文件夹关联需单独确认，可通过“恢复原样”撤销。"),
                     )
                     .child(
                         div()

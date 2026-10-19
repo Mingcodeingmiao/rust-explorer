@@ -115,6 +115,7 @@ struct Tab {
     history: History,
     query: String,
     global: bool,
+    reveal_targets: Vec<PathBuf>,
 }
 #[derive(Clone)]
 struct DragFiles {
@@ -199,6 +200,7 @@ struct Explorer {
     settings: Settings,
     options: Option<Settings>,
     options_page: usize,
+    association_busy: bool,
     options_scroll: ScrollHandle,
     toolbar_overflow: Vec<&'static str>,
     nested_submenu: Option<(String, f32)>,
@@ -235,9 +237,13 @@ struct Explorer {
     usage_rx: mpsc::Receiver<(u64, PathBuf, Usage)>,
     usage_tx: mpsc::Sender<(u64, PathBuf, Usage)>,
     usage_running: bool,
+    usage_revision: u64,
     usage_enabled: bool,
     inline_rename: Option<PathBuf>,
     pending_select: Option<PathBuf>,
+    external_reveal: Vec<PathBuf>,
+    reveal_pending: bool,
+    reveal_scroll: Option<PathBuf>,
     pending_rename: bool,
     rename_token: u64,
     selected_at: Instant,
@@ -303,6 +309,7 @@ struct Explorer {
     search: Entity<TextInput>,
     dialog_input: Entity<TextInput>,
     editing_address: bool,
+    address_before_edit: String,
     address_candidates: Vec<rust_explorer::path_completion::Candidate>,
     address_choice: Option<usize>,
     address_generation: u64,
@@ -314,6 +321,9 @@ struct Explorer {
     shell_clipboard: Option<(Vec<PathBuf>, bool)>,
     shell_clipboard_seq: u32,
     list_scroll: ListState,
+    // A refresh of the same tab/location keeps its viewport while the replacement
+    // listing loads. Navigation and searches still start at the top.
+    reload_scope: Option<(u64, PathBuf, String)>,
     zoom: f32,
     layout_width: f32,
     layout_mode: Option<(ViewMode, bool)>,
@@ -421,14 +431,43 @@ impl Explorer {
         }
         cx.notify();
     }
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let initial = std::env::args_os()
+    fn new(
+        window: &mut Window,
+        launch: Option<rust_explorer::launch_request::LaunchRequest>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let folder_handler = std::env::args_os()
             .nth(1)
-            .map(PathBuf::from)
-            .filter(|p| navigation::is_virtual(p) || p.is_dir())
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
+            .is_some_and(|a| a == "--open-folder");
+        let mut settings = Settings::load();
+        let initial = launch
+            .as_ref()
+            .map(|r| r.folder.clone())
+            .or_else(|| {
+                std::env::args_os()
+                    .nth(if folder_handler { 2 } else { 1 })
+                    .map(PathBuf::from)
+                    .map(|p| {
+                        if folder_handler {
+                            rust_explorer::default_browser::folder_argument(&p).unwrap_or(p)
+                        } else {
+                            p
+                        }
+                    })
+                    .filter(|p| navigation::is_virtual(p) || p.is_dir())
+            })
+            .unwrap_or_else(|| match settings.startup_page.as_str() {
+                "this-pc" => PathBuf::from("::ThisPC"),
+                "quick-access" => PathBuf::from("::QuickAccess"),
+                _ => shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Profile)
+                    .unwrap_or_else(|| PathBuf::from("C:\\")),
+            });
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
+        address.update(cx, |input, _| {
+            input.single_line_scroll = true;
+            input.click_to_end = true;
+        });
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
         let mut subscriptions = vec![];
@@ -535,6 +574,16 @@ impl Explorer {
         );
         subscriptions.push(
             cx.on_blur(&address.focus_handle(cx), window, |this, _, cx| {
+                if this.address.read(cx).value().is_empty() {
+                    let path = this.dir();
+                    let value = this
+                        .shell_names
+                        .get(&path)
+                        .cloned()
+                        .unwrap_or_else(|| path.display().to_string());
+                    this.address
+                        .update(cx, |input, cx| input.set_value(value, cx));
+                }
                 this.editing_address = false;
                 cx.notify();
             }),
@@ -599,7 +648,6 @@ impl Explorer {
         let (watch_tx, watch_rx) = mpsc::channel();
         let (usage_tx, usage_rx) = mpsc::channel();
         let (drag_tx, drag_rx) = mpsc::channel();
-        let mut settings = Settings::load();
         if !settings.quick_access_system_migrated {
             // Earlier releases seeded these six paths. System Quick Access now
             // supplies them; retain only folders the user added after that seed.
@@ -629,6 +677,7 @@ impl Explorer {
             view,
             options: None,
             options_page: 0,
+            association_busy: false,
             options_scroll: ScrollHandle::new(),
             toolbar_overflow: vec![],
             nested_submenu: None,
@@ -668,9 +717,16 @@ impl Explorer {
             usage_rx,
             usage_tx,
             usage_running: false,
+            usage_revision: 0,
             usage_enabled: false,
             inline_rename: None,
             pending_select: None,
+            reveal_pending: launch.as_ref().is_some_and(|r| !r.select.is_empty()),
+            external_reveal: launch
+                .as_ref()
+                .map(|r| r.select.clone())
+                .unwrap_or_default(),
+            reveal_scroll: None,
             pending_rename: false,
             rename_token: 0,
             selected_at: Instant::now(),
@@ -710,6 +766,7 @@ impl Explorer {
                 history: History::new(initial),
                 query: String::new(),
                 global: false,
+                reveal_targets: launch.map(|r| r.select).unwrap_or_default(),
             }],
             active: 0,
             entries: Arc::new(vec![]),
@@ -743,6 +800,7 @@ impl Explorer {
             search,
             dialog_input,
             editing_address: false,
+            address_before_edit: String::new(),
             address_candidates: vec![],
             address_choice: None,
             address_generation: 0,
@@ -754,6 +812,7 @@ impl Explorer {
             shell_clipboard: None,
             shell_clipboard_seq: 0,
             list_scroll: ListState::new(0, ListAlignment::Top, px(160.)),
+            reload_scope: None,
             zoom: 1.,
             layout_width: 0.,
             layout_mode: None,
@@ -777,6 +836,7 @@ impl Explorer {
             let _ = weak.update(cx, |_, cx| cx.notify());
         });
         window.focus(&this.focus);
+        let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -784,6 +844,9 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
+                        if let Some(request) = launch_hwnd.and_then(rust_explorer::instance::take) {
+                            this.accept_launch(request, cx);
+                        }
                         // Windows performs live window moves on the UI thread.
                         // Pause background polls/icon notifications while the
                         // left button is held so they cannot force repaints
@@ -816,7 +879,7 @@ impl Explorer {
                         }
                         let mut usage_changed = false;
                         for (generation, path, usage) in this.usage_rx.try_iter() {
-                            if generation == this.generation {
+                            if generation == this.usage_revision {
                                 this.usage.insert(path, usage);
                                 usage_changed = true;
                             }
@@ -899,11 +962,64 @@ impl Explorer {
         self.list_scroll.reset(self.rows.len());
         self.list_scroll.scroll_to(offset);
     }
-    fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if path == PathBuf::from("shell:RecycleBinFolder") {
-            self.run_shell(shell::Request::Open { path }, cx);
+    fn accept_launch(
+        &mut self,
+        request: rust_explorer::launch_request::LaunchRequest,
+        cx: &mut Context<Self>,
+    ) {
+        // Preserve a rename or an open dialog instead of discarding user input.
+        if self.inline_rename.is_some() || self.dialog.is_some() || self.options.is_some() {
+            cx.defer(move |cx| {
+                if let Err(error) = open_explorer_request(None, Some(request), cx) {
+                    eprintln!("{error:#}");
+                }
+            });
             return;
         }
+        self.popup = None;
+        self.filters = Default::default();
+        self.collapsed_groups.clear();
+        if !self.loading && !self.selected.is_empty() {
+            self.tabs[self.active].reveal_targets = self
+                .selected
+                .iter()
+                .filter_map(|i| self.entries.get(*i).map(|e| e.path.clone()))
+                .collect();
+        }
+        let index = rust_explorer::launch_request::find_reveal_tab(
+            &request,
+            self.tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i, t.history.current(), t.reveal_targets.as_slice())),
+        );
+        let index = index.unwrap_or_else(|| {
+            self.tabs.push(Tab {
+                id: next_tab_id(),
+                history: History::new(request.folder),
+                query: String::new(),
+                global: false,
+                reveal_targets: Vec::new(),
+            });
+            self.tabs.len() - 1
+        });
+        if !request.select.is_empty() {
+            self.tabs[index].reveal_targets = request.select;
+        }
+        self.tabs[index].query.clear();
+        self.switch_tab(index, cx);
+        if let Some(handle) = self.own_window {
+            let focus = self.focus.clone();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| {
+                    window.activate_window();
+                    window.focus(&focus);
+                });
+            });
+        }
+        cx.notify();
+    }
+    fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.settings.remember_views {
             self.view = self.settings.folder_views.get(&path).copied().unwrap_or(
                 if volumes::is_computer(&path) {
@@ -912,6 +1028,9 @@ impl Explorer {
                     self.settings.view
                 },
             );
+        }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&path) {
+            self.view = ViewMode::Details;
         }
         if volumes::is_computer(&path) && !volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
@@ -936,16 +1055,35 @@ impl Explorer {
         self.reload(cx);
     }
     fn reload(&mut self, cx: &mut Context<Self>) {
+        let path = self.dir();
+        let scope = (
+            self.tabs[self.active].id,
+            path.clone(),
+            self.tabs[self.active].query.clone(),
+        );
+        let preserve_viewport = self.reload_scope.as_ref() == Some(&scope);
+        self.reload_scope = Some(scope);
+        if self.tabs[self.active]
+            .reveal_targets
+            .iter()
+            .any(|p| p.parent() != Some(path.as_path()))
+        {
+            self.tabs[self.active].reveal_targets.clear();
+            self.external_reveal.clear();
+            self.reveal_pending = false;
+        }
         self.ctrl_open_selection = None;
         self.usage_cancel.store(true, Ordering::Relaxed);
         self.usage_cancel = Arc::new(AtomicBool::new(false));
+        self.usage_revision = self.usage_revision.wrapping_add(1);
         self.usage.clear();
         self.usage_running = false;
         self.usage_enabled = false;
         self.inline_rename = None;
-        if self.settings.high_performance {
+        if !preserve_viewport {
             self.content_scroll.set_offset(point(px(0.), px(0.)));
             self.high_performance_row.set(0.);
+            self.home_scroll.set_offset(point(px(0.), px(0.)));
         }
         self.dialog = None;
         self.popup = None;
@@ -953,6 +1091,7 @@ impl Explorer {
         self.cancel.store(true, Ordering::Relaxed);
         self.cancel = Arc::new(AtomicBool::new(false));
         let cancel = self.cancel.clone();
+        let reveal = self.external_reveal.clone();
         self.generation += 1;
         let generation = self.generation;
         let path = self.dir();
@@ -977,9 +1116,11 @@ impl Explorer {
         self.selected.clear();
         self.focus_item = None;
         self.keyboard_cursor = None;
-        self.entries = Arc::new(vec![]);
+        if !preserve_viewport {
+            self.entries = Arc::new(vec![]);
+            self.list_scroll.reset(0);
+        }
         self.clear_preview();
-        self.list_scroll.reset(0);
         let query = self.tabs[self.active].query.clone();
         if navigation::is_app_virtual(&path) && query.trim().is_empty() {
             self.loading = false;
@@ -1068,10 +1209,10 @@ impl Explorer {
                     (result.entries, status)
                 };
                 if !hidden {
-                    entries.retain(|v| !v.hidden);
+                    entries.retain(|v| !v.hidden || reveal.contains(&v.path));
                 }
                 if !protected {
-                    entries.retain(|e| !e.system);
+                    entries.retain(|e| !e.system || reveal.contains(&e.path));
                 }
                 fs::sort(&mut entries, sort, descending);
                 if !folders_first {
@@ -1146,7 +1287,28 @@ impl Explorer {
                             }
                         }
                         this.entries = Arc::new(entries);
+                        this.usage = disk_usage::cached_sizes(
+                            this.entries
+                                .iter()
+                                .filter(|e| e.directory)
+                                .map(|e| e.path.as_path()),
+                        );
+                        this.usage_enabled = !this.usage.is_empty();
                         this.rebuild_rows();
+                        if this.reveal_pending {
+                            for target in &this.external_reveal {
+                                if let Some(index) =
+                                    this.entries.iter().position(|e| &e.path == target)
+                                {
+                                    this.selected.insert(index);
+                                    this.anchor = index;
+                                    this.keyboard_cursor = Some(target.clone());
+                                    this.focus_item = Some(target.clone());
+                                    this.reveal_scroll = Some(target.clone());
+                                }
+                            }
+                            this.reveal_pending = false;
+                        }
                         if let Some(path) = this.pending_select.take() {
                             if let Some(index) = this
                                 .entries
@@ -1248,6 +1410,10 @@ impl Explorer {
         else {
             return;
         };
+        if rust_explorer::shell_folder::is_recycle_bin_path(&entry.path) {
+            self.preview = Preview::Message("回收站项目\n双击查看系统属性".into());
+            return;
+        }
         if entry.directory {
             self.preview = Preview::Message("文件夹\n双击打开".into());
             return;
@@ -1392,6 +1558,7 @@ impl Explorer {
             history: History::new(path),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
@@ -1416,6 +1583,7 @@ impl Explorer {
             history: History::new(path.clone()),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         };
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
@@ -1443,6 +1611,14 @@ impl Explorer {
             self.settings.shift_open_tab,
             false,
         );
+        let disposition = if self.dir() == PathBuf::from("::QuickAccess")
+            && self.settings.quick_access_new_tab
+            && disposition == rust_explorer::open_target::OpenDisposition::Current
+        {
+            rust_explorer::open_target::OpenDisposition::Tab
+        } else {
+            disposition
+        };
         self.open_directory(path, disposition, cx);
     }
     fn open_entry_with(
@@ -1451,10 +1627,23 @@ impl Explorer {
         disposition: rust_explorer::open_target::OpenDisposition,
         cx: &mut Context<Self>,
     ) {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&entry.path) {
+            self.run_shell(shell::Request::Properties { path: entry.path }, cx);
+            return;
+        }
         if entry.directory && rust_explorer::shell_folder::is_shell_path(&entry.path) {
             self.shell_names
                 .insert(entry.path.clone(), entry.name.clone());
         }
+        let disposition = if entry.directory
+            && self.dir() == PathBuf::from("::QuickAccess")
+            && self.settings.quick_access_new_tab
+            && disposition == rust_explorer::open_target::OpenDisposition::Current
+        {
+            rust_explorer::open_target::OpenDisposition::Tab
+        } else {
+            disposition
+        };
         if entry.directory && !entry.link {
             self.open_directory(entry.path, disposition, cx);
         } else if entry.link
@@ -1538,7 +1727,8 @@ impl Explorer {
     fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
         let invalidates_usage = matches!(
             &request,
-            shell::Request::History { .. }
+            shell::Request::EmptyRecycleBin
+                | shell::Request::History { .. }
                 | shell::Request::RecordCreated { .. }
                 | shell::Request::Copy { .. }
                 | shell::Request::Transfer { .. }
@@ -1576,19 +1766,26 @@ impl Explorer {
             self.busy = true;
         }
         self.error = None;
-        let refresh = !matches!(
-            &request,
-            shell::Request::Open { .. }
-                | shell::Request::FontPreview { .. }
-                | shell::Request::SystemProperties
-                | shell::Request::Share { .. }
-                | shell::Request::Properties { .. }
-                | shell::Request::PropertiesMany { .. }
-                | shell::Request::SharingAccess { .. }
-                | shell::Request::AdvancedShare { .. }
-                | shell::Request::Menu { .. }
-                | shell::Request::ThemedMenu { .. }
-        );
+        let recycle_menu = match &request {
+            shell::Request::Menu { folder, .. } | shell::Request::ThemedMenu { folder, .. } => {
+                rust_explorer::shell_folder::is_recycle_bin_path(folder)
+            }
+            _ => false,
+        };
+        let refresh = recycle_menu
+            || !matches!(
+                &request,
+                shell::Request::Open { .. }
+                    | shell::Request::FontPreview { .. }
+                    | shell::Request::SystemProperties
+                    | shell::Request::Share { .. }
+                    | shell::Request::Properties { .. }
+                    | shell::Request::PropertiesMany { .. }
+                    | shell::Request::SharingAccess { .. }
+                    | shell::Request::AdvancedShare { .. }
+                    | shell::Request::Menu { .. }
+                    | shell::Request::ThemedMenu { .. }
+            );
         let moving_paths = match &request {
             shell::Request::Copy {
                 paths,
@@ -1597,6 +1794,12 @@ impl Explorer {
             } => Some(paths.clone()),
             _ => None,
         };
+        // A cancelled batch may already have deleted some items. Always list
+        // again once the native operation finishes, including partial failures.
+        let deletion = matches!(
+            &request,
+            shell::Request::Delete { .. } | shell::Request::PermanentDelete { .. }
+        );
         let menu_paths = if let shell::Request::Menu { paths, folder, .. }
         | shell::Request::ThemedMenu { paths, folder, .. } = &request
         {
@@ -1773,8 +1976,12 @@ impl Explorer {
                     cx.notify();
                     return;
                 }
+                let native_refresh = result.as_ref().is_ok_and(|value| value == "refresh");
                 if let Err(e) = result {
                     this.error = Some(e.to_string());
+                    if deletion {
+                        this.reload(cx);
+                    }
                     cx.notify();
                 } else {
                     if let Some(paths) = moving_paths {
@@ -1784,7 +1991,7 @@ impl Explorer {
                             shell::clear_clipboard();
                         }
                     }
-                    if refresh {
+                    if refresh || native_refresh {
                         this.reload(cx);
                     } else {
                         cx.notify();
@@ -1800,10 +2007,17 @@ impl Explorer {
         if self.busy {
             return;
         }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            self.system_menu(cx);
+            return;
+        }
         // The native MTP namespace menu is incomplete and can misbehave. Use
         // the app-owned item menu for portable-device items even when the
         // "full system menu" option is enabled.
-        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+        if navigation::is_shell_folder(&self.dir())
+            && !rust_explorer::shell_folder::is_recycle_bin_path(&self.dir())
+            && !self.selected.is_empty()
+        {
             self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
             self.submenu = None;
             cx.notify();
@@ -1842,7 +2056,10 @@ impl Explorer {
         cx.notify();
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
-        if navigation::is_shell_folder(&self.dir()) && !self.selected.is_empty() {
+        if navigation::is_shell_folder(&self.dir())
+            && !rust_explorer::shell_folder::is_recycle_bin_path(&self.dir())
+            && !self.selected.is_empty()
+        {
             self.popup = Some(("file-menu".into(), point(px(240.), px(200.))));
             self.submenu = None;
             cx.notify();
@@ -2000,6 +2217,38 @@ impl Explorer {
         {
             return;
         }
+        if matches!(dialog, Dialog::NewFolder) {
+            if self.busy {
+                return;
+            }
+            self.busy = true;
+            let parent = self.dir();
+            let original_parent = parent.clone();
+            let task = cx
+                .background_executor()
+                .spawn(async move { fs::create_numbered_folder(&parent) });
+            cx.spawn(async move |view, cx| {
+                let result = task.await;
+                let _ = view.update(cx, |this, cx| {
+                    this.busy = false;
+                    match result {
+                        Ok(path) => {
+                            if this.dir() == original_parent {
+                                this.pending_select = Some(path.clone());
+                            }
+                            this.run_shell(shell::Request::RecordCreated { path }, cx);
+                        }
+                        Err(error) => {
+                            this.error = Some(error.to_string());
+                            cx.notify();
+                        }
+                    }
+                });
+            })
+            .detach();
+            cx.notify();
+            return;
+        }
         let name = match &dialog {
             Dialog::RenameVolume { initial, .. } => initial.clone(),
             Dialog::Rename(path) => {
@@ -2059,8 +2308,13 @@ impl Explorer {
     }
     fn confirm_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.dialog_input.read(cx).value();
-        if matches!(self.dialog, Some(Dialog::RenameVolume { .. })) {
-            if let Err(error) = volume_label::validate(&name, "") {
+        if let Some(Dialog::RenameVolume { path, .. }) = &self.dialog {
+            let filesystem = if volume_label::is_network_drive(path) {
+                "NETWORK"
+            } else {
+                ""
+            };
+            if let Err(error) = volume_label::validate(&name, filesystem) {
                 self.error = Some(error.to_string());
                 cx.notify();
                 return;
@@ -2241,15 +2495,23 @@ impl Explorer {
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         self.tabs.push(Tab {
             id: next_tab_id(),
-            history: History::new(self.dir()),
+            history: History::new(if self.settings.new_tab_this_pc {
+                PathBuf::from("::ThisPC")
+            } else {
+                self.dir()
+            }),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
     fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let was_computer = volumes::is_computer(&self.dir());
         self.active = index;
+        self.external_reveal = self.tabs[index].reveal_targets.clone();
+        self.reveal_pending = !self.external_reveal.is_empty();
+        self.reveal_scroll = None;
         if self.settings.remember_views {
             self.view = self
                 .settings
@@ -2612,20 +2874,15 @@ impl Explorer {
     }
 
     fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_address {
+            self.address_before_edit = self.address.read(cx).value();
+        }
         self.editing_address = true;
         self.address_candidates.clear();
         self.address_choice = None;
         self.address_generation = self.address_generation.wrapping_add(1);
         self.address
             .update(cx, |v, cx| v.focus_select_all(window, cx));
-        self.address_candidates.clear();
-        cx.notify();
-    }
-    fn focus_address_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.editing_address = true;
-        self.address_choice = None;
-        self.address_generation = self.address_generation.wrapping_add(1);
-        self.address.update(cx, |v, cx| v.focus_end(window, cx));
         self.address_candidates.clear();
         cx.notify();
     }
@@ -2775,7 +3032,13 @@ impl Render for Explorer {
             };
             window.set_window_title(&title);
         } else {
-            window.set_window_title(concat!("Rust Explorer ", env!("CARGO_PKG_VERSION")));
+            let path = self.dir();
+            let title = self
+                .shell_names
+                .get(&path)
+                .cloned()
+                .unwrap_or_else(|| navigation::location_name(&path));
+            window.set_window_title(&title);
         }
         let list_height = (f32::from(window.viewport_size().height) / self.zoom - 177.).max(100.);
         if (available - self.layout_width).abs() > 0.5
@@ -2788,6 +3051,14 @@ impl Render for Explorer {
             self.layout_mode = Some((self.view, self.settings.compact));
             self.rebuild_rows();
             self.list_scroll.scroll_to(offset);
+        }
+        if let Some(path) = self.reveal_scroll.take() {
+            if let Some(index) = self.entries.iter().position(|e| e.path == path) {
+                if let Some(row) = self.rows.iter().position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index)) || matches!(r,DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i==index)))) {
+                    self.set_high_performance_row(row as f32);
+                    self.list_scroll.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+                }
+            }
         }
         self.sync_thumbnails();
         let recycle = self.settings.high_performance
@@ -2817,15 +3088,39 @@ impl Render for Explorer {
             self.invalidate_list();
         }
         self.toolbar_overflow = rust_explorer::settings::toolbar_overflow(
-            logical_width,
+            logical_width
+                - if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+                    128.
+                } else {
+                    0.
+                },
             self.view == ViewMode::Details && !navigation::is_virtual(&self.dir()),
         );
         let t = self.theme;
         let mut root = div()
             .id("explorer")
-            .capture_any_mouse_down(cx.listener(|v, _: &MouseDownEvent, _, cx| {
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, w, cx| {
                 if v.system_menu_active {
                     cx.stop_propagation();
+                    return;
+                }
+                if v.editing_address {
+                    let address = v.address_bounds.get();
+                    let candidates = Bounds::new(
+                        point(address.left(), address.bottom()),
+                        size(
+                            address.size.width,
+                            ui(v.address_candidates.len().min(9) as f32 * 26.)
+                                .to_pixels(w.rem_size()),
+                        ),
+                    );
+                    if !address.contains(&e.position)
+                        && (v.address_candidates.is_empty() || !candidates.contains(&e.position))
+                    {
+                        // Blank content/tool areas do not always claim focus themselves.
+                        // Explicitly blur the editor so clearing without typing restores now.
+                        w.focus(&v.focus);
+                    }
                 }
             }))
             .key_context("Explorer")
@@ -3141,6 +3436,7 @@ impl Render for Explorer {
                         history: History::new(v.dir()),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     }),
                     cx,
                 );
@@ -3241,96 +3537,107 @@ impl Render for Explorer {
                     );
                 }
             }))
-            .on_mouse_move(cx.listener(|v, event: &MouseMoveEvent, w, cx| {
-                if event.pressed_button == Some(MouseButton::Left) && v.marquee.is_some() {
-                    v.update_marquee(event.position, cx);
-                }
-                if event.pressed_button == Some(MouseButton::Right) {
-                    let right = v
-                        .right_file_drag
-                        .as_ref()
-                        .map(|r| (r.index, r.paths.clone(), r.start, r.active));
-                    if let Some((index, paths, start, active)) = right {
-                        if active || (event.position - start).magnitude() > 4. {
-                            if !active {
-                                if !v.selected.contains(&index) {
-                                    v.select(index, false, false, w, cx);
+            .on_mouse_move({
+                let listener = cx.listener(|v, event: &MouseMoveEvent, w, cx| {
+                    if event.pressed_button == Some(MouseButton::Left) && v.marquee.is_some() {
+                        v.update_marquee(event.position, cx);
+                    }
+                    if event.pressed_button == Some(MouseButton::Right) {
+                        let right = v
+                            .right_file_drag
+                            .as_ref()
+                            .map(|r| (r.index, r.paths.clone(), r.start, r.active));
+                        if let Some((index, paths, start, active)) = right {
+                            if active || (event.position - start).magnitude() > 4. {
+                                if !active {
+                                    if !v.selected.contains(&index) {
+                                        v.select(index, false, false, w, cx);
+                                    }
+                                    if let Some(right) = &mut v.right_file_drag {
+                                        right.active = true;
+                                    }
                                 }
-                                if let Some(right) = &mut v.right_file_drag {
-                                    right.active = true;
-                                }
+                                v.update_file_drag(paths, event.position, event.modifiers, cx);
                             }
-                            v.update_file_drag(paths, event.position, event.modifiers, cx);
                         }
                     }
-                }
-                if let Some((start, width)) = v.preview_resize {
-                    if event.dragging() {
-                        v.settings.preview_width = (width
-                            - (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(180., 900.);
+                    if let Some((start, width)) = v.preview_resize {
+                        if event.dragging() {
+                            v.settings.preview_width = (width
+                                - (f32::from(event.position.x) - start) / v.zoom)
+                                .clamp(180., 900.);
+                            cx.notify();
+                        }
+                    }
+                    if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
+                        let mut p = handle.offset();
+                        p.y = px((*offset - (f32::from(event.position.y) - *start) * *ratio)
+                            .clamp(-f32::from(handle.max_offset().height), 0.));
+                        handle.set_offset(p);
                         cx.notify();
                     }
-                }
-                if let Some((handle, start, offset, ratio)) = &v.aux_scroll_drag {
-                    let mut p = handle.offset();
-                    p.y = px((*offset - (f32::from(event.position.y) - *start) * *ratio)
-                        .clamp(-f32::from(handle.max_offset().height), 0.));
-                    handle.set_offset(p);
-                    cx.notify();
-                }
-                if let Some((handle, start, offset, ratio)) = &v.aux_horizontal_drag {
-                    let mut p = handle.offset();
-                    p.x = px((*offset - (f32::from(event.position.x) - *start) * *ratio)
-                        .clamp(-f32::from(handle.max_offset().width), 0.));
-                    handle.set_offset(p);
-                    cx.notify();
-                }
-                if let Some((horizontal, start, offset, ratio)) = v.scroll_drag {
-                    let delta = if horizontal {
-                        f32::from(event.position.x)
-                    } else {
-                        f32::from(event.position.y)
-                    } - start;
-                    if horizontal {
-                        let mut point = v.content_scroll.offset();
-                        point.x = px(offset - delta * ratio);
-                        v.content_scroll.set_offset(point);
-                    } else if v.high_performance_active() {
-                        v.set_high_performance_row(offset + delta * ratio);
-                    } else {
-                        v.set_list_scroll_row(offset + delta * ratio);
-                    }
-                    cx.notify();
-                }
-                if let Some((start, width)) = v.sidebar_resize {
-                    if event.dragging() {
-                        v.settings.sidebar_width = (width
-                            + (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(140., 600.);
+                    if let Some((handle, start, offset, ratio)) = &v.aux_horizontal_drag {
+                        let mut p = handle.offset();
+                        p.x = px((*offset - (f32::from(event.position.x) - *start) * *ratio)
+                            .clamp(-f32::from(handle.max_offset().width), 0.));
+                        handle.set_offset(p);
                         cx.notify();
                     }
-                }
-                if let Some((index, start, width)) = v.volume_columns_resize {
-                    if event.dragging() {
-                        if let Some((_, column_width)) = v.settings.volume_columns.get_mut(index) {
-                            *column_width = (width
+                    if let Some((horizontal, start, offset, ratio)) = v.scroll_drag {
+                        let delta = if horizontal {
+                            f32::from(event.position.x)
+                        } else {
+                            f32::from(event.position.y)
+                        } - start;
+                        if horizontal {
+                            let mut point = v.content_scroll.offset();
+                            point.x = px(offset - delta * ratio);
+                            v.content_scroll.set_offset(point);
+                        } else if v.high_performance_active() {
+                            v.set_high_performance_row(offset + delta * ratio);
+                        } else {
+                            v.set_list_scroll_row(offset + delta * ratio);
+                        }
+                        cx.notify();
+                    }
+                    if let Some((start, width)) = v.sidebar_resize {
+                        if event.dragging() {
+                            v.settings.sidebar_width = (width
+                                + (f32::from(event.position.x) - start) / v.zoom)
+                                .clamp(140., 600.);
+                            cx.notify();
+                        }
+                    }
+                    if let Some((index, start, width)) = v.volume_columns_resize {
+                        if event.dragging() {
+                            if let Some((_, column_width)) =
+                                v.settings.volume_columns.get_mut(index)
+                            {
+                                *column_width = (width
+                                    + (f32::from(event.position.x) - start) / v.zoom)
+                                    .clamp(64., 1200.);
+                            }
+                            cx.notify();
+                        }
+                    }
+                    if let Some((index, start, width)) = v.columns_resize {
+                        if event.dragging() {
+                            v.settings.columns[index].1 = (width
                                 + (f32::from(event.position.x) - start) / v.zoom)
                                 .clamp(64., 1200.);
+                            v.invalidate_list();
+                            cx.notify();
                         }
-                        cx.notify();
+                    }
+                });
+                // Passive movement needs only GPUI's hover hit testing. Avoid
+                // updating the entire Explorer entity for every raw mouse event.
+                move |event: &MouseMoveEvent, window, cx: &mut App| {
+                    if event.pressed_button.is_some() {
+                        listener(event, window, cx);
                     }
                 }
-                if let Some((index, start, width)) = v.columns_resize {
-                    if event.dragging() {
-                        v.settings.columns[index].1 = (width
-                            + (f32::from(event.position.x) - start) / v.zoom)
-                            .clamp(64., 1200.);
-                        v.invalidate_list();
-                        cx.notify();
-                    }
-                }
-            }))
+            })
             .capture_any_mouse_up(cx.listener(|v, e: &MouseUpEvent, w, cx| {
                 if e.button == MouseButton::Left {
                     if let Some(drag) = v.marquee.take() {
@@ -3448,11 +3755,11 @@ impl Render for Explorer {
                 _ => v.reload(cx),
             });
             nav = nav.child(if id == "refresh" {
-                // 80% of the original 32 px square, including the glyph.
+                // Match the other navigation buttons while retaining a centered glyph.
                 div()
                     .id(id)
                     .w(ui(30.))
-                    .h(ui(25.6))
+                    .h(ui(32.))
                     .flex_shrink_0()
                     .flex()
                     .items_center()
@@ -3460,7 +3767,7 @@ impl Render for Explorer {
                     .rounded(ui(4.))
                     .cursor_pointer()
                     .hover(move |s| s.bg(rgb(t.hover)))
-                    .child(visual::icon_sized("refresh", t.text, 12.8))
+                    .child(visual::icon_sized("refresh", t.text, 16.))
                     .on_click(click)
             } else {
                 button(id, label, t).on_click(click)
@@ -3473,7 +3780,49 @@ impl Render for Explorer {
                 .relative()
                 .flex_1()
                 .relative()
-                .child(self.address.clone())
+                .flex()
+                .items_center()
+                .h(ui(32.))
+                .rounded(ui(4.))
+                .bg(rgb(t.panel))
+                .text_color(rgb(t.text))
+                .child(div().flex_1().min_w_0().child(self.address.clone()))
+                .child(
+                    div()
+                        .id("clear-address")
+                        .w(ui(28.))
+                        .h(ui(28.))
+                        .flex_shrink_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_pointer()
+                        .child(visual::icon_sized("close", t.text, 12.))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|v, _, w, cx| {
+                                cx.stop_propagation();
+                                v.address_candidates.clear();
+                                v.address_choice = None;
+                                v.address_generation = v.address_generation.wrapping_add(1);
+                                let value = v.address.read(cx).value();
+                                if value == v.address_before_edit || value.is_empty() {
+                                    v.address.update(cx, |input, cx| {
+                                        input.set_value(v.address_before_edit.clone(), cx)
+                                    });
+                                    v.editing_address = false;
+                                    w.focus(&v.focus);
+                                    cx.notify();
+                                    return;
+                                }
+                                v.address.update(cx, |input, cx| {
+                                    input.set_value(String::new(), cx);
+                                    input.focus_end(w, cx);
+                                });
+                                cx.notify();
+                            }),
+                        ),
+                )
                 .child(
                     canvas(move |rect, _, _| bounds.set(rect), |_, _, _, _| {})
                         .absolute()
@@ -3629,6 +3978,19 @@ impl Render for Explorer {
                     ),
             );
         }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            toolbar = toolbar.child(
+                button("empty-recycle-bin", "清空回收站", t)
+                    .w(ui(120.))
+                    .flex_shrink_0()
+                    .when(self.busy, |d| d.opacity(0.4).cursor_default())
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        if !v.busy {
+                            v.run_shell(shell::Request::EmptyRecycleBin, cx);
+                        }
+                    })),
+            );
+        }
         toolbar = toolbar
             .child(
                 button(
@@ -3726,7 +4088,10 @@ impl Render for Explorer {
                 );
         } else {
             let table_width = if self.view == ViewMode::Details {
-                self.settings.columns.iter().map(|(_, w)| *w).sum::<f32>()
+                self.column_widths(available)
+                    .iter()
+                    .map(|(_, w)| *w)
+                    .sum::<f32>()
             } else if self.view == ViewMode::List {
                 self.layout_width.max(
                     self.rows
@@ -4118,46 +4483,64 @@ impl Render for Explorer {
                         )
                         .into_any_element(),
                 };
-            let element = if self.settings.details_pane {
-                let selected: Vec<_> = self
-                    .selected
-                    .iter()
-                    .filter_map(|i| self.entries.get(*i))
-                    .collect();
-                let mut data = div()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .text_color(rgb(t.muted));
-                if selected.len() == 1 {
-                    let entry = selected[0];
-                    data = data
-                        .child(format!("类型：{}", entry.kind))
-                        .child(format!("大小：{}", self.entry_size_text(entry)))
-                        .child(format!("修改日期：{}", entry.date()))
-                        .child(format!("创建日期：{}", extras::format_date(entry.created)))
-                        .child(
-                            div()
-                                .whitespace_normal()
-                                .child(entry.path.display().to_string()),
-                        );
+            let element =
+                if self.settings.details_pane || matches!(self.preview, Preview::Message(_)) {
+                    let selected: Vec<_> = self
+                        .selected
+                        .iter()
+                        .filter_map(|i| self.entries.get(*i))
+                        .collect();
+                    let mut data = div()
+                        .id("selected-entry-details")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .text_color(rgb(t.muted));
+                    if selected.len() == 1 {
+                        let entry = selected[0];
+                        data = data
+                            .child(visual::entry_icon(
+                                &entry.path,
+                                entry.directory,
+                                entry.link,
+                                t.text,
+                                96.,
+                            ))
+                            .child(
+                                div()
+                                    .text_color(rgb(t.text))
+                                    .whitespace_normal()
+                                    .child(entry.name.clone()),
+                            )
+                            .child(format!("类型：{}", entry.kind))
+                            .child(format!("大小：{}", self.entry_size_text(entry)))
+                            .child(format!("修改日期：{}", entry.date()))
+                            .child(format!("创建日期：{}", extras::format_date(entry.created)))
+                            .child(
+                                div()
+                                    .whitespace_normal()
+                                    .child(entry.path.display().to_string()),
+                            );
+                    } else {
+                        data = data
+                            .child(format!("已选择 {} 个项目", selected.len()))
+                            .child(format!(
+                                "文件：{} 个",
+                                selected.iter().filter(|e| !e.directory).count()
+                            ))
+                            .child(format!(
+                                "文件夹：{} 个",
+                                selected.iter().filter(|e| e.directory).count()
+                            ));
+                    }
+                    data.into_any_element()
                 } else {
-                    data = data
-                        .child(format!("已选择 {} 个项目", selected.len()))
-                        .child(format!(
-                            "文件：{} 个",
-                            selected.iter().filter(|e| !e.directory).count()
-                        ))
-                        .child(format!(
-                            "文件夹：{} 个",
-                            selected.iter().filter(|e| e.directory).count()
-                        ));
-                }
-                data.into_any_element()
-            } else {
-                element
-            };
+                    element
+                };
             pane = pane.child(element);
             body = body.child(pane);
         }
@@ -4169,11 +4552,37 @@ impl Render for Explorer {
         } else {
             format!(
                 "{}{}",
-                self.status,
+                if self.selected.is_empty() {
+                    self.status.clone()
+                } else {
+                    format!("{} 个项目", self.entries.len())
+                },
                 if self.selected.is_empty() {
                     String::new()
                 } else {
-                    format!(" · 已选择 {} 项", self.selected.len())
+                    let bytes = self
+                        .selected
+                        .iter()
+                        .filter_map(|i| self.entries.get(*i))
+                        .fold(0u64, |sum, entry| {
+                            sum.saturating_add(if !entry.directory {
+                                entry.size
+                            } else if self.usage_enabled {
+                                self.usage.get(&entry.path).map_or(0, |u| u.bytes)
+                            } else {
+                                0
+                            })
+                        });
+                    format!(
+                        " | 已选择 {} 项 | {} {}",
+                        self.selected.len(),
+                        if self.usage_enabled {
+                            "统计大小"
+                        } else {
+                            "文件大小"
+                        },
+                        fs::size_label(bytes)
+                    )
                 }
             )
         };
@@ -4494,11 +4903,11 @@ impl Render for Explorer {
     }
 }
 
-pub fn run() {
+pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
     rust_explorer::fluent_icons::initialize();
     Application::new()
         .with_assets(rust_explorer::fluent_icons::Assets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             input::init(cx);
             cx.bind_keys([
                 KeyBinding::new("alt-left", Back, Some("Explorer")),
@@ -4639,7 +5048,7 @@ pub fn run() {
                     Some("Explorer"),
                 )]);
             }
-            open_explorer(None, cx).expect("无法创建窗口");
+            open_explorer_request(None, launch, cx).expect("无法创建窗口");
             cx.activate(true);
         });
 }

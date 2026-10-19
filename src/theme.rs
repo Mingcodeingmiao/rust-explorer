@@ -14,7 +14,7 @@ pub struct Theme {
 }
 impl Theme {
     pub fn active_tab(self) -> u32 {
-        if self.dark { self.input } else { 0xdeebf7 }
+        self.input
     }
     pub fn preference(preference: &str) -> Self {
         match preference {
@@ -50,7 +50,7 @@ impl Theme {
             Self {
                 dark,
                 background: 0xffffff,
-                chrome: 0xf3f3f3,
+                chrome: 0xe9e9e9,
                 panel: 0xf8f8f8,
                 input: 0xffffff,
                 border: 0xe5e5e5,

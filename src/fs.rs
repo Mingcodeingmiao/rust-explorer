@@ -12,7 +12,14 @@ use std::{
 };
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RecycleInfo {
+    pub original_location: String,
+    pub deleted: Option<SystemTime>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Entry {
+    #[serde(default)]
+    pub recycle: Option<RecycleInfo>,
     pub path: PathBuf,
     pub name: String,
     pub directory: bool,
@@ -62,6 +69,7 @@ impl Entry {
                 .unwrap_or("文件".into())
         };
         Ok(Self {
+            recycle: None,
             path,
             name,
             directory,
@@ -315,4 +323,44 @@ mod tests {
         assert!(!h.forward());
         assert_eq!(h.current(), Path::new("C:\\c"));
     }
+    #[test]
+    fn numbered_folder_skips_existing_files_and_reuses_gaps() {
+        let parent = std::env::temp_dir().join(format!(
+            "re-numbered-folder-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::write(parent.join("新建文件夹 1"), b"owned fixture").unwrap();
+        assert_eq!(
+            create_numbered_folder(&parent).unwrap(),
+            parent.join("新建文件夹 2")
+        );
+        assert_eq!(
+            create_numbered_folder(&parent).unwrap(),
+            parent.join("新建文件夹 3")
+        );
+        std::fs::remove_dir(parent.join("新建文件夹 2")).unwrap();
+        assert_eq!(
+            create_numbered_folder(&parent).unwrap(),
+            parent.join("新建文件夹 2")
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+}
+
+/// Atomically reserve the first available numbered folder, including gaps.
+pub fn create_numbered_folder(parent: &Path) -> std::io::Result<PathBuf> {
+    for number in 1..=u32::MAX {
+        let path = parent.join(format!("新建文件夹 {number}"));
+        match std::fs::create_dir(&path) {
+            Ok(()) => return Ok(path),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::other("没有可用的新建文件夹名称"))
 }

@@ -2,8 +2,8 @@
 101 ICON "resources/app-icon/rust-explorer.ico"
 
 1 VERSIONINFO
- FILEVERSION 0,7,2,0
- PRODUCTVERSION 0,7,2,0
+ FILEVERSION 0,7,3,0
+ PRODUCTVERSION 0,7,3,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -16,11 +16,11 @@ BEGIN
   BEGIN
    VALUE "CompanyName", "Rust Explorer"
    VALUE "FileDescription", "Rust Explorer Native File Manager"
-   VALUE "FileVersion", "0.7.2.0"
+   VALUE "FileVersion", "0.7.3.0"
    VALUE "InternalName", "rust-explorer"
    VALUE "OriginalFilename", "rust-explorer.exe"
    VALUE "ProductName", "Rust Explorer"
-   VALUE "ProductVersion", "0.7.2"
+   VALUE "ProductVersion", "0.7.3"
   END
  END
  BLOCK "VarFileInfo"

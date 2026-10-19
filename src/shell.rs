@@ -72,6 +72,7 @@ pub enum TransferMode {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Request {
+    EmptyRecycleBin,
     History {
         transaction: crate::file_history::Transaction,
     },
@@ -301,6 +302,48 @@ pub fn execute_output(request: Request) -> Result<String> {
 mod protocol_tests {
     use super::*;
     #[test]
+    #[ignore = "Requires an interactive Windows Shell; deletes only its own empty temporary fixture"]
+    fn native_delete_survives_unsupported_progress_caption() {
+        let parent = std::env::temp_dir().join(format!(
+            "re-native-delete-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let recycled = parent.join("recycle-fixture");
+        let permanent = parent.join("permanent-fixture");
+        std::fs::create_dir(&recycled).unwrap();
+        std::fs::create_dir(&permanent).unwrap();
+        dispatch(Request::Delete {
+            paths: vec![recycled.clone()],
+        })
+        .unwrap();
+        assert!(!recycled.exists());
+        dispatch(Request::PermanentDelete {
+            paths: vec![permanent.clone()],
+        })
+        .unwrap();
+        assert!(!permanent.exists());
+        std::fs::remove_dir(&parent).unwrap();
+    }
+    #[test]
+    fn start_pin_restrictions_are_reported_without_requesting_elevation() {
+        assert!(is_start_pin_verb("pintostartscreen"));
+        assert!(is_start_pin_verb("startunpin"));
+        assert!(!is_start_pin_verb("pintohome"));
+        assert!(!is_start_pin_verb("runas"));
+        let message = start_pin_failure(windows::core::Error::from_hresult(
+            windows::core::HRESULT(0x80070005u32 as i32),
+        ))
+        .to_string();
+        assert!(message.contains("0x80070005"));
+        assert!(message.contains("Windows 资源管理器"));
+        assert!(message.contains("未修改权限"));
+    }
+    #[test]
     fn stdin_accepts_requests_larger_than_windows_command_lines() {
         let request = Request::Copy {
             paths: (0..1000)
@@ -332,6 +375,10 @@ mod protocol_tests {
 pub fn dispatch(request: Request) -> Result<()> {
     let _com = Com::new()?;
     match request {
+        Request::EmptyRecycleBin => unsafe {
+            // Keep Windows confirmation, progress and errors enabled.
+            SHEmptyRecycleBinW(None, PCWSTR::null(), 0).map_err(Into::into)
+        },
         Request::History { transaction } => crate::file_history::apply(transaction),
         Request::RecordCreated { path } => crate::file_history::record_created(&path),
         Request::QuickAccessPin { path, pinned } => crate::quick_access::set_pinned(&path, pinned),
@@ -342,7 +389,9 @@ pub fn dispatch(request: Request) -> Result<()> {
             );
             Ok(())
         }
-        Request::RenameVolume { path, label } => crate::volume_label::rename(&path, &label),
+        Request::RenameVolume { path, label } => {
+            crate::volume_label::rename_with_elevation(&path, &label)
+        }
         Request::FontPreview { path } => crate::open_target::launch_font_preview(&path),
         Request::SystemProperties => {
             let system = std::env::var_os("WINDIR")
@@ -633,9 +682,10 @@ pub fn dispatch(request: Request) -> Result<()> {
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
             // Deliberately omit ALLOWUNDO, ADDUNDORECORD and RECYCLEONDELETE.
             // Never retry this operation through Request::Delete on failure.
-            op.SetOperationFlags(FILEOPERATION_FLAGS(
-                FOF_NOCONFIRMATION.0 | FOF_SILENT.0 | FOF_NOERRORUI.0,
-            ))?;
+            op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0))?;
+            // Some installed Shell implementations return E_NOTIMPL for this
+            // optional caption setter. It must not cancel a queued deletion.
+            let _ = op.SetProgressMessage(w!("正在永久删除项目"));
             for path in paths {
                 if !crate::shell_folder::is_shell_path(&path) {
                     anyhow::ensure!(
@@ -674,6 +724,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                 )
             };
             op.SetOperationFlags(flags)?;
+            let _ = op.SetProgressMessage(w!("正在删除项目"));
             for path in paths {
                 let item = item(&path)?;
                 op.DeleteItem(&item, None)?;
@@ -765,7 +816,11 @@ pub fn open(path: &Path) -> Result<()> {
 }
 pub fn properties(path: &Path) -> Result<()> {
     if crate::shell_folder::is_shell_path(path) {
-        return crate::shell_folder::properties(path);
+        crate::shell_folder::properties(path)?;
+        unsafe {
+            pump_property_windows();
+        }
+        return Ok(());
     }
     unsafe {
         let path = wide(path);
@@ -1066,6 +1121,16 @@ unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) 
     unsafe { DefWindowProcW(hwnd, msg, w, l) }
 }
 struct Pidl(*mut Common::ITEMIDLIST);
+fn menu_pidl(path: &Path) -> Result<Pidl> {
+    let pointer = if crate::shell_folder::is_shell_path(path) {
+        let bytes = crate::shell_folder::pidl(path)?;
+        unsafe { ILClone(bytes.as_ptr().cast()) }
+    } else {
+        unsafe { ILCreateFromPathW(PCWSTR(wide(path).as_ptr())) }
+    };
+    anyhow::ensure!(!pointer.is_null(), "无法读取 Shell 菜单项目");
+    Ok(Pidl(pointer))
+}
 impl Drop for Pidl {
     fn drop(&mut self) {
         unsafe {
@@ -1341,6 +1406,45 @@ fn canonical_verb(menu: &IContextMenu, command: u32) -> String {
     )
     .to_ascii_lowercase()
 }
+fn is_start_pin_verb(verb: &str) -> bool {
+    matches!(
+        verb,
+        "pintostartscreen" | "unpinfromstartscreen" | "startpin" | "startunpin"
+    )
+}
+
+fn start_pin_failure(error: windows::core::Error) -> anyhow::Error {
+    if error.code() == windows::core::HRESULT(0x80070005u32 as i32) {
+        anyhow::anyhow!(
+            "Windows 拒绝执行“固定到开始/从开始取消固定”（0x80070005）。这不一定是文件访问权限不足，也可能受到开始菜单策略或系统 Shell 限制。请在 Windows 资源管理器中对该项目执行此操作。未修改权限或尝试管理员重试。系统信息：{error}"
+        )
+    } else {
+        anyhow::Error::new(error).context("Windows 无法执行开始菜单固定操作")
+    }
+}
+
+/// Let ShellExecute bind the item's own IContextMenu handler. NOASYNC is
+/// intentional: this isolated menu host can exit once the invocation finishes.
+/// ASYNCOK would require a longer-lived thread reference/message loop.
+fn invoke_start_pin(path: &Path, verb: &str, owner: HWND) -> Result<()> {
+    anyhow::ensure!(is_start_pin_verb(verb), "Invalid Start pin verb");
+    let file = wide(path);
+    let verb = wide(verb);
+    let mut info = SHELLEXECUTEINFOW {
+        cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        hwnd: owner,
+        lpFile: PCWSTR(file.as_ptr()),
+        lpVerb: PCWSTR(verb.as_ptr()),
+        nShow: SW_SHOWNORMAL.0,
+        ..Default::default()
+    };
+    unsafe { ShellExecuteExW(&mut info) }.map_err(start_pin_failure)?;
+    unsafe {
+        pump_property_windows();
+    }
+    Ok(())
+}
 #[allow(clippy::too_many_arguments)]
 fn context_menu_options(
     paths: &[PathBuf],
@@ -1396,7 +1500,7 @@ fn context_menu_options(
             let children = [ILFindLastID(pidl.0) as *const Common::ITEMIDLIST];
             parent.GetUIObjectOf(hwnd, &children, None)?
         } else if paths.is_empty() {
-            let pidl = Pidl(ILCreateFromPathW(PCWSTR(wide(folder).as_ptr())));
+            let pidl = menu_pidl(folder)?;
             if pidl.0.is_null() {
                 bail!("无法读取文件夹菜单");
             }
@@ -1406,7 +1510,7 @@ fn context_menu_options(
         } else {
             let mut items = Vec::new();
             for path in paths {
-                let pidl = Pidl(ILCreateFromPathW(PCWSTR(wide(path).as_ptr())));
+                let pidl = menu_pidl(path)?;
                 if pidl.0.is_null() {
                     bail!("无法读取文件菜单");
                 }
@@ -1583,16 +1687,29 @@ fn context_menu_options(
                 crate::shell::copy_to_clipboard(paths, verb == "cut")?;
                 return Ok(());
             }
+            if is_start_pin_verb(&verb) && paths.len() == 1 {
+                return invoke_start_pin(&paths[0], &verb, hwnd);
+            }
             let mut info = CMINVOKECOMMANDINFOEX {
                 cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                fMask: SEE_MASK_UNICODE,
+                fMask: SEE_MASK_UNICODE | SEE_MASK_NOASYNC,
                 hwnd,
                 lpVerb: PCSTR((command as usize - 1) as *const u8),
                 lpVerbW: PCWSTR((command as usize - 1) as *const u16),
                 nShow: SW_SHOWNORMAL.0,
                 ..Default::default()
             };
-            menu.InvokeCommand(&mut info as *mut _ as *const CMINVOKECOMMANDINFO)?;
+            let invoked = menu.InvokeCommand(&mut info as *mut _ as *const CMINVOKECOMMANDINFO);
+            if is_start_pin_verb(&verb) {
+                invoked.map_err(start_pin_failure)?;
+            } else {
+                invoked?;
+            }
+            if verb == "delete" {
+                // The helper waits for the native operation before the UI
+                // requests its next directory snapshot.
+                println!("refresh");
+            }
             if let Ok(owner) = GetClipboardOwner() {
                 let mut pid = 0;
                 GetWindowThreadProcessId(owner, Some(&mut pid));

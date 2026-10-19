@@ -11,6 +11,7 @@ function Invoke-CargoChecked {
 Push-Location $projectRoot
 try {
     Invoke-CargoChecked @('fmt', '--all', '--', '--check')
-    Invoke-CargoChecked @('test', '--locked', '--lib', '--no-default-features')
+    # Win32 IPC tests share OS message timing; serialize them for reproducible checks.
+    Invoke-CargoChecked @('test', '--locked', '--lib', '--no-default-features', '--', '--test-threads=1')
     Invoke-CargoChecked @('check', '--locked', '--all-targets')
 } finally { Pop-Location }

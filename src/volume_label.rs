@@ -27,6 +27,9 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
 fn string(value: &[u16]) -> String {
     String::from_utf16_lossy(&value[..value.iter().position(|c| *c == 0).unwrap_or(value.len())])
 }
+pub fn is_network_drive(path: &Path) -> bool {
+    is_drive_root(path) && unsafe { GetDriveTypeW(PCWSTR(wide(path).as_ptr())) == 4 }
+}
 pub fn read(path: &Path) -> Result<VolumeLabel> {
     ensure!(is_drive_root(path), "请选择驱动器根目录");
     let path = wide(path);
@@ -38,10 +41,18 @@ pub fn read(path: &Path) -> Result<VolumeLabel> {
             windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
             None,
         );
-        ensure!(
-            GetDriveTypeW(PCWSTR(path.as_ptr())) != 4,
-            "网络驱动器请使用系统的重命名功能"
-        );
+        if GetDriveTypeW(PCWSTR(path.as_ptr())) == 4 {
+            use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::*};
+            let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)?;
+            let raw = item.GetDisplayName(SIGDN_PARENTRELATIVEEDITING)?;
+            let label = raw.to_string();
+            CoTaskMemFree(Some(raw.0.cast()));
+            return Ok(VolumeLabel {
+                label: label?,
+                filesystem: "NETWORK".into(),
+                read_only: false,
+            });
+        }
         GetVolumeInformationW(
             PCWSTR(path.as_ptr()),
             Some(&mut label),
@@ -59,6 +70,9 @@ pub fn read(path: &Path) -> Result<VolumeLabel> {
 }
 
 pub fn validate(label: &str, filesystem: &str) -> Result<()> {
+    if filesystem == "NETWORK" {
+        return crate::fs::valid_name(label);
+    }
     let fat = matches!(filesystem.to_ascii_uppercase().as_str(), "FAT" | "FAT32");
     ensure!(
         label.encode_utf16().count() <= if fat { 11 } else { 32 },
@@ -85,10 +99,96 @@ pub fn rename(path: &Path, label: &str) -> Result<()> {
     if current.label == label {
         return Ok(());
     }
+    if current.filesystem == "NETWORK" {
+        use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::*};
+        unsafe {
+            let mut pidl = std::ptr::null_mut();
+            SHParseDisplayName(PCWSTR(wide(path).as_ptr()), None, &mut pidl, 0, None)?;
+            let result = (|| -> Result<()> {
+                let parent: IShellFolder = SHBindToParent(pidl, None)?;
+                parent.SetNameOf(
+                    None,
+                    ILFindLastID(pidl),
+                    PCWSTR(wide(label).as_ptr()),
+                    SHGDN_NORMAL,
+                    None,
+                )?;
+                SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_IDLIST, Some(pidl.cast()), None);
+                Ok(())
+            })();
+            CoTaskMemFree(Some(pidl.cast()));
+            return result;
+        }
+    }
     unsafe {
         SetVolumeLabelW(PCWSTR(wide(path).as_ptr()), PCWSTR(wide(label).as_ptr()))?;
     }
     Ok(())
+}
+
+/// Retry only a volume-label access failure with a narrowly scoped UAC helper.
+/// The normal UI and mapped-drive rename remain in the user's session.
+pub fn rename_with_elevation(path: &Path, label: &str) -> Result<()> {
+    match rename(path, label) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if error
+                .downcast_ref::<windows::core::Error>()
+                .is_some_and(|e| e.code() == windows::core::HRESULT(0x80070005u32 as i32))
+                && read(path)?.filesystem != "NETWORK" =>
+        {
+            use windows::Win32::{
+                Foundation::*,
+                System::Threading::*,
+                UI::{Shell::*, WindowsAndMessaging::SW_SHOWNORMAL},
+            };
+            let payload = serde_json::to_string(&(path, label))?;
+            // Encode the JSON as hex so no path/name can inject a command-line option.
+            let encoded: String = payload
+                .as_bytes()
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect();
+            let executable = wide(std::env::current_exe()?);
+            let arguments = wide(format!("--rename-volume-admin {encoded}"));
+            let mut info = SHELLEXECUTEINFOW {
+                cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+                fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+                lpVerb: windows::core::w!("runas"),
+                lpFile: PCWSTR(executable.as_ptr()),
+                lpParameters: PCWSTR(arguments.as_ptr()),
+                nShow: SW_SHOWNORMAL.0,
+                ..Default::default()
+            };
+            unsafe {
+                ShellExecuteExW(&mut info)?;
+                let wait = WaitForSingleObject(info.hProcess, INFINITE);
+                let mut code = 1;
+                let result = GetExitCodeProcess(info.hProcess, &mut code);
+                let _ = CloseHandle(info.hProcess);
+                result?;
+                ensure!(
+                    wait == WAIT_OBJECT_0 && code == 0,
+                    "管理员未完成驱动器重命名，请检查权限或磁盘状态"
+                );
+            }
+            Ok(())
+        }
+        Err(error) => Err(error),
+    }
+}
+
+pub fn rename_admin(encoded: &str) -> Result<()> {
+    ensure!(
+        encoded.len() <= 32768 && encoded.len() % 2 == 0 && encoded.is_ascii(),
+        "Invalid volume rename request"
+    );
+    let bytes = (0..encoded.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&encoded[i..i + 2], 16))
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let (path, label): (std::path::PathBuf, String) = serde_json::from_slice(&bytes)?;
+    rename(&path, &label)
 }
 
 #[cfg(test)]
@@ -119,5 +219,7 @@ mod tests {
         assert!(validate(&"a".repeat(12), "FAT32").is_err());
         assert!(validate("data/backup", "NTFS").is_err());
         assert!(validate("bad\0label", "NTFS").is_err());
+        assert!(validate(&"n".repeat(64), "NETWORK").is_ok());
+        assert!(validate("invalid/name", "NETWORK").is_err());
     }
 }

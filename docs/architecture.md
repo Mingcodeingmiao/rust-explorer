@@ -10,7 +10,7 @@
 - `src/preview.rs`：预览类型白名单、受限文本读取，以及 BOM/UTF-8/UTF-16/GB18030 自动解码。
 - `src/path_completion.rs`：地址栏路径拆分、环境变量展开和目录候选补全。
 - `src/content_layout.rs`：内容视图首列（最多 160 逻辑像素，即 175% DPI 下 280 物理像素）、图片中列和日期/大小列的响应式宽度。
-- 默认文件浏览器关联功能按维护者要求暂缓，当前整合分支不包含关联写入入口。
+- 默认文件夹浏览器以实验性、当前用户可选功能重新整合；原值备份、独立恢复文件、失败回滚与范围限制见 [说明](default-folder-browser.md)。公开 0.7.2 仍为此前暂缓该功能的版本。
 - `src/shell_folder.rs`：通过隔离 helper 枚举 Shell 命名空间中的便携设备/MTP 目录，以 PIDL 十六进制路径保存项目标识，并提供 Shell 图标与打开操作。
 - `src/native_preview.rs`：Shell 视频单帧和 Windows.Data.Pdf 原生页面渲染。
 - `src/native_assets.rs`：带取消、硬超时和 PNG 缓存的原生图像 helper 协议。

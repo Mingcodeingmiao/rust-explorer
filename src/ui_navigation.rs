@@ -257,10 +257,15 @@ impl Explorer {
             }
             Effect::Activate(index) => {
                 let path = rows[index].path.clone();
-                if self.settings.file_favorites.contains(&path)
-                    || path == PathBuf::from("shell:RecycleBinFolder")
-                {
+                if self.settings.file_favorites.contains(&path) {
                     self.run_shell(shell::Request::Open { path }, cx);
+                } else if rows[index].depth == 1
+                    && self.settings.quick_access_new_tab
+                    && self.quick_access_items().iter().any(|(_, p)| p == &path)
+                    && !window.modifiers().control
+                    && !window.modifiers().shift
+                {
+                    self.open_directory(path, rust_explorer::open_target::OpenDisposition::Tab, cx);
                 } else {
                     self.navigate_with_modifiers(path, window.modifiers(), cx);
                 }
@@ -418,6 +423,7 @@ impl Explorer {
             self.quick_access_items()
                 .into_iter()
                 .map(|(name, path)| Entry {
+                    recycle: None,
                     path,
                     name,
                     directory: true,
@@ -437,6 +443,7 @@ impl Explorer {
                 .iter()
                 .filter(|(n, _)| matches!(n.as_str(), "文档" | "图片" | "音乐" | "视频"))
                 .map(|(label, path)| Entry {
+                    recycle: None,
                     path: path.clone(),
                     name: label.clone(),
                     directory: true,
@@ -463,6 +470,7 @@ impl Explorer {
                             .contains(&self.tabs[self.active].query.to_lowercase())
                 })
                 .map(|volume| Entry {
+                    recycle: None,
                     path: volume.path.clone(),
                     name: volume.label.clone(),
                     directory: true,
@@ -879,6 +887,7 @@ impl Explorer {
                                     && !this.settings.file_favorites.contains(&path);
                                 let expandable = row.expandable;
                                 let pinned = row.pinned;
+                                let quick_access_item = row.depth == 1 && (pinned || this.system_quick_access.iter().any(|item| item.path == path));
                                 let expanded = this.tree_is_open(&path);
                                 let keyboard = this.nav_focus.is_focused(window)
                                     && this.nav_keyboard_index == index;
@@ -894,7 +903,7 @@ impl Explorer {
                                 let drop_bounds = this.file_drop_bounds.clone();
                                 div()
                                     .id(("nav", index))
-                                    .w(ui((width - 20.).max(100.)))
+                                    .w(ui((width - 12.).max(100.)))
                                     .h(ui(row_height))
                                     .pl(ui(3. + row.depth as f32 * 16.))
                                     .pr_2()
@@ -1003,7 +1012,7 @@ impl Explorer {
                                         d.child(
                                             div()
                                                 // Keep the pin clear of the overlay scrollbar.
-                                                .pr(ui(10.))
+                                                .pr(ui(0.))
                                                 .child(visual::icon("pin", t.muted)),
                                         )
                                     })
@@ -1016,7 +1025,7 @@ impl Explorer {
                                         |d| {
                                             d.child(
                                                 div()
-                                                    .pr(ui(10.))
+                                                    .pr(ui(0.))
                                                     .opacity(0.45)
                                                     .child(visual::icon("pin", t.muted)),
                                             )
@@ -1035,11 +1044,11 @@ impl Explorer {
                                                     cx,
                                                 );
                                             } else {
-                                                v.navigate_with_modifiers(
-                                                    path.clone(),
-                                                    window.modifiers(),
-                                                    cx,
-                                                );
+                                                if quick_access_item && v.settings.quick_access_new_tab && !window.modifiers().control && !window.modifiers().shift {
+                                                    v.open_directory(path.clone(), rust_explorer::open_target::OpenDisposition::Tab, cx);
+                                                } else {
+                                                    v.navigate_with_modifiers(path.clone(), window.modifiers(), cx);
+                                                }
                                             }
                                         }),
                                     )

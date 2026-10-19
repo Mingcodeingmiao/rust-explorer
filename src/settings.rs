@@ -49,6 +49,9 @@ pub struct Settings {
     pub single_click: bool,
     #[serde(alias = "shift_new_tab")]
     pub shift_open_tab: bool,
+    pub quick_access_new_tab: bool,
+    pub new_tab_this_pc: bool,
+    pub startup_page: String,
     pub separate_process: bool,
     pub full_path: bool,
     pub preview: bool,
@@ -89,6 +92,9 @@ impl Default for Settings {
             wrap_names: true,
             single_click: false,
             shift_open_tab: false,
+            quick_access_new_tab: true,
+            new_tab_this_pc: false,
+            startup_page: "home".into(),
             separate_process: false,
             full_path: false,
             preview: true,
@@ -134,6 +140,9 @@ impl Settings {
             .ok()
             .and_then(|s| serde_json::from_slice(&s).ok())
             .unwrap_or_default();
+        if !["home", "this-pc", "quick-access"].contains(&s.startup_page.as_str()) {
+            s.startup_page = "home".into();
+        }
         let allowed = ["name", "modified", "kind", "size", "created"];
         let mut seen = std::collections::HashSet::new();
         s.columns.retain_mut(|(id, w)| {
@@ -285,5 +294,33 @@ mod volume_column_tests {
         let settings: super::Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(settings.volume_columns, super::default_volume_columns());
         assert_eq!(settings.volume_sort, "name");
+    }
+}
+
+#[cfg(test)]
+mod navigation_preferences_tests {
+    use super::Settings;
+    #[test]
+    fn old_settings_keep_compatible_tab_defaults() {
+        let settings: Settings = serde_json::from_str("{}").unwrap();
+        assert!(settings.quick_access_new_tab);
+        assert!(!settings.new_tab_this_pc);
+        assert_eq!(settings.startup_page, "home");
+    }
+    #[test]
+    fn navigation_choices_survive_save_round_trip() {
+        for page in ["home", "this-pc", "quick-access"] {
+            let settings = Settings {
+                startup_page: page.into(),
+                new_tab_this_pc: true,
+                quick_access_new_tab: false,
+                ..Settings::default()
+            };
+            let saved = serde_json::to_vec(&settings).unwrap();
+            let loaded: Settings = serde_json::from_slice(&saved).unwrap();
+            assert_eq!(loaded.startup_page, page);
+            assert!(loaded.new_tab_this_pc);
+            assert!(!loaded.quick_access_new_tab);
+        }
     }
 }

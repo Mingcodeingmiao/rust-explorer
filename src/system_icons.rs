@@ -28,6 +28,44 @@ pub struct IconBitmap {
     /// Straight (not premultiplied) sRGB RGBA, top row first.
     pub rgba: Vec<u8>,
 }
+fn trim_icon_padding(icon: IconBitmap) -> IconBitmap {
+    let Some(image) = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone()) else {
+        return icon;
+    };
+    let (mut left, mut top, mut right, mut bottom) = (icon.width, icon.height, 0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 16 {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    if right <= left || bottom <= top {
+        return icon;
+    }
+    let crop = image::imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
+    let scale =
+        (icon.width.min(icon.height) as f32 * 0.92) / crop.width().max(crop.height()) as f32;
+    let resized = image::imageops::resize(
+        &crop,
+        (crop.width() as f32 * scale).round().max(1.) as u32,
+        (crop.height() as f32 * scale).round().max(1.) as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut canvas = image::RgbaImage::new(icon.width, icon.height);
+    image::imageops::overlay(
+        &mut canvas,
+        &resized,
+        ((icon.width - resized.width()) / 2) as i64,
+        ((icon.height - resized.height()) / 2) as i64,
+    );
+    IconBitmap {
+        width: icon.width,
+        height: icon.height,
+        rgba: canvas.into_raw(),
+    }
+}
 
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -353,61 +391,65 @@ fn generic_file_index() -> Option<i32> {
     })
 }
 
-/// Load a visually verified Windows resource or a documented Shell stock icon.
-/// Missing/unverified resources return an error so the caller can draw its
-/// original Fluent fallback. Numeric resource identifiers are not OS contracts.
-fn desktop_icon(size: u32) -> Result<IconBitmap> {
-    // Resolve the real Desktop shell item rather than reusing the computer stock icon.
-    let pidl = unsafe { SHGetKnownFolderIDList(&FOLDERID_Desktop, 0, None)? };
-    let mut info = SHFILEINFOW::default();
-    let result = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(pidl.cast()),
-            FILE_ATTRIBUTE_NORMAL,
-            Some(&mut info),
-            size_of::<SHFILEINFOW>() as u32,
-            SHGFI_PIDL
-                | SHGFI_ICON
-                | SHGFI_SYSICONINDEX
-                | if size <= 16 {
-                    SHGFI_SMALLICON
-                } else {
-                    SHGFI_LARGEICON
-                },
-        )
-    };
-    unsafe {
-        windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()));
-    }
-    anyhow::ensure!(
-        result != 0 && !info.hIcon.is_invalid(),
-        "Desktop shell icon unavailable"
-    );
-    let icon = Icon(info.hIcon);
-    if size > 32 {
-        use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
-        let list: IImageList = unsafe {
-            SHGetImageList(if size > 48 {
-                SHIL_JUMBO
-            } else {
-                SHIL_EXTRALARGE
-            } as i32)?
+pub fn windows_11() -> bool {
+    static VERSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| unsafe {
+        use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
         };
-        let large = Icon(unsafe { list.GetIcon(info.iIcon, ILD_TRANSPARENT.0)? });
-        return bitmap(large.0, size);
-    }
-    bitmap(icon.0, size)
+        GetVersionExW(&mut version).is_ok() && version.dwBuildNumber >= 22000
+    })
 }
-
+pub fn has_ui_icon(name: &str) -> bool {
+    matches!(
+        name,
+        "network"
+            | "pin"
+            | "recycle-bin"
+            | "folder"
+            | "folder-open"
+            | "drive"
+            | "search"
+            | "rename"
+            | "delete"
+            | "computer"
+            | "computer-colored"
+            | "desktop"
+            | "video"
+            | "video-file"
+            | "image"
+            | "image-file"
+            | "audio"
+            | "audio-file"
+            | "file"
+            | "up"
+            | "refresh"
+            | "new-folder"
+            | "cut"
+            | "copy"
+            | "paste"
+            | "preview"
+            | "home"
+            | "downloads"
+            | "documents"
+            | "pictures"
+            | "music"
+            | "videos"
+            | "close"
+    )
+}
 pub fn ui_icon(name: &str, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
-    if name == "desktop" {
-        if let Ok(icon) = desktop_icon(size) {
-            return Ok(icon);
-        }
+    match name {
+        "desktop" => return resource_icon("imageres.dll", 183, size),
+        "network" => return resource_icon("imageres.dll", 25, size),
+        "pin" => return resource_icon("imageres.dll", 5100, size).map(trim_icon_padding),
+        "computer" | "computer-colored" => return resource_icon("imageres.dll", 109, size),
+        _ => {}
     }
     let stock = match name {
-        "network" => Some(SIID_WORLD),
         "recycle-bin" => Some(SIID_RECYCLER),
         "folder" => Some(SIID_FOLDER),
         "folder-open" => Some(SIID_FOLDEROPEN),
