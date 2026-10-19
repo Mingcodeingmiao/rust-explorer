@@ -3,8 +3,8 @@
 ## 已实现
 
 - 图标优先读取本机 Explorer SVG、系统 Segoe Fluent Icons / Segoe MDL2 Assets 字体和 Shell 图标资源；缺失时使用内嵌微软 Fluent UI System Icons SVG。官方原始资产、固定上游提交及 MIT 许可位于 resources/fluent-icons。移除手绘工具图标。
-- 导航刷新使用系统字体 Refresh 字形 U+E72C。地址栏电脑图标与虚拟位置标签页使用同一 computer 图标。
-- 任务栏窗口图标按 DPI 从本机 explorer.exe 图标组加载，HICON 生命周期跟随窗口；内嵌 EXE 回退图标为微软 Document Folder 彩色 SVG 的 PNG/ICO。
+- 导航刷新使用系统字体 Refresh 字形 U+E72C。最终 0.7.3 地址栏电脑图标使用 U+E7F4，虚拟位置电脑图标使用 imageres.dll #109。
+- 最终 0.7.3 保留项目原有生成图标作为应用标识，裁去多余透明边并导出多个 DPI 尺寸；不使用微软图标作为应用品牌。窗口 HICON 从 EXE 内嵌资源读取。
 - 未按键的鼠标移动不进入 Explorer 实体更新；不存在原生图标映射时直接使用官方 SVG，避免无效请求和重试。
 - 同标签页、目录和查询条件刷新时保留已有行与滚动位置；目录、查询或标签变化仍重置视口。
 - 永久删除不再屏蔽系统进度和错误界面。进度标题接口不受支持（E_NOTIMPL）时继续删除。完成、取消或部分失败后重新读取列表；原生菜单删除也触发刷新。短操作的进度窗口由 Windows 决定是否显示。

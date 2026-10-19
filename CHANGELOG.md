@@ -2,6 +2,29 @@
 
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
+## [0.7.3] - 2026-10-19
+
+See [complete release notes](docs/v0.7.3.md) and the [roadmap](ROADMAP.md).
+
+### Added
+
+- Opt-in experimental folder/drive associations with backups, a 120-second trial guard and independent recovery; Shell file reveal and separate tabs for different targets in the same folder.
+- Internal Recycle Bin browsing, original-location/deletion-date columns, native properties and an empty-bin action in the main toolbar.
+- Startup-page and new-tab destination preferences, Quick Access folder opening in new tabs, and a version row in Folder Options.
+- Automatic restoration of valid one-hour folder-size caches, selected-size totals and a large-icon details fallback for unsupported previews.
+
+### Fixed
+
+- Address input selection/caret sequencing, background, long-path scrolling and prompt restoration after clearing without entering a new path.
+- Overlapping third-level submenu hitboxes and menu height limits in small windows.
+- System icon mappings, official Fluent SVG fallbacks, tab close alignment, Quick Access pin spacing and application icon padding.
+- Native deletion progress and post-operation refresh, preservation of scroll position on refresh, and immediate inline rename for newly created folders.
+
+### Maintenance and plans
+
+- Serial core IPC tests for consistent Windows message timing; documented validation limits and recovery scope.
+- Existing contributor and dependency PRs remain unmerged. Future work prioritizes file drag/drop improvements, performance and bug fixes.
+
 ## 0.7.2 integration and validation
 
 PR #11 at `f929129` is integrated with the maintainer's changes. MTP parent navigation and light active-tab contrast are fixed. Formatting, 76 core tests and desktop compilation passed; device navigation, upload/download and rename were tested on Xiaomi 14. MTP/WPD transfers are documented as a device/protocol-path capability boundary: some paths require serialized I/O, and same-device copy/move may return ERROR_BUSY. See [integration validation](docs/pr-11-integration-072.md) and [device validation](docs/mtp-tabs-validation-2026-10-18.md). Default-browser association remains deferred; the content first column uses 160 logical pixels (280 physical pixels at 175% DPI). Version 0.7.2 is published as a pre-release.

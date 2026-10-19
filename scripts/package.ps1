@@ -14,12 +14,13 @@ foreach ($name in @('rust-explorer.exe', 'Everything64.dll', 'libgcc_s_seh-1.dll
     $file = Join-Path $source $name
     if (Test-Path -LiteralPath $file) { Copy-Item -LiteralPath $file -Destination $staging }
 }
-foreach ($name in @('README.md', 'README.en.md', 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', 'KNOWN_ISSUES.md')) {
+foreach ($name in @('README.md', 'README.en.md', 'LICENSE', 'NOTICE', 'THIRD_PARTY_NOTICES.md', 'CHANGELOG.md', 'KNOWN_ISSUES.md', 'ROADMAP.md')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $staging
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\pinyin-LICENSE.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\files-MIT.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\LICENSE') -Destination (Join-Path $staging 'FluentUI-System-Icons-LICENSE.txt')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\SOURCES.json') -Destination (Join-Path $staging 'FluentUI-System-Icons-SOURCES.json')
 if (Test-Path -LiteralPath (Join-Path $staging 'Everything64.dll')) {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\Everything-SDK-License.txt') -Destination $staging
 }
