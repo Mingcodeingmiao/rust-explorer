@@ -391,52 +391,6 @@ fn generic_file_index() -> Option<i32> {
     })
 }
 
-/// Load a visually verified Windows resource or a documented Shell stock icon.
-/// Missing/unverified resources return an error so the caller can draw its
-/// original Fluent fallback. Numeric resource identifiers are not OS contracts.
-fn desktop_icon(size: u32) -> Result<IconBitmap> {
-    // Resolve the real Desktop shell item rather than reusing the computer stock icon.
-    let pidl = unsafe { SHGetKnownFolderIDList(&FOLDERID_Desktop, 0, None)? };
-    let mut info = SHFILEINFOW::default();
-    let result = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(pidl.cast()),
-            FILE_ATTRIBUTE_NORMAL,
-            Some(&mut info),
-            size_of::<SHFILEINFOW>() as u32,
-            SHGFI_PIDL
-                | SHGFI_ICON
-                | SHGFI_SYSICONINDEX
-                | if size <= 16 {
-                    SHGFI_SMALLICON
-                } else {
-                    SHGFI_LARGEICON
-                },
-        )
-    };
-    unsafe {
-        windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()));
-    }
-    anyhow::ensure!(
-        result != 0 && !info.hIcon.is_invalid(),
-        "Desktop shell icon unavailable"
-    );
-    let icon = Icon(info.hIcon);
-    if size > 32 {
-        use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
-        let list: IImageList = unsafe {
-            SHGetImageList(if size > 48 {
-                SHIL_JUMBO
-            } else {
-                SHIL_EXTRALARGE
-            } as i32)?
-        };
-        let large = Icon(unsafe { list.GetIcon(info.iIcon, ILD_TRANSPARENT.0)? });
-        return bitmap(large.0, size);
-    }
-    bitmap(icon.0, size)
-}
-
 pub fn windows_11() -> bool {
     static VERSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *VERSION.get_or_init(|| unsafe {
@@ -489,15 +443,11 @@ pub fn has_ui_icon(name: &str) -> bool {
 pub fn ui_icon(name: &str, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
     match name {
+        "desktop" => return resource_icon("imageres.dll", 183, size),
         "network" => return resource_icon("imageres.dll", 25, size),
         "pin" => return resource_icon("imageres.dll", 5100, size).map(trim_icon_padding),
         "computer" | "computer-colored" => return resource_icon("imageres.dll", 109, size),
         _ => {}
-    }
-    if name == "desktop" {
-        if let Ok(icon) = desktop_icon(size) {
-            return Ok(icon);
-        }
     }
     let stock = match name {
         "recycle-bin" => Some(SIID_RECYCLER),

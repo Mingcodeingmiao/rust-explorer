@@ -438,6 +438,7 @@ impl Explorer {
         let folder_handler = std::env::args_os()
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
+        let mut settings = Settings::load();
         let initial = launch
             .as_ref()
             .map(|r| r.folder.clone())
@@ -454,10 +455,14 @@ impl Explorer {
                     })
                     .filter(|p| navigation::is_virtual(p) || p.is_dir())
             })
-            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from("C:\\")));
+            .unwrap_or_else(|| match settings.startup_page.as_str() {
+                "this-pc" => PathBuf::from("::ThisPC"),
+                "quick-access" => PathBuf::from("::QuickAccess"),
+                _ => shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Profile)
+                    .unwrap_or_else(|| PathBuf::from("C:\\")),
+            });
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
-        address.update(cx, |input, _| input.selected_click_to_end = true);
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
         let mut subscriptions = vec![];
@@ -638,7 +643,6 @@ impl Explorer {
         let (watch_tx, watch_rx) = mpsc::channel();
         let (usage_tx, usage_rx) = mpsc::channel();
         let (drag_tx, drag_rx) = mpsc::channel();
-        let mut settings = Settings::load();
         if !settings.quick_access_system_migrated {
             // Earlier releases seeded these six paths. System Quick Access now
             // supplies them; retain only folders the user added after that seed.
@@ -1601,6 +1605,14 @@ impl Explorer {
             self.settings.shift_open_tab,
             false,
         );
+        let disposition = if self.dir() == PathBuf::from("::QuickAccess")
+            && self.settings.quick_access_new_tab
+            && disposition == rust_explorer::open_target::OpenDisposition::Current
+        {
+            rust_explorer::open_target::OpenDisposition::Tab
+        } else {
+            disposition
+        };
         self.open_directory(path, disposition, cx);
     }
     fn open_entry_with(
@@ -1617,6 +1629,15 @@ impl Explorer {
             self.shell_names
                 .insert(entry.path.clone(), entry.name.clone());
         }
+        let disposition = if entry.directory
+            && self.dir() == PathBuf::from("::QuickAccess")
+            && self.settings.quick_access_new_tab
+            && disposition == rust_explorer::open_target::OpenDisposition::Current
+        {
+            rust_explorer::open_target::OpenDisposition::Tab
+        } else {
+            disposition
+        };
         if entry.directory && !entry.link {
             self.open_directory(entry.path, disposition, cx);
         } else if entry.link
@@ -2468,7 +2489,11 @@ impl Explorer {
     fn new_tab(&mut self, cx: &mut Context<Self>) {
         self.tabs.push(Tab {
             id: next_tab_id(),
-            history: History::new(self.dir()),
+            history: History::new(if self.settings.new_tab_this_pc {
+                PathBuf::from("::ThisPC")
+            } else {
+                self.dir()
+            }),
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
@@ -3697,7 +3722,7 @@ impl Render for Explorer {
                 _ => v.reload(cx),
             });
             nav = nav.child(if id == "refresh" {
-                // 80% of the original 32 px square, including the glyph.
+                // Match the other navigation buttons while retaining a centered glyph.
                 div()
                     .id(id)
                     .w(ui(30.))
@@ -3724,6 +3749,10 @@ impl Render for Explorer {
                 .relative()
                 .flex()
                 .items_center()
+                .h(ui(32.))
+                .rounded(ui(4.))
+                .bg(rgb(t.panel))
+                .text_color(rgb(t.text))
                 .child(div().flex_1().min_w_0().child(self.address.clone()))
                 .child(
                     div()
@@ -4419,46 +4448,64 @@ impl Render for Explorer {
                         )
                         .into_any_element(),
                 };
-            let element = if self.settings.details_pane {
-                let selected: Vec<_> = self
-                    .selected
-                    .iter()
-                    .filter_map(|i| self.entries.get(*i))
-                    .collect();
-                let mut data = div()
-                    .p_4()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .text_color(rgb(t.muted));
-                if selected.len() == 1 {
-                    let entry = selected[0];
-                    data = data
-                        .child(format!("类型：{}", entry.kind))
-                        .child(format!("大小：{}", self.entry_size_text(entry)))
-                        .child(format!("修改日期：{}", entry.date()))
-                        .child(format!("创建日期：{}", extras::format_date(entry.created)))
-                        .child(
-                            div()
-                                .whitespace_normal()
-                                .child(entry.path.display().to_string()),
-                        );
+            let element =
+                if self.settings.details_pane || matches!(self.preview, Preview::Message(_)) {
+                    let selected: Vec<_> = self
+                        .selected
+                        .iter()
+                        .filter_map(|i| self.entries.get(*i))
+                        .collect();
+                    let mut data = div()
+                        .id("selected-entry-details")
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_y_scroll()
+                        .p_4()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .text_color(rgb(t.muted));
+                    if selected.len() == 1 {
+                        let entry = selected[0];
+                        data = data
+                            .child(visual::entry_icon(
+                                &entry.path,
+                                entry.directory,
+                                entry.link,
+                                t.text,
+                                96.,
+                            ))
+                            .child(
+                                div()
+                                    .text_color(rgb(t.text))
+                                    .whitespace_normal()
+                                    .child(entry.name.clone()),
+                            )
+                            .child(format!("类型：{}", entry.kind))
+                            .child(format!("大小：{}", self.entry_size_text(entry)))
+                            .child(format!("修改日期：{}", entry.date()))
+                            .child(format!("创建日期：{}", extras::format_date(entry.created)))
+                            .child(
+                                div()
+                                    .whitespace_normal()
+                                    .child(entry.path.display().to_string()),
+                            );
+                    } else {
+                        data = data
+                            .child(format!("已选择 {} 个项目", selected.len()))
+                            .child(format!(
+                                "文件：{} 个",
+                                selected.iter().filter(|e| !e.directory).count()
+                            ))
+                            .child(format!(
+                                "文件夹：{} 个",
+                                selected.iter().filter(|e| e.directory).count()
+                            ));
+                    }
+                    data.into_any_element()
                 } else {
-                    data = data
-                        .child(format!("已选择 {} 个项目", selected.len()))
-                        .child(format!(
-                            "文件：{} 个",
-                            selected.iter().filter(|e| !e.directory).count()
-                        ))
-                        .child(format!(
-                            "文件夹：{} 个",
-                            selected.iter().filter(|e| e.directory).count()
-                        ));
-                }
-                data.into_any_element()
-            } else {
-                element
-            };
+                    element
+                };
             pane = pane.child(element);
             body = body.child(pane);
         }
@@ -4470,11 +4517,37 @@ impl Render for Explorer {
         } else {
             format!(
                 "{}{}",
-                self.status,
+                if self.selected.is_empty() {
+                    self.status.clone()
+                } else {
+                    format!("{} 个项目", self.entries.len())
+                },
                 if self.selected.is_empty() {
                     String::new()
                 } else {
-                    format!(" · 已选择 {} 项", self.selected.len())
+                    let bytes = self
+                        .selected
+                        .iter()
+                        .filter_map(|i| self.entries.get(*i))
+                        .fold(0u64, |sum, entry| {
+                            sum.saturating_add(if !entry.directory {
+                                entry.size
+                            } else if self.usage_enabled {
+                                self.usage.get(&entry.path).map_or(0, |u| u.bytes)
+                            } else {
+                                0
+                            })
+                        });
+                    format!(
+                        " | 已选择 {} 项 | {} {}",
+                        self.selected.len(),
+                        if self.usage_enabled {
+                            "统计大小"
+                        } else {
+                            "文件大小"
+                        },
+                        fs::size_label(bytes)
+                    )
                 }
             )
         };

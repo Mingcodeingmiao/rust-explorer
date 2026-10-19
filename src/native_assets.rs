@@ -29,7 +29,7 @@ impl IconRequest {
             path: PathBuf::new(),
             directory: false,
             pixels,
-            epoch: crate::fluent_icons::resource_epoch().wrapping_add(0x20261021),
+            epoch: crate::fluent_icons::resource_epoch().wrapping_add(0x20261022),
         }
     }
     pub fn file(path: &Path, directory: bool, pixels: u32) -> Self {

@@ -196,7 +196,7 @@ pub fn icon_at(name: &str, color: u32, logical: f32) -> AnyElement {
     icon_sized(name, color, logical)
 }
 pub fn icon(name: &str, color: u32) -> AnyElement {
-    icon_sized(name, color, if name == "pin" { 18. } else { 16. })
+    icon_sized(name, color, if name == "pin" { 18. * 0.75 } else { 16. })
 }
 pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
     // Never use the legacy red-X icon or Win10 toolbar raster resources.
@@ -224,9 +224,22 @@ pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
             .into_any_element();
     }
     let dark = ICONS.with(|v| v.borrow().dark);
-    if let Some(path) = fluent_icons::path(name, dark)
-        .filter(|_| !matches!(name, "network" | "computer" | "computer-colored" | "pin"))
-    {
+    if let Some(path) = fluent_icons::path(name, dark).filter(|_| {
+        !matches!(
+            name,
+            "network"
+                | "computer"
+                | "computer-colored"
+                | "pin"
+                | "home"
+                | "desktop"
+                | "downloads"
+                | "documents"
+                | "pictures"
+                | "music"
+                | "videos"
+        )
+    }) {
         if matches!(name, "close" | "pin" | "unpin") {
             return svg()
                 .path(path.to_string_lossy().into_owned())
@@ -446,7 +459,11 @@ pub fn file_icon_sized(path: &Path, directory: bool, color: u32, logical: f32) -
             d.child(img(path).size_full().object_fit(ObjectFit::Contain))
         })
         .when(image.is_none(), |d| {
-            d.child(drawn_icon(if directory { "folder" } else { "file" }, color))
+            d.child(drawn_icon_sized(
+                if directory { "folder" } else { "file" },
+                color,
+                logical,
+            ))
         })
         .into_any_element()
 }

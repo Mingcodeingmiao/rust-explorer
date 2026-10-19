@@ -2011,13 +2011,18 @@ impl Explorer {
                         cx.stop_propagation();
                         v.accept_tab(drag, index, cx);
                     }))
-                    .child(visual::icon(
+                    .child(visual::icon_at(
                         if navigation::is_virtual(tab.history.current()) {
                             "computer"
                         } else {
                             "folder"
                         },
                         0xeac054,
+                        if current == std::path::Path::new("::QuickAccess") {
+                            12.
+                        } else {
+                            16.
+                        },
                     ))
                     .child(
                         div()
@@ -2030,10 +2035,11 @@ impl Explorer {
                             .child(name),
                     )
                     .child(
-                        button(("close-tab", tab.id), "", t)
-                            .child(visual::icon_at("close", t.text, 16. * 2. / 3.))
-                            .w(ui(24.))
-                            .px_1()
+                        div()
+                            .id(("close-tab", tab.id))
+                            .child(visual::icon_at("close", t.text, 16. * 2. / 3. * 1.27))
+                            .size(ui(24.))
+                            .hover(move |s| s.bg(rgb(t.hover)))
                             .flex_shrink_0()
                             .flex()
                             .items_center()
@@ -4559,8 +4565,39 @@ impl Explorer {
                     .child(format!("当前软件版本：{}", env!("CARGO_PKG_VERSION"))),
             );
         }
+        if self.options_page == 0 {
+            body = body.child(div().py_2().child("启动时打开"));
+            for (page, label) in [
+                ("home", "主文件夹"),
+                ("this-pc", "此电脑"),
+                ("quick-access", "快速访问"),
+            ] {
+                let selected = settings.startup_page == page;
+                body = body.child(
+                    button(SharedString::from(format!("startup-page-{page}")), label, t)
+                        .flex_shrink_0()
+                        .when(selected, |d| d.bg(rgb(t.selection)))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            if let Some(s) = &mut v.options {
+                                s.startup_page = page.into();
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+        }
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
+                (
+                    "quick-access-new-tab",
+                    "默认在新标签页中打开快速访问的文件夹",
+                    settings.quick_access_new_tab,
+                ),
+                (
+                    "new-tab-this-pc",
+                    "新标签页打开此电脑（关闭时打开当前目录）",
+                    settings.new_tab_this_pc,
+                ),
                 (
                     "single",
                     "通过单击打开项目（指向时选定请使用复选框）",
@@ -4718,6 +4755,10 @@ impl Explorer {
                     .on_click(cx.listener(move |v, _, _, cx| {
                         if let Some(s) = &mut v.options {
                             match id {
+                                "quick-access-new-tab" => {
+                                    s.quick_access_new_tab = !s.quick_access_new_tab
+                                }
+                                "new-tab-this-pc" => s.new_tab_this_pc = !s.new_tab_this_pc,
                                 "single" => s.single_click = !s.single_click,
                                 "shift-open-tab" => s.shift_open_tab = !s.shift_open_tab,
                                 "separate" => s.separate_process = !s.separate_process,
