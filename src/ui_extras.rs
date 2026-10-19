@@ -1577,6 +1577,7 @@ impl Explorer {
         }
         if self.usage_running {
             self.usage_cancel.store(true, Ordering::Relaxed);
+            self.usage_revision = self.usage_revision.wrapping_add(1);
             self.usage_running = false;
             self.status = "统计已停止；* 表示跳过项目或部分结果".into();
             cx.notify();
@@ -1586,10 +1587,17 @@ impl Explorer {
         self.usage_running = true;
         self.usage.clear();
         self.usage_cancel = Arc::new(AtomicBool::new(false));
+        self.usage_revision = self.usage_revision.wrapping_add(1);
         let cancel = self.usage_cancel.clone();
         let entries = self.entries.clone();
         let tx = self.usage_tx.clone();
-        let generation = self.generation;
+        let generation = self.usage_revision;
+        disk_usage::invalidate_paths(
+            entries
+                .iter()
+                .filter(|e| e.directory)
+                .map(|e| e.path.as_path()),
+        );
         self.status = "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整".into();
         let task = cx.background_executor().spawn(async move {
             let mut skipped = 0;
@@ -1608,7 +1616,7 @@ impl Explorer {
         cx.spawn(async move |view, cx| {
             let (skipped, hits) = task.await;
             let _ = view.update(cx, |v, cx| {
-                if v.generation == generation {
+                if v.usage_revision == generation {
                     v.usage_running = false;
                     v.status = format!(
                         "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"

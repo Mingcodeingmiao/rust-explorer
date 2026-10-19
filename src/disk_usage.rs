@@ -53,6 +53,26 @@ fn cache() -> &'static Mutex<Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
     CACHE.get_or_init(Default::default)
 }
+/// Read cached results without starting any filesystem traversal.
+pub fn cached_sizes<'a>(paths: impl Iterator<Item = &'a Path>) -> HashMap<PathBuf, Usage> {
+    let mut cache = cache().lock().unwrap();
+    let now = Instant::now();
+    paths
+        .filter_map(|path| {
+            cache
+                .get(path, now)
+                .map(|usage| (path.to_path_buf(), usage))
+        })
+        .collect()
+}
+/// Refresh the displayed directories while retaining unrelated cached totals.
+pub fn invalidate_paths<'a>(paths: impl Iterator<Item = &'a Path>) {
+    let mut cache = cache().lock().unwrap();
+    cache.epoch = cache.epoch.wrapping_add(1);
+    for path in paths {
+        cache.entries.remove(path);
+    }
+}
 /// Shared across windows in this process. Cancelled traversals never enter the cache.
 pub fn calculate_cached(path: &Path, cancel: &Arc<AtomicBool>) -> (Usage, bool) {
     if cancel.load(Ordering::Relaxed) {
@@ -202,7 +222,31 @@ mod tests {
         std::fs::write(&file, [0; 29]).unwrap();
         let (cached, hit) = calculate_cached(&root, &cancel);
         assert_eq!((cached.bytes, hit), (17, true));
-        invalidate_cache();
+        assert_eq!(
+            cached_sizes(std::iter::once(root.as_path()))[&root].bytes,
+            17
+        );
+        let other = root.join("unrelated");
+        {
+            let mut cache = cache().lock().unwrap();
+            let epoch = cache.epoch;
+            cache.put(
+                other.clone(),
+                Usage {
+                    bytes: 5,
+                    complete: true,
+                    ..Default::default()
+                },
+                Instant::now(),
+                epoch,
+            );
+        }
+        invalidate_paths(std::iter::once(root.as_path()));
+        assert!(cached_sizes(std::iter::once(root.as_path())).is_empty());
+        assert_eq!(
+            cached_sizes(std::iter::once(other.as_path()))[&other].bytes,
+            5
+        );
         let (updated, hit) = calculate_cached(&root, &cancel);
         assert_eq!((updated.bytes, hit), (29, false));
         cancel.store(true, Ordering::Relaxed);

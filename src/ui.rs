@@ -237,6 +237,7 @@ struct Explorer {
     usage_rx: mpsc::Receiver<(u64, PathBuf, Usage)>,
     usage_tx: mpsc::Sender<(u64, PathBuf, Usage)>,
     usage_running: bool,
+    usage_revision: u64,
     usage_enabled: bool,
     inline_rename: Option<PathBuf>,
     pending_select: Option<PathBuf>,
@@ -693,6 +694,7 @@ impl Explorer {
             usage_rx,
             usage_tx,
             usage_running: false,
+            usage_revision: 0,
             usage_enabled: false,
             inline_rename: None,
             pending_select: None,
@@ -852,7 +854,7 @@ impl Explorer {
                         }
                         let mut usage_changed = false;
                         for (generation, path, usage) in this.usage_rx.try_iter() {
-                            if generation == this.generation {
+                            if generation == this.usage_revision {
                                 this.usage.insert(path, usage);
                                 usage_changed = true;
                             }
@@ -1042,6 +1044,7 @@ impl Explorer {
         self.ctrl_open_selection = None;
         self.usage_cancel.store(true, Ordering::Relaxed);
         self.usage_cancel = Arc::new(AtomicBool::new(false));
+        self.usage_revision = self.usage_revision.wrapping_add(1);
         self.usage.clear();
         self.usage_running = false;
         self.usage_enabled = false;
@@ -1250,6 +1253,13 @@ impl Explorer {
                             }
                         }
                         this.entries = Arc::new(entries);
+                        this.usage = disk_usage::cached_sizes(
+                            this.entries
+                                .iter()
+                                .filter(|e| e.directory)
+                                .map(|e| e.path.as_path()),
+                        );
+                        this.usage_enabled = !this.usage.is_empty();
                         this.rebuild_rows();
                         if this.reveal_pending {
                             for target in &this.external_reveal {
