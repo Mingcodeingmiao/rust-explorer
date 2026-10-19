@@ -46,6 +46,8 @@ pub struct TextInput {
     last_line_height: Pixels,
     is_selecting: bool,
     pub compact: bool,
+    pub single_line_scroll: bool,
+    scroll_x: Pixels,
 }
 
 impl TextInput {
@@ -62,6 +64,8 @@ impl TextInput {
             last_line_height: px(20.),
             is_selecting: false,
             compact: false,
+            single_line_scroll: false,
+            scroll_x: px(0.),
         }
     }
     fn suggest_previous(&mut self, _: &SuggestPrevious, _: &mut Window, cx: &mut Context<Self>) {
@@ -76,6 +80,7 @@ impl TextInput {
     pub fn set_value(&mut self, value: String, cx: &mut Context<Self>) {
         self.content = value.into();
         self.selected_range = self.content.len()..self.content.len();
+        self.selection_reversed = false;
         self.marked_range = None;
         cx.notify();
     }
@@ -221,6 +226,7 @@ impl TextInput {
 
     fn move_to(&mut self, offset: usize, cx: &mut Context<Self>) {
         self.selected_range = offset..offset;
+        self.selection_reversed = false;
         cx.notify()
     }
 
@@ -247,8 +253,11 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_position(position - bounds.origin, self.last_line_height)
-            .unwrap_or(0)
+        line.closest_index_for_position(
+            position - bounds.origin + gpui::point(self.scroll_x, px(0.)),
+            self.last_line_height,
+        )
+        .unwrap_or(0)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -435,7 +444,7 @@ impl EntityInputHandler for TextInput {
         let start = last_layout.position_for_index(range.start, self.last_line_height)?;
         let end = last_layout.position_for_index(range.end, self.last_line_height)?;
         Some(Bounds::new(
-            bounds.origin + start,
+            bounds.origin + start - gpui::point(self.scroll_x, px(0.)),
             size(
                 if start.y == end.y {
                     (end.x - start.x).max(px(1.))
@@ -457,7 +466,10 @@ impl EntityInputHandler for TextInput {
         let utf8_index = self
             .last_layout
             .as_ref()?
-            .closest_index_for_position(point - bounds.origin, self.last_line_height)
+            .closest_index_for_position(
+                point - bounds.origin + gpui::point(self.scroll_x, px(0.)),
+                self.last_line_height,
+            )
             .ok()?;
         Some(self.offset_to_utf16(utf8_index))
     }
@@ -471,6 +483,7 @@ struct PrepaintState {
     line: Option<WrappedLine>,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
+    scroll_x: Pixels,
 }
 
 impl IntoElement for TextElement {
@@ -582,6 +595,24 @@ impl Element for TextElement {
         let cursor_pos = line
             .position_for_index(cursor, line_height)
             .unwrap_or_default();
+        let scroll_x = if input.single_line_scroll {
+            let right = (bounds.size.width - px(2.)).max(px(1.));
+            let mut offset = input.scroll_x;
+            if cursor_pos.x < offset {
+                offset = cursor_pos.x;
+            }
+            if cursor_pos.x > offset + right {
+                offset = cursor_pos.x - right;
+            }
+            let end = line
+                .position_for_index(input.content.len(), line_height)
+                .unwrap_or_default()
+                .x;
+            offset.clamp(px(0.), (end - right).max(px(0.)))
+        } else {
+            px(0.)
+        };
+        let origin = bounds.origin - gpui::point(scroll_x, px(0.));
         let mut selection = Vec::new();
         if !selected_range.is_empty() {
             for (start, ch) in line
@@ -601,14 +632,14 @@ impl Element for TextElement {
                     bounds.size.width - p.x
                 };
                 selection.push(fill(
-                    Bounds::new(bounds.origin + p, size(width.max(px(1.)), line_height)),
+                    Bounds::new(origin + p, size(width.max(px(1.)), line_height)),
                     rgba(0x3311ff30),
                 ));
             }
         }
         let cursor = selected_range.is_empty().then(|| {
             fill(
-                Bounds::new(bounds.origin + cursor_pos, size(px(2.), line_height)),
+                Bounds::new(origin + cursor_pos, size(px(2.), line_height)),
                 style.color,
             )
         });
@@ -616,6 +647,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            scroll_x,
         }
     }
 
@@ -640,7 +672,7 @@ impl Element for TextElement {
         }
         let line = prepaint.line.take().unwrap();
         line.paint(
-            bounds.origin,
+            bounds.origin - gpui::point(prepaint.scroll_x, px(0.)),
             window.line_height(),
             gpui::TextAlign::Left,
             Some(bounds),
@@ -659,6 +691,7 @@ impl Element for TextElement {
             input.last_line_height = window.line_height();
             input.last_layout = Some(line);
             input.last_bounds = Some(bounds);
+            input.scroll_x = prepaint.scroll_x;
         });
     }
 }

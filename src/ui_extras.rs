@@ -1228,7 +1228,7 @@ impl Explorer {
             .px_2()
             .overflow_hidden()
             .cursor_pointer()
-            .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
+            .on_click(cx.listener(|v, _, w, cx| v.focus_address_at_end(w, cx)));
         crumbs = crumbs
             .child(
                 div()

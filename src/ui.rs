@@ -463,6 +463,7 @@ impl Explorer {
             });
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
+        address.update(cx, |input, _| input.single_line_scroll = true);
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
         let mut subscriptions = vec![];
@@ -2877,6 +2878,11 @@ impl Explorer {
         self.address_candidates.clear();
         cx.notify();
     }
+    fn focus_address_at_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_address(window, cx);
+        self.address
+            .update(cx, |input, cx| input.focus_end(window, cx));
+    }
     fn sync_search_placeholder(&self, cx: &mut Context<Self>) {
         let dir = self.dir();
         let scope = if navigation::is_shell_folder(&dir) {
@@ -3079,7 +3085,12 @@ impl Render for Explorer {
             self.invalidate_list();
         }
         self.toolbar_overflow = rust_explorer::settings::toolbar_overflow(
-            logical_width,
+            logical_width
+                - if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+                    128.
+                } else {
+                    0.
+                },
             self.view == ViewMode::Details && !navigation::is_virtual(&self.dir()),
         );
         let t = self.theme;
@@ -3935,6 +3946,19 @@ impl Render for Explorer {
                     ),
             );
         }
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            toolbar = toolbar.child(
+                button("empty-recycle-bin", "清空回收站", t)
+                    .w(ui(120.))
+                    .flex_shrink_0()
+                    .when(self.busy, |d| d.opacity(0.4).cursor_default())
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        if !v.busy {
+                            v.run_shell(shell::Request::EmptyRecycleBin, cx);
+                        }
+                    })),
+            );
+        }
         toolbar = toolbar
             .child(
                 button(
@@ -3992,27 +4016,6 @@ impl Render for Explorer {
                     })),
             );
         root = root.child(toolbar);
-        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
-            root = root.child(
-                div()
-                    .h(ui(40.))
-                    .flex_shrink_0()
-                    .flex()
-                    .items_center()
-                    .px_3()
-                    .border_b_1()
-                    .border_color(rgb(t.border))
-                    .child(
-                        button("empty-recycle-bin", "清空回收站", t).on_click(cx.listener(
-                            |v, _, _, cx| {
-                                if !v.busy {
-                                    v.run_shell(shell::Request::EmptyRecycleBin, cx);
-                                }
-                            },
-                        )),
-                    ),
-            );
-        }
 
         let sidebar = self.render_sidebar(sidebar_width, cx);
 
