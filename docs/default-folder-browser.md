@@ -1,49 +1,85 @@
 # 默认文件夹浏览器（本地未发布）
 
-对照 PR #11 的 `f929129` 实现重新整合。0.7.2 整合时曾依照维护者此前暂缓 #10 的要求移除；本次重新实现安全恢复流程，没有替用户启用，也没有更新 GitHub 或发行版本。
+本功能由 PR #11 的实现重新整合，随后补充命名值备份、系统打开入口兼容、独立恢复进程和实机测试。公开 0.7.2 不包含这些改动；本轮未更新 GitHub、未发版。
 
-## 使用与范围
+## 启用与范围
 
-文件夹选项 → 常规 → **设为默认文件夹浏览器…**。确认后立即生效，不依赖下方“应用”按钮。先将 `rust-explorer.exe` 和依赖放在固定目录，启用期间不要移动、重命名或删除它们。
+文件夹选项 → 常规 → **试用默认文件夹浏览器…**。
 
-仅设置当前用户 `HKCU\Software\Classes\Directory\shell` 和 `Drive\shell` 的默认命令。使用独立的 `RustExplorer.Open` verb，不覆盖系统 `open\command` 或 `DelegateExecute`。不接管 Win+E、通用 Folder 类、控制面板、库、MTP 等虚拟命名空间。系统文件对话框以及明确调用 Explorer 的程序不保证改用 RE。
+先将程序及依赖放在固定位置。确认开始后临时启用，再询问是否保留；**120 秒内未确认，独立进程自动恢复原关联**。选择“否”立即恢复。操作与选项底部“应用”按钮独立。
 
-这是实验性 Shell 关联功能，不能称作 Windows 全局替换 Explorer。启用过程校验注册表写入与读回；本轮未更改真实关联，不能据此宣称已实测用户环境中的默认双击派发。
+只有备份、应急恢复文件和独立恢复进程都准备就绪后，才写入关联。恢复进程使用单独复制的可执行文件及运行库，不依赖原界面继续运行，不继承启动方的管道或锁句柄；同时采用单调时钟限制试用时间。
+
+仅修改当前用户 `HKCU\Software\Classes\Directory\shell`、`Drive\shell` 下的固定项目，不写 HKLM、不申请管理员权限：
+
+- `RustExplorer.Open`：默认入口、菜单图标、`Document` 多选模型。多选数量仍受 Windows 本身限制。
+- `open\command` 默认值及 `DelegateExecute`：兼容外部程序显式调用 `open`，所有原值按原类型、原字节备份。
+- `RustExplorer.SystemExplorer`：完整右键菜单中的“在 Windows 资源管理器中打开”，直接启动系统 Explorer。
+- `shell` 默认值：选用 RE 的独立 verb。
+
+不接管 Explorer 窗口内部导航、Win+E、控制面板、MTP 等虚拟页面。不修改通用 `Folder` 类，不替换桌面 Shell，不拦截 `explorer.exe`，不安装全局键盘钩子。Explorer 内部双击仍使用自身浏览行为；硬编码启动 Explorer 的软件仍可能打开原版。这不是 Windows 的全局 Explorer 替代。
+
+保留的原生入口也提供恢复通道：即使 RE 原文件被误移动，仍可使用系统 Explorer 找到独立恢复程序。
 
 ## 恢复原样
 
-正常恢复：同一页面点击 **恢复原样…**。也可以运行：
+正常方式：文件夹选项 → 常规 → **恢复原样…**，或者运行：
 
 ```powershell
 & '固定安装目录\rust-explorer.exe' --restore-folder-browser
 ```
 
-独立应急恢复文件在：
+原程序无法运行时，独立恢复程序位于：
+
+```text
+%LOCALAPPDATA%\RustExplorer\folder-association\recovery\rust-explorer.exe
+```
+
+直接打开它进入选项恢复，或带 `--restore-folder-browser` 参数运行。界面提供 **打开恢复文件夹** 按钮。
+
+最后的应急方案是用 Windows 注册表编辑器导入：
 
 ```text
 %LOCALAPPDATA%\RustExplorer\folder-association\restore.reg
 ```
 
-即使程序无法启动，也可通过 Windows 注册表编辑器导入这个文件。它只恢复上述固定路径的默认值，不递归删除键。**应急导入会恢复备份时的值**；如果之后安装了其他文件管理器，应先检查内容。正常“恢复原样”会保留其他程序后来写入的不同值，并报告冲突。
+优先使用恢复程序。`.reg` 是备份时的快照，会覆盖对应值，并删除试用新建的具体 verb 键；若后来其他软件修改这些位置，导入前应检查内容。正常恢复程序会保留第三方后来写入的不同值，只删除原来不存在且当前仍为空的键。
 
-备份 `backup.json` 保存原始值的类型和字节，在任何关联写入之前同步落盘，同时生成 UTF-16 恢复文件。重复启用不覆盖原始备份。启用中途失败自动逐项回滚；回滚失败保留恢复文件并报告具体错误。缺失/损坏备份不猜测原配置。恢复成功后保留 `last-restored.json` 供检查。原先不存在的值会被删除；可能留下无默认值的空键，避免误删其他程序的内容。
+备份为同目录的 `backup.json`。重复启用不覆盖最初备份；缺失或损坏备份不猜测原值。失败会尝试回滚，恢复不完整时保留恢复文件并报告错误。恢复成功后保留 `last-restored.json`，解除活动日志。新版兼容上一版六项备份格式。
 
-异常退出可能留下待恢复的日志，页面会显示关联变化/未完成，须先恢复后重试。卸载或搬移程序前必须恢复关联。
+确认永久保留后，搬移、重命名或删除 RE 前仍须先恢复关联；退出软件不会取消已明确保留的设置。
 
-## 设计依据
+## 验证记录
 
-- 微软 [File Types](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)：每用户 Classes 注册及关联变更通知。
-- 微软 [Context menus](https://github.com/MicrosoftDocs/win32/blob/docs/desktop-src/shell/context.md)：shell 默认值指定默认 verb。
-- 微软 [Shell extension registration](https://learn.microsoft.com/en-us/windows/win32/shell/reg-shell-exts)：Directory 与 Folder 范围差异。
+以下实机操作执行于 2026-10-18，2026-10-19 继续收尾并复核恢复状态。
 
-## 本轮验证（2026-10-18）
+- 87 项核心测试、格式检查及桌面全部 target 编译检查通过，优化构建成功。
+- 全部 20 个写入步骤逐一注入失败，检查原类型、原字节恢复；覆盖命名值、第三方冲突、备份损坏、恢复保护未就绪、重复启用及旧备份恢复。
+- 隔离注册表实际写入、恢复，并用 `reg.exe import` 验证 UTF-16 应急文件。
+- `scripts/test_folder_association_guard.py`：启动者退出、原 EXE 暂时移走后仍能超时恢复；确认保留、独立恢复、再次启用和损坏备份保护通过。脚本先验证 debug 隔离根，release 构建会拒绝运行该隔离测试，不会退回真实关联。
 
-- `scripts/check.ps1`：83 项核心测试通过，格式检查、桌面全部 target 编译检查通过。
-- 对每个关联写入步骤注入失败，验证恢复后的原始值（包含原类型）一致；覆盖重复启用不覆盖备份、损坏日志不写注册表、恢复文件生成失败不写注册表、第三方修改冲突保护。
-- 在 `HKCU\Software\RustExplorer\AssociationTests` 隔离目录实际写入/读回/恢复，测试结束清理自有测试键。
-- 用 Windows `reg.exe import` 实际导入指向隔离目录的 UTF-16 恢复文件，确认无须 RE 即可恢复原值。
-- 用 Windows 命令行解析器验证盘符根目录、空格、中文与 UNC 参数；加入 `\.` 避免根路径末尾反斜杠干扰引号。
-- 实际启动优化构建，通过 `--open-folder` 打开自有 fixture；“选项 → 常规”的状态、说明、启用/恢复按钮显示正常且没有溢出，取消选项返回文件列表。
-- 未点击启用确认、未修改实际 Directory/Drive 关联、未测试真实默认双击派发；未更新 GitHub、未发版。后续启用应由维护者在固定安装位置人工确认。
+用户授权后的真实 HKCU 限时接管结果：
 
-旧贡献版本如果已经直接覆盖 `open\command`，本实现会拒绝叠加启用，要求先使用旧备份恢复，避免误把旧接管状态备份为“原样”。
+| 操作 | 结果 |
+| --- | --- |
+| Windows 默认动作打开普通目录 | RE 正常打开 |
+| 中文和空格目录 | 路径、列表正确 |
+| 系统 `.lnk` 文件夹快捷方式 | RE 打开目标目录 |
+| C 盘根目录 | RE 正常显示 |
+| 外部显式 `open` 请求 | RE 正常打开 |
+| 原生 Explorer 回退入口 | 原版正常打开 |
+| Explorer 内部双击 | 保持其自身导航 |
+| 独立程序主动恢复 | 原值核对一致 |
+| 真实关联 5 秒未确认试用 | 独立进程自动恢复，原值一致 |
+| 恢复后 Windows 默认打开 | 原版 Explorer 正常打开 |
+
+初次实测发现 `canonicalize()` 产生的 `\\?\` EXE 路径令 Shell 拒绝访问；已先恢复，再修正为普通 DOS/UNC 命令路径，复测通过。另修复了空键阻止再次启用、子进程继承管道令调用者等待到超时的问题。
+
+本轮核对 Directory、Drive、Folder 的全部非空 HKCU 值，最终保持测试前关联。未测试 Win+E、真实网络共享或手机内部传输；UNC 参数解析由自动测试覆盖。
+
+## 参考
+
+- [File Types](https://learn.microsoft.com/en-us/windows/win32/shell/fa-file-types)：当前用户注册与关联通知。
+- [Verbs and File Associations](https://learn.microsoft.com/en-us/windows/win32/shell/fa-verbs)：命令行及引号。
+- [Verb selection model](https://learn.microsoft.com/en-us/windows/win32/shell/how-to-employ-the-verb-selection-model)：多选模型。
+- [SHChangeNotify](https://learn.microsoft.com/en-us/windows/win32/api/shlobj_core/nf-shlobj_core-shchangenotify)：异步刷新通知。

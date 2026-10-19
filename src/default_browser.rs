@@ -1,4 +1,4 @@
-//! Opt-in, current-user folder associations. Never replace Explorer's open verb.
+//! Opt-in, journaled per-user folder integration with independent recovery.
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -7,9 +7,32 @@ use std::{
     path::PathBuf,
 };
 use windows_registry::{CURRENT_USER, Type};
+#[path = "default_browser_guard.rs"]
+mod guard;
+pub use guard::{confirm_trial, guard_main, trial_pending};
 
 const VERB: &str = "RustExplorer.Open";
+const FALLBACK: &str = "RustExplorer.SystemExplorer";
 const ROOT: &str = "Software\\Classes";
+fn registry_root() -> Result<String> {
+    // Debug-only process tests fail closed; release builds have no override.
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("RUST_EXPLORER_ASSOCIATION_TEST_ROOT") {
+        let root = root.to_str().context("Invalid registry test root")?;
+        let suffix = root
+            .strip_prefix("Software\\RustExplorer\\AssociationTests\\")
+            .context("Unsafe registry test root")?;
+        ensure!(
+            !suffix.is_empty()
+                && suffix
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
+            "Invalid registry test suffix"
+        );
+        return Ok(root.into());
+    }
+    Ok(ROOT.into())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct Raw {
@@ -31,18 +54,56 @@ impl Raw {
 #[derive(Clone, Serialize, Deserialize)]
 struct Change {
     path: String,
+    #[serde(default)]
+    name: String,
     before: Option<Raw>,
     installed: Raw,
+}
+impl Change {
+    fn current(&self, reg: &impl Registry) -> Result<Option<Raw>> {
+        reg.read_named(&self.path, &self.name)
+    }
+    fn write(&self, reg: &impl Registry, value: Option<&Raw>) -> Result<()> {
+        reg.write_named(&self.path, &self.name, value)
+    }
+}
+struct Target {
+    path: String,
+    name: String,
+    installed: Raw,
+}
+fn target(path: String, name: &str, installed: Raw) -> Target {
+    Target {
+        path,
+        name: name.into(),
+        installed,
+    }
 }
 #[derive(Serialize, Deserialize)]
 struct Backup {
     version: u32,
     changes: Vec<Change>,
+    #[serde(default)]
+    created_keys: Vec<String>,
 }
 
 trait Registry {
     fn read(&self, path: &str) -> Result<Option<Raw>>;
     fn write(&self, path: &str, value: Option<&Raw>) -> Result<()>;
+    fn read_named(&self, path: &str, name: &str) -> Result<Option<Raw>> {
+        ensure!(name.is_empty(), "Named registry values unsupported");
+        self.read(path)
+    }
+    fn write_named(&self, path: &str, name: &str, value: Option<&Raw>) -> Result<()> {
+        ensure!(name.is_empty(), "Named registry values unsupported");
+        self.write(path, value)
+    }
+    fn key_exists(&self, _path: &str) -> Result<bool> {
+        Ok(true)
+    }
+    fn remove_empty_key(&self, _path: &str) -> Result<()> {
+        Ok(())
+    }
 }
 struct RegistryStore {
     root: String,
@@ -57,29 +118,58 @@ fn optional<T>(r: windows_registry::Result<T>) -> Result<Option<T>> {
     }
 }
 impl Registry for RegistryStore {
+    fn key_exists(&self, path: &str) -> Result<bool> {
+        Ok(optional(CURRENT_USER.open(format!("{}\\{path}", self.root)))?.is_some())
+    }
+    fn remove_empty_key(&self, path: &str) -> Result<()> {
+        let full = format!("{}\\{path}", self.root);
+        let Some(key) = optional(CURRENT_USER.open(&full))? else {
+            return Ok(());
+        };
+        if key.values()?.next().is_some() || key.keys()?.next().is_some() {
+            return Ok(());
+        }
+        drop(key);
+        use windows::{
+            Win32::System::Registry::{HKEY, RegDeleteKeyW},
+            core::PCWSTR,
+        };
+        let wide: Vec<u16> = full.encode_utf16().chain(Some(0)).collect();
+        let result = unsafe { RegDeleteKeyW(HKEY(CURRENT_USER.as_raw()), PCWSTR(wide.as_ptr())) };
+        if result.0 != 2 {
+            result.ok()?;
+        }
+        Ok(())
+    }
     fn read(&self, path: &str) -> Result<Option<Raw>> {
+        self.read_named(path, "")
+    }
+    fn read_named(&self, path: &str, name: &str) -> Result<Option<Raw>> {
         let Some(key) = optional(CURRENT_USER.open(format!("{}\\{path}", self.root)))? else {
             return Ok(None);
         };
-        Ok(optional(key.get_value(""))?.map(|v| Raw {
+        Ok(optional(key.get_value(name))?.map(|v| Raw {
             ty: v.ty().into(),
             bytes: v.to_vec(),
         }))
     }
     fn write(&self, path: &str, value: Option<&Raw>) -> Result<()> {
+        self.write_named(path, "", value)
+    }
+    fn write_named(&self, path: &str, name: &str, value: Option<&Raw>) -> Result<()> {
         let path = format!("{}\\{path}", self.root);
         if let Some(value) = value {
             CURRENT_USER
                 .create(path)?
-                .set_bytes("", Type::from(value.ty), &value.bytes)?;
+                .set_bytes(name, Type::from(value.ty), &value.bytes)?;
         } else if let Some(key) = optional(CURRENT_USER.options().read().write().open(path))? {
-            optional(key.remove_value(""))?;
+            optional(key.remove_value(name))?;
         }
         // Keep empty keys: recursive deletion could destroy another application's values.
         Ok(())
     }
 }
-fn plan(exe: &std::path::Path) -> Result<Vec<(String, Raw)>> {
+fn plan(exe: &std::path::Path) -> Result<Vec<Target>> {
     ensure!(exe.is_file(), "Application executable is missing");
     ensure!(
         exe.file_name().is_some_and(|n| n
@@ -90,54 +180,140 @@ fn plan(exe: &std::path::Path) -> Result<Vec<(String, Raw)>> {
     let text = exe
         .to_str()
         .context("Executable path is not valid Unicode")?;
+    // Shell execution rejects verbatim \\?\ executable paths even though
+    // CreateProcess accepts them. Register a normal DOS/UNC command path.
+    let text = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        text.strip_prefix(r"\\?\").unwrap_or(text).to_owned()
+    };
     ensure!(
         !text.contains(['"', '\r', '\n', '\0']),
         "Invalid executable path"
     );
     // A trailing dot avoids the Windows argv trailing-backslash/quote ambiguity for C:\.
     let command = Raw::string(&format!("\"{text}\" --open-folder \"%1\\.\""));
+    let explorer = PathBuf::from(std::env::var_os("SystemRoot").context("SystemRoot unavailable")?)
+        .join("explorer.exe");
+    ensure!(
+        explorer.is_file(),
+        "Windows Explorer fallback is unavailable"
+    );
+    let fallback_command = Raw::string(&format!("\"{}\" \"%1\\.\"", explorer.display()));
     let mut values = vec![];
     for class in ["Directory", "Drive"] {
         let shell = format!("{class}\\shell");
         // Install command before selecting the verb; restore reverses this order.
-        values.push((format!("{shell}\\{VERB}\\command"), command.clone()));
-        values.push((
-            format!("{shell}\\{VERB}"),
-            Raw::string("Open in Rust Explorer"),
-        ));
-        values.push((shell, Raw::string(VERB)));
+        values.extend([
+            target(format!("{shell}\\{VERB}\\command"), "", command.clone()),
+            target(
+                format!("{shell}\\{VERB}"),
+                "",
+                Raw::string("在 Rust Explorer 中打开"),
+            ),
+            target(
+                format!("{shell}\\{VERB}"),
+                "Icon",
+                Raw::string(&format!("\"{text}\",0")),
+            ),
+            target(
+                format!("{shell}\\{VERB}"),
+                "MultiSelectModel",
+                Raw::string("Document"),
+            ),
+            target(
+                format!("{shell}\\{FALLBACK}\\command"),
+                "",
+                fallback_command.clone(),
+            ),
+            target(
+                format!("{shell}\\{FALLBACK}"),
+                "",
+                Raw::string("在 Windows 资源管理器中打开"),
+            ),
+            target(
+                format!("{shell}\\{FALLBACK}"),
+                "Icon",
+                Raw::string(&format!("\"{}\",0", explorer.display())),
+            ),
+            target(format!("{shell}\\open\\command"), "", command.clone()),
+            target(
+                format!("{shell}\\open\\command"),
+                "DelegateExecute",
+                Raw::string(""),
+            ),
+            target(shell, "", Raw::string(VERB)),
+        ]);
     }
     Ok(values)
 }
 fn validate(backup: &Backup) -> Result<()> {
     ensure!(
-        backup.version == 1 && backup.changes.len() == 6,
+        (backup.version == 1 && backup.changes.len() == 6)
+            || (backup.version == 2 && backup.changes.len() == 20),
         "Invalid association backup; no registry values were changed"
     );
     let mut expected = vec![];
     for class in ["Directory", "Drive"] {
-        expected.extend([
-            format!("{class}\\shell\\{VERB}\\command"),
-            format!("{class}\\shell\\{VERB}"),
-            format!("{class}\\shell"),
-        ]);
+        let shell = format!("{class}\\shell");
+        if backup.version == 1 {
+            expected.extend([
+                (format!("{shell}\\{VERB}\\command"), ""),
+                (format!("{shell}\\{VERB}"), ""),
+                (shell, ""),
+            ]);
+        } else {
+            expected.extend([
+                (format!("{shell}\\{VERB}\\command"), ""),
+                (format!("{shell}\\{VERB}"), ""),
+                (format!("{shell}\\{VERB}"), "Icon"),
+                (format!("{shell}\\{VERB}"), "MultiSelectModel"),
+                (format!("{shell}\\{FALLBACK}\\command"), ""),
+                (format!("{shell}\\{FALLBACK}"), ""),
+                (format!("{shell}\\{FALLBACK}"), "Icon"),
+                (format!("{shell}\\open\\command"), ""),
+                (format!("{shell}\\open\\command"), "DelegateExecute"),
+                (shell, ""),
+            ]);
+        }
     }
     ensure!(
         backup
             .changes
             .iter()
-            .zip(expected)
-            .all(|(c, p)| c.path == p),
+            .zip(&expected)
+            .all(|(c, (p, n))| &c.path == p && c.name == *n),
         "Association backup paths are invalid"
     );
+    let allowed_keys = key_paths(expected.iter().map(|(p, _)| p.as_str()));
+    ensure!(
+        backup.created_keys.iter().all(|p| allowed_keys.contains(p)),
+        "Invalid created-key recovery paths"
+    );
     Ok(())
+}
+fn key_paths<'a>(paths: impl Iterator<Item = &'a str>) -> Vec<String> {
+    let mut keys = std::collections::BTreeSet::new();
+    for path in paths {
+        let mut current = String::new();
+        for part in path.split('\\') {
+            if !current.is_empty() {
+                current.push('\\');
+            }
+            current.push_str(part);
+            keys.insert(current.clone());
+        }
+    }
+    let mut keys: Vec<_> = keys.into_iter().collect();
+    keys.sort_by_key(|p| p.matches('\\').count());
+    keys
 }
 fn restore(reg: &impl Registry, backup: &Backup) -> Result<()> {
     validate(backup)?;
     let mut errors = vec![];
     for c in backup.changes.iter().rev() {
         let result = (|| -> Result<()> {
-            let current = reg.read(&c.path)?;
+            let current = c.current(reg)?;
             if current == c.before {
                 return Ok(());
             }
@@ -146,9 +322,9 @@ fn restore(reg: &impl Registry, backup: &Backup) -> Result<()> {
                 "Value changed by another program; preserved: {}",
                 c.path
             );
-            reg.write(&c.path, c.before.as_ref())?;
+            c.write(reg, c.before.as_ref())?;
             ensure!(
-                reg.read(&c.path)? == c.before,
+                c.current(reg)? == c.before,
                 "Restore verification failed: {}",
                 c.path
             );
@@ -158,18 +334,23 @@ fn restore(reg: &impl Registry, backup: &Backup) -> Result<()> {
             errors.push(e.to_string());
         }
     }
+    for path in backup.created_keys.iter().rev() {
+        if let Err(e) = reg.remove_empty_key(path) {
+            errors.push(format!("Empty-key recovery: {path}: {e}"));
+        }
+    }
     ensure!(errors.is_empty(), "{}", errors.join("; "));
     Ok(())
 }
 fn install(reg: &impl Registry, backup: &Backup) -> Result<()> {
     for c in &backup.changes {
         ensure!(
-            reg.read(&c.path)? == c.before,
+            c.current(reg)? == c.before,
             "Association changed while preparing; aborting"
         );
-        reg.write(&c.path, Some(&c.installed))?;
+        c.write(reg, Some(&c.installed))?;
         ensure!(
-            reg.read(&c.path)?.as_ref() == Some(&c.installed),
+            c.current(reg)?.as_ref() == Some(&c.installed),
             "Association verification failed"
         );
     }
@@ -211,10 +392,15 @@ fn recovery_reg(backup: &Backup, root: &str) -> String {
     );
     for c in backup.changes.iter().rev() {
         text.push_str(&format!("\r\n[HKEY_CURRENT_USER\\{root}\\{}]\r\n", c.path));
+        let value_name = if c.name.is_empty() {
+            "@".to_owned()
+        } else {
+            format!("\"{}\"", c.name)
+        };
         match &c.before {
-            None => text.push_str("@=-\r\n"),
+            None => text.push_str(&format!("{value_name}=-\r\n")),
             Some(v) => {
-                text.push_str(&format!("@=hex({:x}):", v.ty));
+                text.push_str(&format!("{value_name}=hex({:x}):", v.ty));
                 for (i, byte) in v.bytes.iter().enumerate() {
                     if i != 0 {
                         text.push(',');
@@ -228,6 +414,14 @@ fn recovery_reg(backup: &Backup, root: &str) -> String {
             }
         }
     }
+    // Emergency import is a snapshot restore. The normal helper instead checks
+    // for foreign values and removes only still-empty, originally absent keys.
+    text.push_str("\r\n; Remove only verb keys that did not exist before this trial.\r\n; Prefer the recovery helper if another program changed these keys later.\r\n");
+    for path in backup.created_keys.iter().rev() {
+        if path.contains("\\shell\\") {
+            text.push_str(&format!("[-HKEY_CURRENT_USER\\{root}\\{path}]\r\n"));
+        }
+    }
     text
 }
 fn durable_create(path: PathBuf, bytes: &[u8]) -> Result<()> {
@@ -237,14 +431,24 @@ fn durable_create(path: PathBuf, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 fn notify_shell() {
+    if registry_root().is_ok_and(|root| root != ROOT) {
+        return;
+    }
     use windows::Win32::UI::Shell::*;
     unsafe {
-        SHChangeNotify(SHCNE_ASSOCCHANGED, SHCNF_IDLIST, None, None);
+        SHChangeNotify(
+            SHCNE_ASSOCCHANGED,
+            SHCNF_IDLIST | SHCNF_FLUSHNOWAIT,
+            None,
+            None,
+        );
     }
 }
 pub fn status() -> Result<String> {
     let dir = recovery_directory()?;
-    let reg = RegistryStore { root: ROOT.into() };
+    let reg = RegistryStore {
+        root: registry_root()?,
+    };
     if !dir.join("backup.json").exists() {
         for class in ["Directory", "Drive"] {
             ensure!(
@@ -256,15 +460,32 @@ pub fn status() -> Result<String> {
     }
     let backup = read_backup(&dir)?;
     for c in &backup.changes {
-        if reg.read(&c.path)?.as_ref() != Some(&c.installed) {
+        if c.current(&reg)?.as_ref() != Some(&c.installed) {
             return Ok("关联已变化或操作未完成，请先恢复原样".into());
         }
+    }
+    if trial_pending() {
+        return Ok("临时试用中，未确认保留将自动恢复".into());
     }
     Ok("已启用普通文件夹和驱动器关联".into())
 }
 pub fn enable() -> Result<()> {
+    begin_trial(120)
+}
+/// Begin a time-limited association trial guarded by an independent process.
+pub fn begin_trial(seconds: u64) -> Result<()> {
+    ensure!(
+        (5..=180).contains(&seconds),
+        "Trial duration must be 5..180 seconds"
+    );
     let (dir, _lock) = lock()?;
-    let reg = RegistryStore { root: ROOT.into() };
+    ensure!(
+        !dir.join("trial.json").exists(),
+        "已有待确认试用，请先确认保留或恢复原样"
+    );
+    let reg = RegistryStore {
+        root: registry_root()?,
+    };
     // Older contributor builds overwrote open\command directly. Do not layer a
     // new journal over that state and later call it a restoration of Explorer.
     if !dir.join("backup.json").exists() {
@@ -285,34 +506,83 @@ pub fn enable() -> Result<()> {
         }
     }
     for class in ["Directory", "Drive"] {
-        let verb = format!("{ROOT}\\{class}\\shell\\{VERB}");
-        ensure!(
-            dir.join("backup.json").exists() || optional(CURRENT_USER.open(verb))?.is_none(),
-            "Existing Rust Explorer verb has no recovery journal; refusing to overwrite"
-        );
+        for owned_verb in [VERB, FALLBACK] {
+            let verb = format!("{}\\{class}\\shell\\{owned_verb}", reg.root);
+            ensure!(
+                dir.join("backup.json").exists() || reusable_verb(&verb)?,
+                "Existing Rust Explorer verb has no recovery journal; refusing to overwrite"
+            );
+        }
     }
-    let result = enable_at(&reg, &dir, &std::env::current_exe()?.canonicalize()?);
+    let result = enable_prepared(
+        &reg,
+        &dir,
+        &std::env::current_exe()?.canonicalize()?,
+        || guard::start(&dir, seconds),
+    );
     notify_shell();
     result
 }
+fn reusable_verb(path: &str) -> Result<bool> {
+    let Some(key) = optional(CURRENT_USER.open(path))? else {
+        return Ok(true);
+    };
+    if key.values()?.next().is_some() {
+        return Ok(false);
+    }
+    for child in key.keys()? {
+        if !child.eq_ignore_ascii_case("command") {
+            return Ok(false);
+        }
+        let command = key.open(child)?;
+        if command.values()?.next().is_some() || command.keys()?.next().is_some() {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+#[cfg(test)]
 fn enable_at(reg: &impl Registry, dir: &std::path::Path, exe: &std::path::Path) -> Result<()> {
+    enable_prepared(reg, dir, exe, || Ok(()))
+}
+fn enable_prepared(
+    reg: &impl Registry,
+    dir: &std::path::Path,
+    exe: &std::path::Path,
+    ready: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     let values = plan(exe)?;
     if dir.join("backup.json").exists() {
         let b = read_backup(dir)?;
-        if b.changes.iter().zip(&values).all(|(c, (_, desired))| {
-            c.installed == *desired
-                && reg
-                    .read(&c.path)
-                    .is_ok_and(|v| v.as_ref() == Some(&c.installed))
-        }) {
+        if b.changes.len() == values.len()
+            && b.changes.iter().zip(&values).all(|(c, desired)| {
+                c.installed == desired.installed
+                    && c.name == desired.name
+                    && c.path == desired.path
+                    && reg
+                        .read_named(&c.path, &c.name)
+                        .is_ok_and(|v| v.as_ref() == Some(&c.installed))
+            })
+        {
             return Ok(());
         }
         bail!("Existing backup found; restore original associations first");
     }
     let mut changes = vec![];
-    for (path, installed) in values {
-        let before = reg.read(&path)?;
-        if path.contains(VERB) {
+    let mut created_keys = vec![];
+    for path in key_paths(values.iter().map(|v| v.path.as_str())) {
+        if !reg.key_exists(&path)? {
+            created_keys.push(path);
+        }
+    }
+    for Target {
+        path,
+        name,
+        installed,
+    } in values
+    {
+        let before = reg.read_named(&path, &name)?;
+        if path.contains(VERB) || path.contains(FALLBACK) {
             ensure!(
                 before.is_none(),
                 "Rust Explorer verb already exists without a backup; refusing to overwrite"
@@ -320,26 +590,29 @@ fn enable_at(reg: &impl Registry, dir: &std::path::Path, exe: &std::path::Path) 
         }
         changes.push(Change {
             path,
+            name,
             before,
             installed,
         });
     }
     let backup = Backup {
-        version: 1,
+        version: 2,
         changes,
+        created_keys,
     };
     durable_create(
         dir.join("backup.json"),
         &serde_json::to_vec_pretty(&backup)?,
     )?;
     let recovery: Vec<u8> = std::iter::once(0xfeffu16)
-        .chain(recovery_reg(&backup, ROOT).encode_utf16())
+        .chain(recovery_reg(&backup, &registry_root()?).encode_utf16())
         .flat_map(u16::to_le_bytes)
         .collect();
     // No registry writes until BOTH recovery files are safely on disk.
     if let Err(e) = durable_create(dir.join("restore.reg"), &recovery) {
         return Err(e.context("Recovery file could not be saved; associations unchanged"));
     }
+    ready().context("独立恢复保护未就绪，未修改任何关联")?;
     if let Err(e) = install(reg, &backup) {
         let rollback = restore(reg, &backup);
         return match rollback {
@@ -372,8 +645,16 @@ pub fn folder_argument(path: &std::path::Path) -> Result<PathBuf> {
 }
 pub fn disable() -> Result<()> {
     let (dir, _lock) = lock()?;
-    let backup = read_backup(&dir)?;
-    let restored = restore(&RegistryStore { root: ROOT.into() }, &backup);
+    disable_at(&dir)
+}
+fn disable_at(dir: &std::path::Path) -> Result<()> {
+    let backup = read_backup(dir)?;
+    let restored = restore(
+        &RegistryStore {
+            root: registry_root()?,
+        },
+        &backup,
+    );
     notify_shell();
     restored?;
     // Retain an archived copy for inspection, freeing the active journal only on success.
@@ -382,7 +663,41 @@ pub fn disable() -> Result<()> {
         fs::remove_file(dir.join("restore.reg"))?;
     }
     fs::remove_file(dir.join("backup.json"))?;
+    guard::clear(dir)?;
     Ok(())
+}
+
+/// Query Windows' merged association view, rather than reporting only our HKCU writes.
+pub fn diagnostics() -> Result<serde_json::Value> {
+    use windows::{
+        Win32::UI::Shell::*,
+        core::{PCWSTR, PWSTR},
+    };
+    let mut commands = serde_json::Map::new();
+    for class in ["Directory", "Drive"] {
+        let class_w: Vec<u16> = class.encode_utf16().chain(Some(0)).collect();
+        let mut buf = vec![0u16; 32768];
+        let mut count = buf.len() as u32;
+        let hr = unsafe {
+            AssocQueryStringW(
+                ASSOCF_NONE,
+                ASSOCSTR_COMMAND,
+                PCWSTR(class_w.as_ptr()),
+                PCWSTR::null(),
+                Some(PWSTR(buf.as_mut_ptr())),
+                &mut count,
+            )
+        };
+        let value = if hr.is_ok() {
+            String::from_utf16_lossy(&buf[..buf.iter().position(|n| *n == 0).unwrap_or(buf.len())])
+        } else {
+            format!("Unavailable: {hr:?}")
+        };
+        commands.insert(class.into(), value.into());
+    }
+    Ok(
+        serde_json::json!({"status": status()?, "recovery_directory": recovery_directory()?, "registry_scope": registry_root()?, "trial": trial_pending(), "shell_commands": commands}),
+    )
 }
 
 #[cfg(test)]
@@ -413,6 +728,12 @@ mod tests {
             }
             Ok(())
         }
+        fn read_named(&self, p: &str, name: &str) -> Result<Option<Raw>> {
+            self.read(&format!("{p}\0{name}"))
+        }
+        fn write_named(&self, p: &str, name: &str, value: Option<&Raw>) -> Result<()> {
+            self.write(&format!("{p}\0{name}"), value)
+        }
     }
     fn backup() -> Backup {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -429,29 +750,40 @@ mod tests {
             .unwrap()
             .into_iter()
             .enumerate()
-            .map(|(i, (path, installed))| Change {
-                path,
-                installed,
-                before: (i % 3 == 2).then(|| Raw {
-                    ty: 2,
-                    bytes: vec![65, 0, 0, 0],
-                }),
-            })
+            .map(
+                |(
+                    i,
+                    Target {
+                        path,
+                        name,
+                        installed,
+                    },
+                )| Change {
+                    path,
+                    name,
+                    installed,
+                    before: (i % 3 == 2).then(|| Raw {
+                        ty: 2,
+                        bytes: vec![65, 0, 0, 0],
+                    }),
+                },
+            )
             .collect();
         fs::remove_file(&exe).unwrap();
         fs::remove_dir(exe.parent().unwrap()).unwrap();
         Backup {
-            version: 1,
+            version: 2,
             changes,
+            created_keys: vec![],
         }
     }
     #[test]
     fn every_failed_write_rolls_back_exactly() {
         let b = backup();
-        for fail in 1..=6 {
+        for fail in 1..=b.changes.len() {
             let reg = Memory::default();
             for c in &b.changes {
-                reg.write(&c.path, c.before.as_ref()).unwrap();
+                c.write(&reg, c.before.as_ref()).unwrap();
             }
             let original = reg.values.borrow().clone();
             reg.writes.set(0);
@@ -466,13 +798,13 @@ mod tests {
         let mut b = backup();
         let reg = Memory::default();
         for c in &b.changes {
-            reg.write(&c.path, c.before.as_ref()).unwrap();
+            c.write(&reg, c.before.as_ref()).unwrap();
         }
         install(&reg, &b).unwrap();
         let foreign = Raw::string("OtherBrowser");
-        reg.write(&b.changes[2].path, Some(&foreign)).unwrap();
+        b.changes[9].write(&reg, Some(&foreign)).unwrap();
         assert!(restore(&reg, &b).is_err());
-        assert_eq!(reg.read(&b.changes[2].path).unwrap(), Some(foreign));
+        assert_eq!(b.changes[9].current(&reg).unwrap(), Some(foreign));
         b.changes[0].path = "Unrelated".into();
         assert!(restore(&reg, &b).is_err());
     }
@@ -485,12 +817,12 @@ mod tests {
         );
         let reg = RegistryStore { root: root.clone() };
         for c in &b.changes {
-            reg.write(&c.path, c.before.as_ref()).unwrap();
+            c.write(&reg, c.before.as_ref()).unwrap();
         }
         install(&reg, &b).unwrap();
         restore(&reg, &b).unwrap();
         for c in &b.changes {
-            assert_eq!(reg.read(&c.path).unwrap(), c.before);
+            assert_eq!(c.current(&reg).unwrap(), c.before);
         }
         // This root is an isolated fixture, never Software\Classes.
         CURRENT_USER.remove_tree(root).unwrap();
@@ -593,7 +925,7 @@ mod tests {
         let reg = RegistryStore { root: root.clone() };
         let b = backup();
         for c in &b.changes {
-            reg.write(&c.path, c.before.as_ref()).unwrap();
+            c.write(&reg, c.before.as_ref()).unwrap();
         }
         install(&reg, &b).unwrap();
         let path = std::env::temp_dir().join(format!("re-restore-test-{}.reg", std::process::id()));
@@ -610,9 +942,88 @@ mod tests {
             .unwrap();
         assert!(output.status.success(), "reg import failed: {:?}", output);
         for c in &b.changes {
-            assert_eq!(reg.read(&c.path).unwrap(), c.before);
+            assert_eq!(c.current(&reg).unwrap(), c.before);
         }
         CURRENT_USER.remove_tree(root).unwrap();
         fs::remove_file(path).unwrap();
+    }
+    #[test]
+    fn empty_restored_verb_can_be_reused_but_foreign_metadata_cannot() {
+        let path = format!(
+            "Software\\RustExplorer\\AssociationTests\\empty-{}",
+            std::process::id()
+        );
+        let command = CURRENT_USER.create(format!("{path}\\command")).unwrap();
+        assert!(reusable_verb(&path).unwrap());
+        command
+            .set_string("DelegateExecute", "other handler")
+            .unwrap();
+        assert!(!reusable_verb(&path).unwrap());
+        command.remove_value("DelegateExecute").unwrap();
+        assert!(reusable_verb(&path).unwrap());
+        CURRENT_USER.remove_tree(path).unwrap();
+    }
+    #[test]
+    fn guard_readiness_failure_never_modifies_registry() {
+        let dir = std::env::temp_dir().join(format!("re-guard-failure-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let exe = dir.join("rust-explorer.exe");
+        fs::write(&exe, b"fixture").unwrap();
+        let reg = Memory::default();
+        assert!(enable_prepared(&reg, &dir, &exe, || bail!("guard failed")).is_err());
+        assert_eq!(reg.writes.get(), 0);
+        assert!(read_backup(&dir).is_ok());
+        assert!(dir.join("restore.reg").is_file());
+        for file in ["rust-explorer.exe", "backup.json", "restore.reg"] {
+            fs::remove_file(dir.join(file)).unwrap();
+        }
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn registered_executable_uses_shell_compatible_path() {
+        let dir = std::env::temp_dir().join(format!("re-shell-path-{}", std::process::id()));
+        fs::create_dir(&dir).unwrap();
+        let exe = dir.join("rust-explorer.exe");
+        fs::write(&exe, b"fixture").unwrap();
+        let values = plan(&exe.canonicalize().unwrap()).unwrap();
+        let command = String::from_utf16(
+            &values[0]
+                .installed
+                .bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert!(!command.contains(r"\\?\"));
+        assert!(command.starts_with(&format!("\"{}\"", exe.display())));
+        fs::remove_file(exe).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+    #[test]
+    fn version_one_backup_remains_restorable_and_names_are_whitelisted() {
+        let mut b = backup();
+        b.changes = b
+            .changes
+            .into_iter()
+            .enumerate()
+            .filter_map(|(i, c)| [0, 1, 9, 10, 11, 19].contains(&i).then_some(c))
+            .collect();
+        b.version = 1;
+        let mut json = serde_json::to_value(&b).unwrap();
+        for c in json["changes"].as_array_mut().unwrap() {
+            c.as_object_mut().unwrap().remove("name");
+        }
+        json.as_object_mut().unwrap().remove("created_keys");
+        let mut old: Backup = serde_json::from_value(json).unwrap();
+        validate(&old).unwrap();
+        let reg = Memory::default();
+        for c in &old.changes {
+            c.write(&reg, c.before.as_ref()).unwrap();
+        }
+        install(&reg, &old).unwrap();
+        restore(&reg, &old).unwrap();
+        old.changes[0].name = "OtherValue".into();
+        assert!(validate(&old).is_err());
     }
 }

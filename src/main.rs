@@ -13,6 +13,18 @@ fn main() {
         }
     }
     let result = match args.get(1).map(String::as_str) {
+        Some("--folder-association-guard") => rust_explorer::default_browser::guard_main(
+            args.get(2).map(String::as_str).unwrap_or(""),
+        ),
+        Some("--test-folder-browser") => rust_explorer::default_browser::begin_trial(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(120),
+        ),
+        Some("--confirm-folder-browser") => rust_explorer::default_browser::confirm_trial(),
+        Some("--folder-association-status") => rust_explorer::default_browser::diagnostics()
+            .and_then(|v| {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                Ok(())
+            }),
         Some("--restore-folder-browser") => rust_explorer::default_browser::disable(),
         Some("--shell-parent") => (|| -> anyhow::Result<()> {
             let path: std::path::PathBuf =
