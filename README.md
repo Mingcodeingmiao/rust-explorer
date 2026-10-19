@@ -7,7 +7,9 @@
 
 使用 **Rust + GPUI** 编写的 Windows 原生文件管理器，支持多标签、系统右键菜单、缩略图和预览，无需浏览器或 WebView2 运行时。
 
-**当前版本为 0.7.3。** 新增可恢复的实验性默认文件夹关联、内部回收站、启动页与标签页设置，并改进地址栏、系统图标、文件操作和小窗口菜单。详见 [0.7.3 更新说明](docs/v0.7.3.md)。MTP/WPD 设备传输仍可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
+<p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
+
+**当前版本为 0.7.4。** 本次为维护版本：修复审计发现的 Shell/COM 使用缺陷（快捷方式与 junction 缩略图、盘根拖放自包含校验、MTP 属性页、卷信息错误模式、已知文件夹内存释放），把右键菜单改为常驻 Shell 宿主从而大幅降低弹出延迟，并修复 Windows 上 `cargo test` 无法启动的问题。详见 [0.7.4 更新说明](docs/v0.7.4.md)。0.7.3 引入的可恢复实验性默认文件夹关联、内部回收站、启动页与标签页设置保持不变；MTP/WPD 设备传输仍可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -28,7 +30,7 @@
 
 从 [Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) 下载 Windows x64 ZIP，**完整解压**后运行 `rust-explorer.exe`，通常无需管理员权限。发行文件目前未签名，请比对同版本 `SHA256SUMS.txt`。
 
-Everything 集成需要已安装、可用的 Everything 客户端。不接管 Win+E。0.7.3 的“默认文件夹浏览器”需在常规选项中主动试用，仅关联普通文件夹和驱动器，包含原值备份、120 秒试用保护和恢复入口，详见[使用与恢复说明](docs/default-folder-browser.md)。安装或启动不会自动开启关联。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
+Everything 集成需要已安装、可用的 Everything 客户端。不接管 Win+E。默认文件夹浏览器（0.7.3 起）需在常规选项中主动试用，仅关联普通文件夹和驱动器，包含原值备份、120 秒试用保护和恢复入口，详见[使用与恢复说明](docs/default-folder-browser.md)。安装或启动不会自动开启关联。配置与图像缓存位于 `%LOCALAPPDATA%\RustExplorer`。
 
 ## 从源码构建
 
@@ -61,7 +63,7 @@ Debug 构建省略 `-Release`。MSYS2 UCRT64 用户安装 `stable-x86_64-pc-wind
 - [贡献指南](CONTRIBUTING.md)、[行为准则](CODE_OF_CONDUCT.md)、[安全报告](SECURITY.md)
 - [快捷键](docs/explorer-shortcuts.md)、[架构](docs/architecture.md)、[撤销/重做](docs/file-history-062.md)
 - [原生预览](docs/native-previews.md)、[系统图标](docs/system-icons.md)、[运行时资源](docs/fluent-icons.md)
-- [0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
+- [0.7.4 更新说明](docs/v0.7.4.md)、[0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
 
 欢迎通过 Issue 模板报告可复现问题，提供版本、Windows build、DPI/缩放、主题和查看模式；上传前移除个人路径及敏感内容。
 

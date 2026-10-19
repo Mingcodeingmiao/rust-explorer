@@ -2,6 +2,27 @@
 
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
+## [0.7.4] - 2026-10-19
+
+See [complete release notes](docs/v0.7.4.md) and the [roadmap](ROADMAP.md).
+
+### Fixed
+
+- Junction and directory-symlink thumbnails were always rejected as "file changed": the identity check followed reparse points while the entry itself was built from `symlink_metadata`.
+- Drive-root drop containment: a canonicalized root (`\\?\C:\`) carries a trailing separator, so the string-prefix check let a drive root be dropped into its own subfolder.
+- Portable-device (MTP) property sheets were opened without holding an STA and without a message pump, so they could close immediately or never appear.
+- Volume queries now install `SEM_FAILCRITICALERRORS` before the first call and restore the previous mode; `DRIVE_UNKNOWN`/`DRIVE_NO_ROOT_DIR` are reported as unknown/disconnected instead of "local disk".
+- `SHGetKnownFolderPath` results are released even when the string conversion fails.
+- Multi-selection context menus no longer reject a shared parent folder that differs only in letter case.
+
+### Performance
+
+- Context menus are served by one long-lived STA helper that keeps third-party Shell extensions loaded. Measured menu display: 346-475 ms per invocation before, 315 ms for the first menu and 61-77 ms afterwards. A `GetCommandString` cache removes two redundant passes per menu. The helper exits together with its parent process.
+
+### Build
+
+- `cargo test` runs on Windows again: the embedded application manifest (ComCtl32 v6) is now linked into every target, so the `TaskDialogIndirect` import that gpui pulls in resolves in test binaries. Core suite: 96 passed, 1 ignored.
+
 ## [0.7.3] - 2026-10-19
 
 See [complete release notes](docs/v0.7.3.md) and the [roadmap](ROADMAP.md).

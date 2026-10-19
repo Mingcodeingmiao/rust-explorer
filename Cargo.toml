@@ -1,6 +1,6 @@
 [package]
 name = "rust-explorer"
-version = "0.7.3"
+version = "0.7.4"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Windows file manager built with Rust and GPUI"

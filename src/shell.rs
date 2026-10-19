@@ -221,7 +221,170 @@ fn read_bounded(mut input: impl std::io::Read, limit: usize) -> Result<Vec<u8>> 
     }
     Ok(bytes)
 }
+/// Context menus are answered by a persistent STA helper. A cold
+/// `QueryContextMenu` costs ~250 ms because every registered Shell extension has
+/// to be loaded into a fresh process; the same call costs ~44 ms once they are
+/// warm. Every other request keeps the isolated one-shot helper so a misbehaving
+/// extension can never outlive a single operation.
+static MENU_HOST: std::sync::Mutex<Option<MenuHost>> = std::sync::Mutex::new(None);
+const MENU_HOST_DONE: &str = "@@done";
+const MENU_HOST_ERROR: &str = "@@err:";
+
+struct MenuHost {
+    child: std::process::Child,
+    input: std::process::ChildStdin,
+    replies: std::sync::mpsc::Receiver<String>,
+}
+impl MenuHost {
+    fn start() -> Result<Self> {
+        use std::{io::BufRead, os::windows::process::CommandExt, process::Stdio};
+        let mut child = std::process::Command::new(std::env::current_exe()?)
+            .arg("--shell-server")
+            .arg(std::process::id().to_string())
+            .creation_flags(0x08000000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let input = child.stdin.take().context("菜单宿主输入不可用")?;
+        let stdout = child.stdout.take().context("菜单宿主输出不可用")?;
+        let (sender, replies) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self {
+            child,
+            input,
+            replies,
+        })
+    }
+    fn send(&mut self, payload: &str) -> Result<()> {
+        use std::io::Write;
+        writeln!(self.input, "{payload}")?;
+        self.input.flush()?;
+        Ok(())
+    }
+    /// Collect one response frame: everything up to the `@@done` marker.
+    fn response(&mut self) -> Result<String> {
+        let mut collected = String::new();
+        loop {
+            let line = self
+                .replies
+                .recv()
+                .map_err(|_| anyhow::anyhow!("菜单宿主已退出"))?;
+            if line == MENU_HOST_DONE {
+                return Ok(collected.trim().to_string());
+            }
+            if let Some(message) = line.strip_prefix(MENU_HOST_ERROR) {
+                bail!("{message}");
+            }
+            if !line.is_empty() {
+                if !collected.is_empty() {
+                    collected.push('\n');
+                }
+                collected.push_str(&line);
+            }
+        }
+    }
+}
+impl Drop for MenuHost {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+fn is_menu_request(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::Menu { .. } | Request::ThemedMenu { .. } | Request::ComputerMenu { .. }
+    )
+}
+/// Exit this helper as soon as its parent process disappears.
+///
+/// A menu host can sit inside `TrackPopupMenuEx`, where it cannot observe a
+/// closed stdin pipe, so without this it would outlive its parent as an orphan
+/// holding a live modal menu. Waiting on the parent handle turns that into a
+/// clean process exit.
+pub fn watch_parent_process(pid: u32) {
+    std::thread::spawn(move || unsafe {
+        use windows::Win32::System::Threading::{
+            OpenProcess, WaitForSingleObject, INFINITE, PROCESS_SYNCHRONIZE,
+        };
+        if let Ok(parent) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) {
+            WaitForSingleObject(parent, INFINITE);
+            let _ = windows::Win32::Foundation::CloseHandle(parent);
+            std::process::exit(0);
+        }
+    });
+}
+
+/// `--shell-server`: long-lived STA helper. One JSON request per stdin line,
+/// answered with a single `@@done`/`@@err:` marker line after any command output.
+pub fn serve_menu_requests() -> Result<()> {
+    use std::io::{BufRead, Write};
+    // Hold one STA reference for the whole session so Shell handlers stay loaded.
+    let _com = Com::new()?;
+    let mut out = std::io::stdout();
+    for line in std::io::stdin().lock().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let request: Request = match serde_json::from_str(&line) {
+            Ok(request) => request,
+            Err(error) => {
+                writeln!(out, "{MENU_HOST_ERROR}无效请求：{error}")?;
+                out.flush()?;
+                continue;
+            }
+        };
+        if !is_menu_request(&request) {
+            writeln!(out, "{MENU_HOST_ERROR}该服务只处理菜单请求")?;
+            out.flush()?;
+            continue;
+        }
+        match dispatch(request) {
+            Ok(()) => writeln!(out, "{MENU_HOST_DONE}")?,
+            Err(error) => writeln!(out, "{MENU_HOST_ERROR}{error:#}")?,
+        }
+        out.flush()?;
+    }
+    Ok(())
+}
+fn execute_menu_output(request: Request) -> Result<String> {
+    let payload = serde_json::to_string(&request)?;
+    let mut guard = MENU_HOST
+        .lock()
+        .map_err(|_| anyhow::anyhow!("菜单宿主不可用"))?;
+    if guard.is_none() {
+        *guard = MenuHost::start().ok();
+    }
+    if let Some(active) = guard.as_mut() {
+        unsafe {
+            let _ = AllowSetForegroundWindow(active.child.id());
+        }
+        if active.send(&payload).is_ok() {
+            if let Ok(response) = active.response() {
+                return Ok(response);
+            }
+        }
+    }
+    *guard = None;
+    drop(guard);
+    execute_one_shot(request)
+}
 pub fn execute_output(request: Request) -> Result<String> {
+    if is_menu_request(&request) {
+        return execute_menu_output(request);
+    }
+    execute_one_shot(request)
+}
+fn execute_one_shot(request: Request) -> Result<String> {
     use std::{io::Write, process::Stdio};
     let pin_deadline = matches!(&request, Request::QuickAccessPin { .. });
     let payload = serde_json::to_vec(&request)?;
@@ -416,16 +579,16 @@ pub fn dispatch(request: Request) -> Result<()> {
                 Some(std::fs::canonicalize(&destination)?)
             };
             if let Some(target) = &target {
-                let target_key = target.to_string_lossy().to_lowercase();
                 // Resolve junctions before rejecting a drop onto itself or a descendant.
+                // Compare canonical paths component-wise: a drive root canonicalizes to
+                // `\\?\C:\` (trailing separator), so string prefixes silently miss it.
                 for path in paths
                     .iter()
                     .filter(|path| !crate::shell_folder::is_shell_path(path))
                 {
                     let source = std::fs::canonicalize(path)?;
-                    let key = source.to_string_lossy().to_lowercase();
                     anyhow::ensure!(
-                        target_key != key && !target_key.starts_with(&(key + "\\")),
+                        !target.starts_with(&source),
                         "不能将项目放入自身或其子文件夹"
                     );
                 }
@@ -885,7 +1048,7 @@ pub fn properties_many(paths: &[PathBuf]) -> Result<()> {
 }
 // Property sheets are modeless and can be created after ShellExecuteEx returns.
 // Keep the isolated STA alive and dispatch messages until its sheets close.
-unsafe fn pump_property_windows() {
+pub(crate) unsafe fn pump_property_windows() {
     unsafe extern "system" fn count(hwnd: HWND, param: LPARAM) -> BOOL {
         let mut pid = 0;
         unsafe {
@@ -941,9 +1104,11 @@ pub fn drives() -> Vec<PathBuf> {
 pub fn known_folder(id: &windows::core::GUID) -> Option<PathBuf> {
     unsafe {
         let p = SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, None).ok()?;
-        let path = PathBuf::from(p.to_string().ok()?);
+        // Release the COM string before any early return: `to_string` can fail on
+        // malformed UTF-16 and would otherwise leak the CoTaskMem allocation.
+        let text = p.to_string();
         CoTaskMemFree(Some(p.0.cast()));
-        Some(path)
+        Some(PathBuf::from(text.ok()?))
     }
 }
 pub fn places() -> Vec<(String, PathBuf)> {
@@ -1413,6 +1578,30 @@ fn is_start_pin_verb(verb: &str) -> bool {
     )
 }
 
+/// Per-menu cache for `GetCommandString`. A rich context menu queries the same
+/// command ids three times (insert position, host-verb filtering, selected verb);
+/// every miss is a cross-module call into a third-party handler.
+struct VerbCache<'a> {
+    menu: &'a IContextMenu,
+    cache: std::collections::HashMap<u32, String>,
+}
+impl<'a> VerbCache<'a> {
+    fn new(menu: &'a IContextMenu) -> Self {
+        Self {
+            menu,
+            cache: std::collections::HashMap::new(),
+        }
+    }
+    fn verb(&mut self, command: u32) -> String {
+        if let Some(value) = self.cache.get(&command) {
+            return value.clone();
+        }
+        let value = canonical_verb(self.menu, command);
+        self.cache.insert(command, value.clone());
+        value
+    }
+}
+
 fn start_pin_failure(error: windows::core::Error) -> anyhow::Error {
     if error.code() == windows::core::HRESULT(0x80070005u32 as i32) {
         anyhow::anyhow!(
@@ -1518,7 +1707,12 @@ fn context_menu_options(
             }
             let parent: IShellFolder = SHBindToParent(items[0].0, None)?;
             // Cross-folder selections are exposed through IShellItemArray's data object.
-            let same_parent = paths.iter().all(|p| p.parent() == paths[0].parent());
+            let first_parent = paths[0]
+                .parent()
+                .map(|parent| parent.to_string_lossy().to_lowercase());
+            let same_parent = paths.iter().all(|p| {
+                p.parent().map(|parent| parent.to_string_lossy().to_lowercase()) == first_parent
+            });
             if !same_parent {
                 bail!("跨目录多选菜单请先打开所在位置；复制/移动/删除仍支持跨目录多选");
             }
@@ -1538,12 +1732,13 @@ fn context_menu_options(
         )
         .ok()?;
         MENU.with(|v| *v.borrow_mut() = Some(menu.clone()));
+        let mut verbs = VerbCache::new(&menu);
         if let Some(options) = &mut options {
             options.folder = !paths.is_empty() && paths.iter().any(|path| is_folder(path));
             options.folder_insert = if options.folder {
                 (0..GetMenuItemCount(Some(popup.0)))
                     .find(|position| {
-                        canonical_verb(&menu, GetMenuItemID(popup.0, *position)) == "open"
+                        verbs.verb(GetMenuItemID(popup.0, *position)) == "open"
                     })
                     .map(|position| position as u32 + 1)
                     .unwrap_or(0)
@@ -1555,7 +1750,7 @@ fn context_menu_options(
             // Shell view commands need our own IShellView state; keep all other
             // provider commands, including the real New and sharing submenus.
             for position in (0..GetMenuItemCount(Some(popup.0))).rev() {
-                let verb = canonical_verb(&menu, GetMenuItemID(popup.0, position));
+                let verb = verbs.verb(GetMenuItemID(popup.0, position));
                 if matches!(verb.as_str(), "undo" | "redo")
                     || (paths.is_empty()
                         && matches!(
@@ -1579,7 +1774,7 @@ fn context_menu_options(
         }
         if computer {
             let native_quick_pin = (0..GetMenuItemCount(Some(popup.0)))
-                .any(|index| canonical_verb(&menu, GetMenuItemID(popup.0, index)) == "pintohome");
+                .any(|index| verbs.verb(GetMenuItemID(popup.0, index)) == "pintohome");
             for (position, id, label) in [
                 (0, 0x8000, if expanded { "折叠" } else { "展开" }),
                 (1, 0x8001, "在新标签页中打开"),
@@ -1649,7 +1844,7 @@ fn context_menu_options(
             }
         }
         if command > 0 {
-            let verb = canonical_verb(&menu, command as u32);
+            let verb = verbs.verb(command as u32);
             if computer && verb == "pintohome" {
                 println!("command:computer-pin");
                 return Ok(());

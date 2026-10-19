@@ -32,15 +32,14 @@ pub fn is_network_drive(path: &Path) -> bool {
 }
 pub fn read(path: &Path) -> Result<VolumeLabel> {
     ensure!(is_drive_root(path), "请选择驱动器根目录");
+    // Install the guard before the first query (network drives can block on a
+    // reconnect dialog) and restore the previous mode on every exit path.
+    let _quiet = crate::volumes::QuietVolumeErrors::suppress();
     let path = wide(path);
     let mut label = [0u16; 261];
     let mut filesystem = [0u16; 64];
     let mut flags = 0;
     unsafe {
-        let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
-            windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
-            None,
-        );
         if GetDriveTypeW(PCWSTR(path.as_ptr())) == 4 {
             use windows::Win32::{System::Com::CoTaskMemFree, UI::Shell::*};
             let item: IShellItem = SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None)?;

@@ -197,6 +197,12 @@ pub fn pidl(path: &Path) -> Result<Vec<u8>> {
 
 /// Open a portable-device item through ShellExecuteEx with its PIDL.
 pub fn properties(path: &Path) -> Result<()> {
+    // A namespace item's `properties` verb is served by an in-process Shell
+    // extension that creates a *modeless* sheet: this thread has to stay in an
+    // STA and pump messages until the sheet closes, exactly like the file-system
+    // path in `shell::properties`. Otherwise the sheet is torn down (or never
+    // appears) as soon as the helper process finishes the request.
+    let _com = Com::new();
     let pidl = pidl(path)?;
     use windows::Win32::{
         Foundation::HWND,
@@ -218,6 +224,7 @@ pub fn properties(path: &Path) -> Result<()> {
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut info) }.context("当前系统无法打开此便携设备项目的属性")?;
+    unsafe { crate::shell::pump_property_windows() };
     Ok(())
 }
 

@@ -134,6 +134,12 @@ fn main() {
             .get(2)
             .ok_or_else(|| anyhow::anyhow!("缺少驱动器重命名请求"))
             .and_then(|value| rust_explorer::volume_label::rename_admin(value)),
+        Some("--shell-server") => {
+            if let Some(pid) = args.get(2).and_then(|value| value.parse::<u32>().ok()) {
+                rust_explorer::shell::watch_parent_process(pid);
+            }
+            rust_explorer::shell::serve_menu_requests()
+        }
         Some("--shell-stdin") => rust_explorer::shell::read_request(std::io::stdin().lock())
             .and_then(rust_explorer::shell::dispatch),
         Some("--shell") => args
