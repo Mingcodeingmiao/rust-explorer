@@ -47,6 +47,8 @@ pub struct TextInput {
     is_selecting: bool,
     pub compact: bool,
     pub single_line_scroll: bool,
+    pub click_to_end: bool,
+    drag_anchor: Option<Point<Pixels>>,
     scroll_x: Pixels,
 }
 
@@ -65,6 +67,8 @@ impl TextInput {
             is_selecting: false,
             compact: false,
             single_line_scroll: false,
+            click_to_end: false,
+            drag_anchor: None,
             scroll_x: px(0.),
         }
     }
@@ -175,6 +179,13 @@ impl TextInput {
     ) {
         window.focus(&self.focus_handle);
         self.is_selecting = true;
+        self.drag_anchor = None;
+
+        if self.click_to_end && !event.modifiers.shift {
+            self.drag_anchor = Some(event.position);
+            self.move_to(self.content.len(), cx);
+            return;
+        }
 
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -185,10 +196,19 @@ impl TextInput {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _window: &mut Window, _: &mut Context<Self>) {
         self.is_selecting = false;
+        self.drag_anchor = None;
     }
 
     fn on_mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.is_selecting {
+            if let Some(anchor) = self.drag_anchor {
+                let delta = event.position - anchor;
+                if delta.x.abs() < px(3.) && delta.y.abs() < px(3.) {
+                    return;
+                }
+                self.move_to(self.index_for_mouse_position(anchor), cx);
+                self.drag_anchor = None;
+            }
             self.select_to(self.index_for_mouse_position(event.position), cx);
         }
     }

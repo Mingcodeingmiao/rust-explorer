@@ -309,6 +309,7 @@ struct Explorer {
     search: Entity<TextInput>,
     dialog_input: Entity<TextInput>,
     editing_address: bool,
+    address_before_edit: String,
     address_candidates: Vec<rust_explorer::path_completion::Candidate>,
     address_choice: Option<usize>,
     address_generation: u64,
@@ -463,7 +464,10 @@ impl Explorer {
             });
         let address =
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
-        address.update(cx, |input, _| input.single_line_scroll = true);
+        address.update(cx, |input, _| {
+            input.single_line_scroll = true;
+            input.click_to_end = true;
+        });
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
         let mut subscriptions = vec![];
@@ -796,6 +800,7 @@ impl Explorer {
             search,
             dialog_input,
             editing_address: false,
+            address_before_edit: String::new(),
             address_candidates: vec![],
             address_choice: None,
             address_generation: 0,
@@ -2869,6 +2874,9 @@ impl Explorer {
     }
 
     fn focus_address(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.editing_address {
+            self.address_before_edit = self.address.read(cx).value();
+        }
         self.editing_address = true;
         self.address_candidates.clear();
         self.address_choice = None;
@@ -2877,11 +2885,6 @@ impl Explorer {
             .update(cx, |v, cx| v.focus_select_all(window, cx));
         self.address_candidates.clear();
         cx.notify();
-    }
-    fn focus_address_at_end(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_address(window, cx);
-        self.address
-            .update(cx, |input, cx| input.focus_end(window, cx));
     }
     fn sync_search_placeholder(&self, cx: &mut Context<Self>) {
         let dir = self.dir();
@@ -3096,9 +3099,28 @@ impl Render for Explorer {
         let t = self.theme;
         let mut root = div()
             .id("explorer")
-            .capture_any_mouse_down(cx.listener(|v, _: &MouseDownEvent, _, cx| {
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, w, cx| {
                 if v.system_menu_active {
                     cx.stop_propagation();
+                    return;
+                }
+                if v.editing_address {
+                    let address = v.address_bounds.get();
+                    let candidates = Bounds::new(
+                        point(address.left(), address.bottom()),
+                        size(
+                            address.size.width,
+                            ui(v.address_candidates.len().min(9) as f32 * 26.)
+                                .to_pixels(w.rem_size()),
+                        ),
+                    );
+                    if !address.contains(&e.position)
+                        && (v.address_candidates.is_empty() || !candidates.contains(&e.position))
+                    {
+                        // Blank content/tool areas do not always claim focus themselves.
+                        // Explicitly blur the editor so clearing without typing restores now.
+                        w.focus(&v.focus);
+                    }
                 }
             }))
             .key_context("Explorer")
@@ -3783,6 +3805,16 @@ impl Render for Explorer {
                                 v.address_candidates.clear();
                                 v.address_choice = None;
                                 v.address_generation = v.address_generation.wrapping_add(1);
+                                let value = v.address.read(cx).value();
+                                if value == v.address_before_edit || value.is_empty() {
+                                    v.address.update(cx, |input, cx| {
+                                        input.set_value(v.address_before_edit.clone(), cx)
+                                    });
+                                    v.editing_address = false;
+                                    w.focus(&v.focus);
+                                    cx.notify();
+                                    return;
+                                }
                                 v.address.update(cx, |input, cx| {
                                     input.set_value(String::new(), cx);
                                     input.focus_end(w, cx);
