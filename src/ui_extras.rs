@@ -323,8 +323,8 @@ pub(super) fn open_explorer_request(
             }
             view.update(cx, |v, cx| {
                 if let Some(tab) = tab {
-                    v.external_reveal.clear();
-                    v.reveal_pending = false;
+                    v.external_reveal = tab.reveal_targets.clone();
+                    v.reveal_pending = !v.external_reveal.is_empty();
                     v.tabs = vec![tab];
                     v.active = 0;
                     v.search
@@ -3809,6 +3809,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     };
                     let _ = open_explorer(Some(tab), cx);
                 }
@@ -4006,6 +4007,7 @@ impl Explorer {
                         history: History::new(path.clone()),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     });
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
@@ -4024,6 +4026,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     };
                     let _ = open_explorer(Some(tab), cx);
                 }
@@ -4096,6 +4099,7 @@ impl Explorer {
                         history: History::new(path),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     });
                     self.switch_tab(self.tabs.len() - 1, cx);
                 }
@@ -4108,6 +4112,7 @@ impl Explorer {
                             history: History::new(path),
                             query: String::new(),
                             global: false,
+                            reveal_targets: Vec::new(),
                         }),
                         cx,
                     );
@@ -4266,6 +4271,7 @@ impl Explorer {
                     history: History::new(self.dir()),
                     query: String::new(),
                     global: false,
+                    reveal_targets: Vec::new(),
                 };
                 let _ = open_explorer(Some(tab), cx);
             }

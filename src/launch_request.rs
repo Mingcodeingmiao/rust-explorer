@@ -74,9 +74,85 @@ pub fn current() -> Result<Option<LaunchRequest>> {
     parse(&std::env::args_os().skip(1).collect::<Vec<_>>())
 }
 
+/// A different file must not replace a tab's existing reveal target.
+pub fn find_reveal_tab<'a>(
+    request: &LaunchRequest,
+    tabs: impl Iterator<Item = (usize, &'a Path, &'a [PathBuf])>,
+) -> Option<usize> {
+    let mut empty = None;
+    for (index, folder, targets) in tabs {
+        if folder != request.folder {
+            continue;
+        }
+        if request.select.is_empty()
+            || (targets.len() == request.select.len()
+                && request.select.iter().all(|path| targets.contains(path)))
+        {
+            return Some(index);
+        }
+        if targets.is_empty() && empty.is_none() {
+            empty = Some(index);
+        }
+    }
+    empty
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn external_reveal_keeps_different_files_in_separate_tabs() {
+        let folder = PathBuf::from(r"C:\reveal");
+        let a = folder.join("a.txt");
+        let b = folder.join("b.txt");
+        let mut tabs = vec![(folder.clone(), vec![a.clone()])];
+        let request = LaunchRequest {
+            folder: folder.clone(),
+            select: vec![b.clone()],
+        };
+        let find = |tabs: &Vec<(PathBuf, Vec<PathBuf>)>, request: &LaunchRequest| {
+            find_reveal_tab(
+                request,
+                tabs.iter()
+                    .enumerate()
+                    .map(|(i, (p, t))| (i, p.as_path(), t.as_slice())),
+            )
+        };
+        assert_eq!(find(&tabs, &request), None);
+        tabs.push((folder.clone(), vec![b]));
+        assert_eq!(find(&tabs, &request), Some(1));
+        assert_eq!(
+            find(
+                &tabs,
+                &LaunchRequest {
+                    folder: folder.clone(),
+                    select: vec![a]
+                }
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            find(
+                &tabs,
+                &LaunchRequest {
+                    folder: folder.clone(),
+                    select: vec![]
+                }
+            ),
+            Some(0)
+        );
+        tabs.push((folder.clone(), vec![]));
+        assert_eq!(
+            find(
+                &tabs,
+                &LaunchRequest {
+                    folder: folder.clone(),
+                    select: vec![folder.join("c.txt")]
+                }
+            ),
+            Some(2)
+        );
+    }
     #[test]
     fn reveal_supports_explorer_syntax_unicode_commas_and_multiple_targets() {
         let dir = std::env::temp_dir().join(format!("re-reveal-{}", std::process::id()));

@@ -115,6 +115,7 @@ struct Tab {
     history: History,
     query: String,
     global: bool,
+    reveal_targets: Vec<PathBuf>,
 }
 #[derive(Clone)]
 struct DragFiles {
@@ -696,7 +697,10 @@ impl Explorer {
             inline_rename: None,
             pending_select: None,
             reveal_pending: launch.as_ref().is_some_and(|r| !r.select.is_empty()),
-            external_reveal: launch.map(|r| r.select).unwrap_or_default(),
+            external_reveal: launch
+                .as_ref()
+                .map(|r| r.select.clone())
+                .unwrap_or_default(),
             reveal_scroll: None,
             pending_rename: false,
             rename_token: 0,
@@ -737,6 +741,7 @@ impl Explorer {
                 history: History::new(initial),
                 query: String::new(),
                 global: false,
+                reveal_targets: launch.map(|r| r.select).unwrap_or_default(),
             }],
             active: 0,
             entries: Arc::new(vec![]),
@@ -947,22 +952,33 @@ impl Explorer {
         self.popup = None;
         self.filters = Default::default();
         self.collapsed_groups.clear();
-        self.external_reveal = request.select;
-        self.reveal_pending = !self.external_reveal.is_empty();
-        self.reveal_scroll = None;
-        let index = self
-            .tabs
-            .iter()
-            .position(|t| t.history.current() == &request.folder);
+        if !self.loading && !self.selected.is_empty() {
+            self.tabs[self.active].reveal_targets = self
+                .selected
+                .iter()
+                .filter_map(|i| self.entries.get(*i).map(|e| e.path.clone()))
+                .collect();
+        }
+        let index = rust_explorer::launch_request::find_reveal_tab(
+            &request,
+            self.tabs
+                .iter()
+                .enumerate()
+                .map(|(i, t)| (i, t.history.current(), t.reveal_targets.as_slice())),
+        );
         let index = index.unwrap_or_else(|| {
             self.tabs.push(Tab {
                 id: next_tab_id(),
                 history: History::new(request.folder),
                 query: String::new(),
                 global: false,
+                reveal_targets: Vec::new(),
             });
             self.tabs.len() - 1
         });
+        if !request.select.is_empty() {
+            self.tabs[index].reveal_targets = request.select;
+        }
         self.tabs[index].query.clear();
         self.switch_tab(index, cx);
         if let Some(handle) = self.own_window {
@@ -1013,6 +1029,16 @@ impl Explorer {
         self.reload(cx);
     }
     fn reload(&mut self, cx: &mut Context<Self>) {
+        let path = self.dir();
+        if self.tabs[self.active]
+            .reveal_targets
+            .iter()
+            .any(|p| p.parent() != Some(path.as_path()))
+        {
+            self.tabs[self.active].reveal_targets.clear();
+            self.external_reveal.clear();
+            self.reveal_pending = false;
+        }
         self.ctrl_open_selection = None;
         self.usage_cancel.store(true, Ordering::Relaxed);
         self.usage_cancel = Arc::new(AtomicBool::new(false));
@@ -1484,6 +1510,7 @@ impl Explorer {
             history: History::new(path),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
@@ -1508,6 +1535,7 @@ impl Explorer {
             history: History::new(path.clone()),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         };
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
@@ -2336,12 +2364,16 @@ impl Explorer {
             history: History::new(self.dir()),
             query: String::new(),
             global: false,
+            reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
     fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
         let was_computer = volumes::is_computer(&self.dir());
         self.active = index;
+        self.external_reveal = self.tabs[index].reveal_targets.clone();
+        self.reveal_pending = !self.external_reveal.is_empty();
+        self.reveal_scroll = None;
         if self.settings.remember_views {
             self.view = self
                 .settings
@@ -3247,6 +3279,7 @@ impl Render for Explorer {
                         history: History::new(v.dir()),
                         query: String::new(),
                         global: false,
+                        reveal_targets: Vec::new(),
                     }),
                     cx,
                 );
