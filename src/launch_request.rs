@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchRequest {
     pub folder: PathBuf,
     pub select: Vec<PathBuf>,

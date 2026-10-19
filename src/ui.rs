@@ -425,11 +425,14 @@ impl Explorer {
         }
         cx.notify();
     }
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        launch: Option<rust_explorer::launch_request::LaunchRequest>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let folder_handler = std::env::args_os()
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
-        let launch = rust_explorer::launch_request::current().ok().flatten();
         let initial = launch
             .as_ref()
             .map(|r| r.folder.clone())
@@ -801,6 +804,7 @@ impl Explorer {
             let _ = weak.update(cx, |_, cx| cx.notify());
         });
         window.focus(&this.focus);
+        let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
             loop {
                 cx.background_executor()
@@ -808,6 +812,9 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
+                        if let Some(request) = launch_hwnd.and_then(rust_explorer::instance::take) {
+                            this.accept_launch(request, cx);
+                        }
                         // Windows performs live window moves on the UI thread.
                         // Pause background polls/icon notifications while the
                         // left button is held so they cannot force repaints
@@ -922,6 +929,52 @@ impl Explorer {
         let offset = self.list_scroll.logical_scroll_top();
         self.list_scroll.reset(self.rows.len());
         self.list_scroll.scroll_to(offset);
+    }
+    fn accept_launch(
+        &mut self,
+        request: rust_explorer::launch_request::LaunchRequest,
+        cx: &mut Context<Self>,
+    ) {
+        // Preserve a rename or an open dialog instead of discarding user input.
+        if self.inline_rename.is_some() || self.dialog.is_some() || self.options.is_some() {
+            cx.defer(move |cx| {
+                if let Err(error) = open_explorer_request(None, Some(request), cx) {
+                    eprintln!("{error:#}");
+                }
+            });
+            return;
+        }
+        self.popup = None;
+        self.filters = Default::default();
+        self.collapsed_groups.clear();
+        self.external_reveal = request.select;
+        self.reveal_pending = !self.external_reveal.is_empty();
+        self.reveal_scroll = None;
+        let index = self
+            .tabs
+            .iter()
+            .position(|t| t.history.current() == &request.folder);
+        let index = index.unwrap_or_else(|| {
+            self.tabs.push(Tab {
+                id: next_tab_id(),
+                history: History::new(request.folder),
+                query: String::new(),
+                global: false,
+            });
+            self.tabs.len() - 1
+        });
+        self.tabs[index].query.clear();
+        self.switch_tab(index, cx);
+        if let Some(handle) = self.own_window {
+            let focus = self.focus.clone();
+            cx.defer(move |cx| {
+                let _ = handle.update(cx, |_, window, _| {
+                    window.activate_window();
+                    window.focus(&focus);
+                });
+            });
+        }
+        cx.notify();
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if path == PathBuf::from("shell:RecycleBinFolder") {
@@ -4547,11 +4600,11 @@ impl Render for Explorer {
     }
 }
 
-pub fn run() {
+pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
     rust_explorer::fluent_icons::initialize();
     Application::new()
         .with_assets(rust_explorer::fluent_icons::Assets)
-        .run(|cx: &mut App| {
+        .run(move |cx: &mut App| {
             input::init(cx);
             cx.bind_keys([
                 KeyBinding::new("alt-left", Back, Some("Explorer")),
@@ -4692,7 +4745,7 @@ pub fn run() {
                     Some("Explorer"),
                 )]);
             }
-            open_explorer(None, cx).expect("无法创建窗口");
+            open_explorer_request(None, launch, cx).expect("无法创建窗口");
             cx.activate(true);
         });
 }

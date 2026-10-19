@@ -2,12 +2,6 @@
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    {
-        if let Err(error) = rust_explorer::launch_request::current() {
-            eprintln!("{error:#}");
-            std::process::exit(1);
-        }
-    }
     let result = match args.get(1).map(String::as_str) {
         Some("--folder-association-guard") => rust_explorer::default_browser::guard_main(
             args.get(2).map(String::as_str).unwrap_or(""),
@@ -141,7 +135,31 @@ fn main() {
         _ => {
             #[cfg(feature = "desktop")]
             {
-                ui::run();
+                let launch = match rust_explorer::launch_request::current() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        // Release builds have no console: do not fail invisibly.
+                        let message: Vec<u16> = format!("无法打开目标位置：\n{error:#}")
+                            .encode_utf16()
+                            .chain(Some(0))
+                            .collect();
+                        unsafe {
+                            use windows::Win32::UI::WindowsAndMessaging::*;
+                            MessageBoxW(
+                                None,
+                                windows::core::PCWSTR(message.as_ptr()),
+                                windows::core::w!("Rust Explorer"),
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
+                        std::process::exit(1);
+                    }
+                };
+                let (_instance, forwarded) = rust_explorer::instance::handoff(launch.as_ref());
+                if !forwarded {
+                    ui::run(launch);
+                }
                 Ok(())
             }
             #[cfg(not(feature = "desktop"))]

@@ -12,6 +12,14 @@ rust-explorer.exe --select "C:\Downloads\a.txt" "C:\Downloads\b.txt"
 
 多个目标必须在同一文件夹。选中后自动滚动到目标，不进入重命名；显式定位的隐藏/系统文件也可显示。`--open-folder` 或直接传入文件路径时，同样定位该文件；传入目录则直接打开目录。
 
+## 外部调用响应
+
+显式外部打开请求优先交给同一路径、同一用户配置下已运行的 RE，通过有超时的 `WM_COPYDATA` 消息传递。窗口收到请求后复用对应目录标签页，或新增标签页；最小化窗口会恢复。普通无参数启动仍可新建窗口，不安装驻留服务。
+
+窗口启动过程中会短暂等待其就绪；目标无响应、消息被拒绝或窗口已退出时，回退到独立界面。队列和消息长度均有上限。已有窗口正在重命名或打开选项/对话框时，另开窗口，保留当前输入。启动路径只解析一次；失败时显示错误，避免无控制台版本静默退出。
+
+这次优化没有扩大默认文件夹关联范围。磁盘、网络和手机目录本身的读取耗时仍然存在；不同权限级别的窗口可能无法互传消息，此时使用回退窗口。
+
 ## 系统边界
 
 默认文件夹关联负责打开目录，不会截获所有软件的“在文件夹中显示”。直接调用 `SHOpenFolderAndSelectItems` 或写死 `explorer.exe` 的程序，仍可能启动 Windows Explorer。当前实现没有全局注入、Explorer 劫持或修改通用 Folder 类，不能承诺浏览器、聊天及下载软件全部转交给 RE。可配置外部文件管理器的软件，应配置上面的 `--select` 命令。
@@ -21,3 +29,11 @@ rust-explorer.exe --select "C:\Downloads\a.txt" "C:\Downloads\b.txt"
 - 88 项核心测试、格式检查及桌面全部 target 编译检查通过。
 - 实机创建 181 个文件，定位最后一个文件：正确打开所在目录、自动滚动并高亮，无重命名输入框；原生窗口标题为所在文件夹名称。
 - 未更改实际默认文件夹关联，未推送 GitHub 或发布版本。
+
+后续响应优化：89 项测试通过，包含真实 Win32 窗口接收、重复请求、拒绝无效路径和窗口销毁后的回退。实机连续 5 次交接约 94–239 毫秒，仅保留一个 UI 进程；最小化后能恢复并高亮；两个同时冷启动请求最终保留一个进程、两个目录标签。时间是调用进程返回时间，不代表目录加载完成时间，不能作为所有机器的性能保证。
+
+另实测以隐藏方式冷启动仍显示窗口并高亮；修复需要在 GPUI 完成初始窗口可见性处理后再显示。重命名期间收到外部请求会在同一进程另开窗口。
+
+REA 已绑定本机 `C:\Windows\explorer.exe`，SHA-256 为 `eee089fe6f927c7f0d51b0abd9d70c094157e33673ad760713ec7b1cea18ee11`。当前未配置 Ghidra 原生分析引擎，Windows 上该 REA 版本的原生 UI 观察工具也不可用；未取得系统 Explorer 内部派发逻辑的反编译证据。上述改动依据本项目源码、实机行为及公开 Win32 消息/前台窗口接口，不宣称复现了系统内部实现。
+
+参考：[WM_COPYDATA](https://learn.microsoft.com/en-us/windows/win32/dataxchg/wm-copydata)、[SendMessageTimeoutW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw)、[AllowSetForegroundWindow](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-allowsetforegroundwindow)。

@@ -10,7 +10,7 @@ pub(super) struct TabDrop {
     pub accepted: bool,
     pub position: (i32, i32),
 }
-fn native_hwnd(window: &Window) -> Option<isize> {
+pub(super) fn native_hwnd(window: &Window) -> Option<isize> {
     match HasWindowHandle::window_handle(window).ok()?.as_raw() {
         RawWindowHandle::Win32(handle) => Some(handle.hwnd.get()),
         _ => None,
@@ -288,8 +288,16 @@ pub(super) fn open_explorer(
     tab: Option<Tab>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<Explorer>> {
+    open_explorer_request(tab, None, cx)
+}
+pub(super) fn open_explorer_request(
+    tab: Option<Tab>,
+    launch: Option<rust_explorer::launch_request::LaunchRequest>,
+    cx: &mut App,
+) -> anyhow::Result<WindowHandle<Explorer>> {
     let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
-    cx.open_window(
+    let external = launch.is_some();
+    let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.), px(400.))),
@@ -301,11 +309,13 @@ pub(super) fn open_explorer(
             ..Default::default()
         },
         move |w, cx| {
-            let view = cx.new(|cx| Explorer::new(w, cx));
+            let view = cx.new(|cx| Explorer::new(w, launch, cx));
             if let Some(hwnd) = native_hwnd(w) {
                 set_application_icon(hwnd);
                 if let Err(error) = rust_explorer::window_frame::install(hwnd) {
                     eprintln!("{error:#}");
+                } else {
+                    rust_explorer::instance::advertise(hwnd);
                 }
                 TAB_WINDOWS.with(|windows| {
                     windows.borrow_mut().insert(hwnd, view.downgrade());
@@ -324,7 +334,18 @@ pub(super) fn open_explorer(
             });
             view
         },
-    )
+    )?;
+    if external {
+        // GPUI applies initial visibility after the constructor closure returns.
+        cx.defer(move |cx| {
+            let _ = handle.update(cx, |_, window, _| {
+                if let Some(hwnd) = native_hwnd(window) {
+                    rust_explorer::instance::reveal_window(hwnd);
+                }
+            });
+        });
+    }
+    Ok(handle)
 }
 pub(super) fn compare_entries(
     a: &Entry,
