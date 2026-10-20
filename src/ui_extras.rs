@@ -2823,22 +2823,8 @@ impl Explorer {
                     )
                 })
                 .when(
-                    (has_thumbnail && presentation.shortcut)
-                        || (entry.link
-                            && !entry.path.extension().is_some_and(|e| {
-                                e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url")
-                            })),
-                    |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .bottom_0()
-                                .size(ui(16.))
-                                .bg(rgb(0xffffff))
-                                .child(visual::icon("shortcut", 0x0067c0)),
-                        )
-                    },
+                    (has_thumbnail && presentation.shortcut) || entry.link,
+                    |d| d.child(visual::link_badge(self.view.icon_size())),
                 );
             if self.view == ViewMode::Content {
                 let inner = (item_width - 24.).max(0.);

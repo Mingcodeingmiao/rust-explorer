@@ -274,17 +274,15 @@ pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
 /// standalone overlay bitmap API), so the arrow stays drawn; its size follows the
 /// icon size the way Explorer's overlay does.
 pub fn link_badge(logical: f32) -> AnyElement {
+    // One badge per item, sized from the icon: a fixed 16 px box looked oversized
+    // next to extra-large icons and tiny next to medium ones.
     let edge = if logical >= 140. {
-        // Extra large icons.
-        logical * 0.275
+        logical * 0.20
     } else if logical >= 96. {
-        // Large icons.
-        logical * 0.25
+        logical * 0.20
     } else if logical >= 56. {
-        // Medium icons.
-        logical * 0.156
+        logical * 0.20
     } else {
-        // Tiles, list and details keep their previous overlay size.
         (logical * 0.36).clamp(8., 18.)
     };
     div()

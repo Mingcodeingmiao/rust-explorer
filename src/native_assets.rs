@@ -126,7 +126,7 @@ fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("RustExplorer/cache/native-v6-r4")
+        .join("RustExplorer/cache/native-v6-r5")
 }
 fn cache_path(key: impl Hash) -> Result<PathBuf> {
     let root = cache_root();
@@ -137,7 +137,7 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
 }
 
 fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v5");
+    let root = cache_root().join("thumbnails-v6");
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
@@ -376,7 +376,7 @@ pub fn serve(json: &str) -> Result<()> {
                 shortcut_epoch: item.shortcut_epoch,
             };
             let output = if shortcut {
-                let root = cache_root().join("thumbnails-v5");
+                let root = cache_root().join("thumbnails-v6");
                 std::fs::create_dir_all(&root)?;
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 (&item, &resolved).hash(&mut hash);
@@ -437,13 +437,8 @@ pub fn serve(json: &str) -> Result<()> {
                     );
                     crate::native_preview::file_thumbnail(&resolved.path, pixels)?
                 };
-                // Explorer marks shortcut thumbnails with the link arrow in the
-                // corner; the Shell's image factory does not add it for us.
-                let bitmap = if shortcut {
-                    crate::native_preview::with_link_badge(bitmap)
-                } else {
-                    bitmap
-                };
+                // No badge is painted into the bitmap: the view draws one link
+                // arrow per tile, so baking a second one here produced two arrows.
                 save_png(&output, bitmap.width, bitmap.height, &bitmap.rgba)?;
                 if let Some(root) = output.parent() {
                     prune_thumbnail_cache(root);
