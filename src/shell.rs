@@ -67,13 +67,17 @@ impl OperationControl {
 thread_local! {
     static OPERATION_CONTROL: RefCell<Option<OperationControl>> = const { RefCell::new(None) };
 }
-pub fn execute_controlled(mut request: Request, control: OperationControl) -> Result<String> {
-    // Every user-facing Shell operation is killable without terminating a GUI
-    // thread. A helper owns its popup; never create cross-process child windows.
-    match &mut request {
-        Request::ThemedMenu { owner, .. } | Request::ComputerMenu { owner, .. } => *owner = 0,
-        _ => {}
+pub fn execute_controlled(request: Request, control: OperationControl) -> Result<String> {
+    // Menus stay on the in-process path added in 0.7.5. Running them in a one-shot
+    // helper costs a process spawn plus a cold Shell-extension load on every
+    // right-click (~250 ms), and a menu is dismissed by the user, so it does not
+    // need the cancellation that file operations get.
+    if is_menu_request(&request) {
+        menu_trace("menu: in-process (cancellable operations keep their helper)");
+        return execute_output(request);
     }
+    // Every other user-facing Shell operation is killable without terminating a GUI
+    // thread. A helper owns its popup; never create cross-process child windows.
     OPERATION_CONTROL.with(|slot| *slot.borrow_mut() = Some(control));
     struct Reset;
     impl Drop for Reset {
