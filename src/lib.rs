@@ -27,3 +27,5 @@ pub mod thumbnails;
 pub mod volume_label;
 pub mod volumes;
 pub mod window_frame;
+
+pub mod type_select;
