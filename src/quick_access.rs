@@ -23,6 +23,25 @@ pub struct Item {
     pub pinned: Option<bool>,
 }
 
+/// Quick Access list read earlier in this process. A window that opens later reuses
+/// it instead of spawning (and waiting for) another helper.
+static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Item>)>> =
+    std::sync::Mutex::new(None);
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Cached list from this process, if it was read recently enough to be reused.
+pub fn cached() -> Option<Vec<Item>> {
+    let guard = CACHE.lock().ok()?;
+    let (taken, items) = guard.as_ref()?;
+    (taken.elapsed() < CACHE_TTL).then(|| items.clone())
+}
+
+pub fn remember(items: &[Item]) {
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), items.to_vec()));
+    }
+}
+
 struct MenuInventory {
     menu: IContextMenu,
     commands: Vec<(u32, String)>,
@@ -179,6 +198,12 @@ pub fn snapshot() -> Result<Vec<Item>> {
         )?;
         let enumeration: IEnumShellItems = root.BindToHandler(None, &BHID_EnumItems)?;
         let mut items = Vec::new();
+        // Knowing whether an entry is pinned costs one context-menu instantiation
+        // per item (~40 ms, more on the first call). Stay well inside the helper's
+        // 1600 ms budget: probe the first entries only and stop at a deadline that
+        // starts with the first probe, so enumeration does not eat the budget.
+        let mut probe_start: Option<std::time::Instant> = None;
+        let mut probed = 0usize;
         loop {
             let mut fetched = 0;
             let mut batch = [None];
@@ -201,13 +226,23 @@ pub fn snapshot() -> Result<Vec<Item>> {
                 continue;
             }
             let name = display_name(&item, SIGDN_NORMALDISPLAY).unwrap_or_else(|_| path.clone());
+            let pinned = if probed < 16 {
+                let start = *probe_start.get_or_insert_with(std::time::Instant::now);
+                if start.elapsed() < std::time::Duration::from_millis(900) {
+                    probed += 1;
+                    inventory(&item)
+                        .ok()
+                        .and_then(|menu| pin_state(&menu.commands))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             items.push(Item {
                 name,
                 path: path.into(),
-                // Do not instantiate a context menu here: namespace extension
-                // handlers can take seconds per item. Pin state is unknown
-                // until an explicit action; frequent items remain visible.
-                pinned: None,
+                pinned,
             });
             if items.len() >= 256 {
                 break;

@@ -242,6 +242,25 @@ pub fn bounded<T: serde::de::DeserializeOwned>(
     );
     Ok(serde_json::from_slice(&output)?)
 }
+/// Snapshot taken earlier in this process. All windows live in one process, so a
+/// window that opens later can reuse the drive list instead of enumerating every
+/// drive (and spawning a helper per drive) again.
+static SNAPSHOT_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Volume>)>> =
+    std::sync::Mutex::new(None);
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Snapshot from this process, if one was taken recently enough to be reused.
+pub fn cached_snapshot() -> Option<Vec<Volume>> {
+    let guard = SNAPSHOT_CACHE.lock().ok()?;
+    let (taken, volumes) = guard.as_ref()?;
+    (taken.elapsed() < SNAPSHOT_TTL).then(|| volumes.clone())
+}
+
+pub fn remember_snapshot(volumes: &[Volume]) {
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), volumes.to_vec()));
+    }
+}
 pub fn snapshot() -> Vec<Volume> {
     let mut result: Vec<Volume> = roots()
         .into_iter()
@@ -276,6 +295,7 @@ pub fn snapshot() -> Vec<Volume> {
             });
         }
     }
+    remember_snapshot(&result);
     result
 }
 #[derive(Serialize, Deserialize)]

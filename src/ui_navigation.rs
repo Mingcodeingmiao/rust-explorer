@@ -132,6 +132,7 @@ impl Explorer {
                     y,
                     dark: self.theme.dark,
                     expanded: self.tree_is_open(&path),
+                    owner: shell::active_window_owner(),
                 },
                 cx,
             );
@@ -141,6 +142,10 @@ impl Explorer {
             && !path.to_string_lossy().starts_with("shell:")
         {
             let (x, y) = shell::cursor();
+            let quick_access_pinned = self
+                .system_quick_access
+                .iter()
+                .any(|item| item.path == path && item.pinned == Some(true));
             self.run_shell(
                 shell::Request::ThemedMenu {
                     folder: path.parent().unwrap_or(&path).to_path_buf(),
@@ -165,6 +170,8 @@ impl Explorer {
                     undo: !self.undo_stack.is_empty(),
                     redo: !self.redo_stack.is_empty(),
                     can_paste: false,
+                    quick_access_pinned,
+                    owner: shell::active_window_owner(),
                 },
                 cx,
             );
@@ -313,6 +320,19 @@ impl Explorer {
         if self.quick_access_busy || self.quick_access_tick.elapsed() < Duration::from_secs(15) {
             return;
         }
+        // Reuse the list this process already read: opening a window must not wait
+        // for another Quick Access helper.
+        if self.system_quick_access.is_empty() {
+            if let Some(cached) = rust_explorer::quick_access::cached() {
+                self.quick_access_tick = Instant::now();
+                self.system_quick_access = cached;
+                if self.dir() == PathBuf::from("::QuickAccess") && self.is_home() {
+                    self.sync_computer_entries();
+                }
+                cx.notify();
+                return;
+            }
+        }
         self.quick_access_busy = true;
         self.quick_access_tick = Instant::now();
         let task = cx.background_executor().spawn(async {
@@ -327,6 +347,7 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 v.quick_access_busy = false;
                 if let Ok(items) = result {
+                    rust_explorer::quick_access::remember(&items);
                     if v.system_quick_access != items {
                         let anchor = v.navigation_anchor();
                         v.system_quick_access = items;
@@ -373,6 +394,19 @@ impl Explorer {
     pub(super) fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
         if self.volume_busy {
             return;
+        }
+        // A window opened later reuses the snapshot this process already took, so its
+        // sidebar appears immediately instead of re-enumerating every drive.
+        if self.volumes.is_empty() {
+            if let Some(cached) = volumes::cached_snapshot() {
+                self.volume_capacity_tick = Instant::now();
+                self.volumes = cached;
+                if self.is_home() {
+                    self.sync_computer_entries();
+                }
+                cx.notify();
+                return;
+            }
         }
         self.volume_busy = true;
         self.volume_tick = Instant::now();

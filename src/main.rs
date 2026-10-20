@@ -134,6 +134,12 @@ fn main() {
             .get(2)
             .ok_or_else(|| anyhow::anyhow!("缺少驱动器重命名请求"))
             .and_then(|value| rust_explorer::volume_label::rename_admin(value)),
+        // Elevated helper for the drive context menu's "Format" verb: the format
+        // dialog has to run in an administrator process, and it is modal there.
+        Some("--format-drive") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少要格式化的驱动器"))
+            .and_then(|value| rust_explorer::shell::format_drive(value)),
         Some("--shell-server") => {
             if let Some(pid) = args.get(2).and_then(|value| value.parse::<u32>().ok()) {
                 rust_explorer::shell::watch_parent_process(pid);
