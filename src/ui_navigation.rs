@@ -339,13 +339,17 @@ impl Explorer {
             volumes::bounded::<Vec<rust_explorer::quick_access::Item>>(
                 "--quick-access",
                 "null",
-                Duration::from_millis(1600),
+                Duration::from_secs(4),
             )
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |v, cx| {
                 v.quick_access_busy = false;
+                if result.is_err() && v.dir() == PathBuf::from("::QuickAccess") {
+                    v.status = "快速访问读取失败，保留已有列表 · F5 重试".into();
+                    cx.notify();
+                }
                 if let Ok(items) = result {
                     rust_explorer::quick_access::remember(&items);
                     if v.system_quick_access != items {
