@@ -2671,7 +2671,7 @@ impl Explorer {
         let has_current = current.is_some();
         let current = current.unwrap_or(order[0]);
         let columns = match self.view {
-            ViewMode::ExtraLarge => (self.layout_width / 224.).floor().max(1.) as usize,
+            ViewMode::ExtraLarge => (self.layout_width / 328.).floor().max(1.) as usize,
             ViewMode::Large => (self.layout_width / 164.).floor().max(1.) as usize,
             ViewMode::Medium => (self.layout_width / 124.).floor().max(1.) as usize,
             ViewMode::Small => (self.layout_width / 210.).floor().max(1.) as usize,
@@ -3012,6 +3012,26 @@ impl Explorer {
             cx.notify();
         }
     }
+}
+
+/// Display name of a path, without the directory: dialogs mention the item only.
+fn item_name(path: &std::path::Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// First `limit` item names, one per line, with an ellipsis when there are more.
+fn item_names(paths: &[std::path::PathBuf], limit: usize) -> String {
+    let mut names: Vec<String> = paths
+        .iter()
+        .take(limit)
+        .map(|path| item_name(path))
+        .collect();
+    if paths.len() > limit {
+        names.push("……".into());
+    }
+    names.join("\n")
 }
 
 fn icon(glyph: &str, color: u32) -> AnyElement {
@@ -3867,7 +3887,15 @@ impl Render for Explorer {
                 .rounded(ui(4.))
                 .bg(rgb(t.panel))
                 .text_color(rgb(t.text))
-                .child(div().flex_1().min_w_0().child(self.address.clone()))
+                // A little left padding so the caret is not glued to the border when
+                // the address bar is in edit mode.
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pl(ui(6.))
+                        .child(self.address.clone()),
+                )
                 .child(
                     div()
                         .id("clear-address")
@@ -4836,25 +4864,29 @@ impl Render for Explorer {
                     ),
                     Dialog::Delete(paths) => (
                         "删除文件",
-                        format!(
-                            "将 {} 个项目移至回收站？不能回收的项目会由 Windows 再次确认。",
-                            paths.len()
-                        ),
+                        match paths.as_slice() {
+                            [path] => format!("是否删除 {}？", item_name(path)),
+                            _ => format!(
+                                "是否删除这 {} 个项目？\n{}",
+                                paths.len(),
+                                item_names(&paths, 3)
+                            ),
+                        },
                         true,
                     ),
                     Dialog::PermanentDelete(paths) => (
                         "永久删除 — 无法撤销",
-                        format!(
-                            "确定永久删除这 {} 个项目吗？\n不会移至回收站，无法通过本程序撤销。\n\n{}{}",
-                            paths.len(),
-                            paths
-                                .iter()
-                                .take(3)
-                                .map(|path| path.display().to_string())
-                                .collect::<Vec<_>>()
-                                .join("\n"),
-                            if paths.len() > 3 { "\n……" } else { "" }
-                        ),
+                        match paths.as_slice() {
+                            [path] => format!(
+                                "是否删除 {}？\n不会移至回收站，无法通过本程序撤销。",
+                                item_name(path)
+                            ),
+                            _ => format!(
+                                "是否删除这 {} 个项目？\n不会移至回收站，无法通过本程序撤销。\n\n{}",
+                                paths.len(),
+                                item_names(&paths, 3)
+                            ),
+                        },
                         true,
                     ),
                 };

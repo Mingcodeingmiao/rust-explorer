@@ -1288,7 +1288,7 @@ impl Explorer {
         }
         let width = self.layout_width.max(200.);
         let cell = match self.view {
-            ViewMode::ExtraLarge => 224.,
+            ViewMode::ExtraLarge => 328.,
             ViewMode::Large => 164.,
             ViewMode::Medium => 124.,
             ViewMode::Small => 210.,
@@ -3132,7 +3132,7 @@ impl Explorer {
                     ViewMode::Details | ViewMode::Content => 1,
                     _ => {
                         let cell = match self.view {
-                            ViewMode::ExtraLarge => 224.,
+                            ViewMode::ExtraLarge => 328.,
                             ViewMode::Large => 164.,
                             ViewMode::Medium => 124.,
                             ViewMode::Small => 210.,
