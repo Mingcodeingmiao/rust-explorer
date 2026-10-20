@@ -9,7 +9,9 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.7.5。** 本次集中修复**右键菜单**与**新窗口打开**行为并做性能优化：右键菜单改为在应用进程内显示（不再被系统瞬间取消、任务栏与窗口阴影不再闪烁），防抖只统计"按下→抬起"的位移，悬浮提示改为点击穿透的原生卡片并跟随 DPI；新窗口打开按"配置里该文件夹保存的视图 → 内置默认"计算显示方式；磁盘与快速访问改为进程内共享缓存，新窗口即时呈现。详见 [0.7.5 更新说明](docs/v0.7.5.md)。0.7.4 修复了审计发现的 Shell/COM 与 Win32 调用缺陷（见 [0.7.5 更新说明](docs/v0.7.5.md)）。0.7.3 引入的可恢复实验性默认文件夹关联、内部回收站、启动页与标签页设置保持不变；MTP/WPD 设备传输仍可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
+**当前版本为 0.7.5。** 本次集中修复**右键菜单**与**新窗口打开**行为并做性能优化：右键菜单改为在应用进程内显示（不再被系统瞬间取消、任务栏与窗口阴影不再闪烁），防抖只统计"按下→抬起"的位移，悬浮提示改为点击穿透的原生卡片并跟随 DPI；新窗口打开按"配置里该文件夹保存的视图 → 内置默认"计算显示方式；磁盘与快速访问改为进程内共享缓存，新窗口即时呈现。详见 [0.7.5 更新说明](docs/v0.7.5.md)。0.7.4 修复了审计发现的 Shell/COM 与 Win32 调用缺陷（见 [0.7.4 更新说明](docs/v0.7.4.md)）。0.7.3 引入的可恢复实验性默认文件夹关联、内部回收站、启动页与标签页设置保持不变；MTP/WPD 设备传输仍可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
+
+以上为主分支源码版本；截至 2026-10-20，最新已发布的下载版本为 [0.7.3](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.3)。0.7.4 / 0.7.5 改动已通过 [PR #24](https://github.com/Mingcodeingmiao/rust-explorer/pull/24) 合并，尚未发布对应安装包。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -63,7 +65,7 @@ Debug 构建省略 `-Release`。MSYS2 UCRT64 用户安装 `stable-x86_64-pc-wind
 - [贡献指南](CONTRIBUTING.md)、[行为准则](CODE_OF_CONDUCT.md)、[安全报告](SECURITY.md)
 - [快捷键](docs/explorer-shortcuts.md)、[架构](docs/architecture.md)、[撤销/重做](docs/file-history-062.md)
 - [原生预览](docs/native-previews.md)、[系统图标](docs/system-icons.md)、[运行时资源](docs/fluent-icons.md)
-- [0.7.5 更新说明](docs/v0.7.5.md)、[0.7.5 更新说明](docs/v0.7.5.md)、[0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
+- [0.7.5 更新说明](docs/v0.7.5.md)、[0.7.4 更新说明](docs/v0.7.4.md)、[0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
 
 欢迎通过 Issue 模板报告可复现问题，提供版本、Windows build、DPI/缩放、主题和查看模式；上传前移除个人路径及敏感内容。
 

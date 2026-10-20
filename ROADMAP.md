@@ -14,8 +14,8 @@
 
 - 已解决或已有替代设置的问题，会回复对应版本、入口及复测方法；部分完成的问题会明确剩余范围。
 - 未实现的需求保留记录，后续逐步评估和适配。快速访问默认新标签页已在 0.7.3 提供；0.7.5 已将右键菜单改为进程内显示，剩余的类型列关联查询与图标路径缓存列入下方计划。
-- 现有贡献 PR（包括鼠标侧键导航与依赖升级）本次只回复、不合并；之后逐项审核、解决冲突和回归测试，再逐步整合。没有承诺某个尚未审核 PR 一定合入。
+- PR #24（0.7.4 / 0.7.5 修复）已合入主分支。其余贡献 PR 仍需逐项审核、解决冲突和回归测试，再逐步整合。
 
 ## English
 
-Future work focuses on more complete file drag/drop, performance improvements and reproducible bug fixes. Further folder-association reliability work will preserve recovery safeguards. Whitespace double-click navigation, dual panes and a separate favorites bar remain future evaluation items. Existing contributor PRs are deferred until individual review and regression testing; they are not part of 0.7.5.
+Future work focuses on more complete file drag/drop, performance improvements and reproducible bug fixes. Further folder-association reliability work will preserve recovery safeguards. Whitespace double-click navigation, dual panes and a separate favorites bar remain future evaluation items. PR #24 (0.7.4 / 0.7.5 fixes) has been merged. Other contributor PRs remain subject to individual review and regression testing.
