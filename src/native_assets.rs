@@ -315,18 +315,22 @@ pub fn serve(json: &str) -> Result<()> {
                 unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 4,
                 "不自动读取网络驱动器缩略图"
             );
-            let metadata = std::fs::metadata(&item.path)?;
+            // `item` is built from `symlink_metadata`; keep the identity check on the
+            // same source. Following a reparse point here reports the junction
+            // target's mtime, which never matches the link's own metadata.
+            let metadata = std::fs::symlink_metadata(&item.path)?;
             anyhow::ensure!(
                 metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
                 "不自动下载脱机或云占位文件"
             );
+            let directory = metadata.file_attributes() & 0x10 != 0;
             anyhow::ensure!(
-                metadata.is_dir() == item.directory
-                    && (if metadata.is_dir() { 0 } else { metadata.len() }) == item.size
+                directory == item.directory
+                    && (if directory { 0 } else { metadata.len() }) == item.size
                     && metadata.modified().ok() == item.modified,
                 "文件已变化"
             );
-            let shortcut = !metadata.is_dir()
+            let shortcut = !directory
                 && matches!(
                     item.path
                         .extension()

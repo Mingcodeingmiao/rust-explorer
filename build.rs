@@ -26,7 +26,13 @@ fn main() {
         for library in ["ole32", "oleaut32", "shell32", "uuid", "propsys"] {
             println!("cargo:rustc-link-lib={library}");
         }
-        embed_resource::compile("resources/app.rc", embed_resource::NONE)
+        // Link the resource archive (manifest + version info + icon) into every
+        // target exactly once. `compile` would emit `rustc-link-arg-bins` only, so
+        // the unit-test binary of the lib target loaded ComCtl32 v5 and died with
+        // STATUS_ENTRYPOINT_NOT_FOUND on the `TaskDialogIndirect` import that gpui
+        // pulls in; combining `compile` with an extra all-target link argument
+        // duplicates the manifest and makes the linker report a .rsrc merge failure.
+        embed_resource::compile_for_everything("resources/app.rc", embed_resource::NONE)
             .manifest_required()
             .expect("Failed to embed the Windows application manifest");
     }

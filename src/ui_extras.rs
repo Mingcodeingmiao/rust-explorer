@@ -75,6 +75,8 @@ struct NameTip {
     hint: rust_explorer::file_hints::FileHint,
     visible: bool,
     theme: Theme,
+    tip: Option<rust_explorer::file_tip::FileTip>,
+    tip_scale: f32,
 }
 impl NameTip {
     fn new(entry: Entry, theme: Theme, cx: &mut Context<Self>) -> Self {
@@ -134,6 +136,15 @@ impl NameTip {
             hint,
             visible: false,
             theme,
+            tip: None,
+            tip_scale: 1.0,
+        }
+    }
+}
+impl Drop for NameTip {
+    fn drop(&mut self) {
+        if let Some(tip) = self.tip.as_mut() {
+            tip.hide();
         }
     }
 }
@@ -142,86 +153,36 @@ impl Render for NameTip {
         if !self.visible {
             return div().into_any_element();
         }
-        let scale = f32::from(window.rem_size()) / 16.;
-        let texts: Vec<String> = std::iter::once(self.hint.name.clone())
+        // GPUI pixels are logical: the native card needs the monitor DPI as well as
+        // the user's zoom, otherwise it renders at 100% size on a scaled display.
+        let scale = (f32::from(window.rem_size()) / 16.) * window.scale_factor();
+        if shell::menu_active() {
+            // A topmost card must not appear while a native menu is on screen.
+            if let Some(tip) = self.tip.as_mut() {
+                tip.hide();
+            }
+            return div().into_any_element();
+        }
+        if self.tip.is_none() || (self.tip_scale - scale).abs() > 0.01 {
+            self.tip = rust_explorer::file_tip::FileTip::new(scale, self.theme.dark);
+            self.tip_scale = scale;
+        }
+        let text = std::iter::once(self.hint.name.clone())
             .chain(
                 self.hint
                     .lines
                     .iter()
                     .map(|line| format!("{}：{}", line.label, line.value)),
             )
-            .collect();
-        let run = |text: &str| TextRun {
-            len: text.len(),
-            font: font("Microsoft YaHei UI"),
-            color: rgb(self.theme.text).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let width = texts
-            .iter()
-            .map(|text| {
-                f32::from(
-                    window
-                        .text_system()
-                        .shape_line(
-                            text.replace('\n', " ").into(),
-                            px(13. * scale),
-                            &[run(text)],
-                            None,
-                        )
-                        .width,
-                ) / scale
-            })
-            .fold(180_f32, f32::max)
-            .min(580.);
-        let rows: Vec<_> = texts
-            .iter()
-            .map(|text| {
-                let text = wrapped(text);
-                let height = window
-                    .text_system()
-                    .shape_text(
-                        text.clone().into(),
-                        px(13. * scale),
-                        &[run(&text)],
-                        Some(px(width * scale)),
-                        None,
-                    )
-                    .map(|lines| {
-                        lines
-                            .iter()
-                            .map(|line| f32::from(line.size(px(20. * scale)).height) / scale)
-                            .sum::<f32>()
-                    })
-                    .unwrap_or(40.);
-                div()
-                    .w_full()
-                    .h(ui(height.max(20.)))
-                    .flex_shrink_0()
-                    .line_height(ui(20.))
-                    .whitespace_normal()
-                    .child(text)
-            })
-            .collect();
-        div()
-            .w(ui(width + 18.))
-            .p_2()
-            .rounded(ui(4.))
-            .border_1()
-            .border_color(rgb(self.theme.border))
-            .shadow_md()
-            .bg(rgb(self.theme.panel))
-            .text_color(rgb(self.theme.text))
-            .text_size(ui(13.))
-            .font_family("Microsoft YaHei UI")
-            .whitespace_normal()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .children(rows)
-            .into_any_element()
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(tip) = self.tip.as_mut() {
+            // Explorer shows the hover card just below-right of the pointer. The
+            // card is its own click-through window, so it can neither sit under the
+            // pointer nor race the mouse-up that opens the context menu.
+            tip.show(&text, shell::cursor());
+        }
+        div().into_any_element()
     }
 }
 impl Render for DragColumn {
@@ -328,6 +289,11 @@ pub(super) fn open_explorer_request(
                     v.active = 0;
                     v.search
                         .update(cx, |input, cx| input.set_value(v.tabs[0].query.clone(), cx));
+                    // The window was built for its default folder; resolve the
+                    // presentation for the folder it now shows instead of keeping
+                    // the previous one (e.g. This PC's tiles + type grouping).
+                    let dir = v.dir();
+                    v.apply_listing_defaults(&dir);
                 }
                 v.reload(cx);
             });
@@ -383,9 +349,6 @@ fn column_label(id: &str, usage: bool) -> &'static str {
         "size" => "大小",
         _ => "名称",
     }
-}
-fn wrapped(text: &str) -> String {
-    text.to_owned()
 }
 pub(super) fn icon_label_lines(
     text: &str,
@@ -1307,6 +1270,15 @@ impl Explorer {
         self.settings.enqueue_save();
     }
     pub(super) fn rebuild_rows(&mut self) {
+        shell::menu_trace(format!(
+            "view: rebuild_rows dir={:?} view={:?} group={:?} entries={} width={} zoom={}",
+            self.dir(),
+            self.view,
+            self.group,
+            self.entries.len(),
+            self.layout_width,
+            self.zoom
+        ));
         self.thumbnail_viewport.set(None);
         self.rows.clear();
         self.content_image_present = false;
@@ -3856,6 +3828,23 @@ impl Explorer {
         overlay.into_any_element()
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if id == "quick-pinned" || id == "quick-unpinned" {
+            // The native menu already changed the Shell's Quick Access list; pull the
+            // new state immediately instead of waiting for the periodic refresh.
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+            self.quick_access_tick = Instant::now() - Duration::from_secs(16);
+            self.refresh_quick_access(cx);
+            self.status = if id == "quick-pinned" {
+                "已固定到快速访问".into()
+            } else {
+                "已从快速访问取消固定".into()
+            };
+            w.focus(&self.focus);
+            cx.notify();
+            return;
+        }
         if id == "filter-done" {
             self.popup = None;
             self.submenu = None;
@@ -3865,13 +3854,28 @@ impl Explorer {
             return;
         }
         if id == "open-new-tab" || id == "open-new-window" {
-            let folders: Vec<PathBuf> = self
+            let mut folders: Vec<PathBuf> = self
                 .selected
                 .iter()
                 .filter_map(|index| self.entries.get(*index))
                 .filter(|entry| entry.directory && !entry.link)
                 .map(|entry| entry.path.clone())
                 .collect();
+            // Drives and other tiles are not always part of the selection when the
+            // menu was opened on them; fall back to the menu's own target.
+            if folders.is_empty() {
+                if let Some(target) = self.context_target.clone() {
+                    folders.push(target);
+                }
+            }
+            shell::menu_trace(format!(
+                "menu: {id} for {} folder(s): {:?}",
+                folders.len(),
+                folders
+            ));
+            // No presentation is copied from this window: a folder is always listed
+            // the way the settings resolve it (saved per-folder view, else the
+            // built-in default). See `resolved_view` in ui.rs.
             self.popup = None;
             self.submenu = None;
             self.nested_submenu = None;
@@ -4212,6 +4216,10 @@ impl Explorer {
                 if let Some(path) = self.context_target.clone() {
                     if !navigation::is_virtual(&path) {
                         let (x, y) = shell::cursor();
+                        let quick_access_pinned = self
+                            .system_quick_access
+                            .iter()
+                            .any(|item| item.path == path && item.pinned == Some(true));
                         self.run_shell(
                             shell::Request::ThemedMenu {
                                 folder: path.parent().unwrap_or(&path).to_path_buf(),
@@ -4236,6 +4244,8 @@ impl Explorer {
                                 undo: !self.undo_stack.is_empty(),
                                 redo: !self.redo_stack.is_empty(),
                                 can_paste: false,
+                                quick_access_pinned,
+                                owner: shell::active_window_owner(),
                             },
                             cx,
                         );

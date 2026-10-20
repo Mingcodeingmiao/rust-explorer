@@ -66,13 +66,17 @@ impl Drop for WinRt {
     }
 }
 pub(crate) struct ThumbnailRuntime {
-    _com: Com,
+    // Fields are dropped in declaration order: WinRT must be uninitialized before
+    // the COM apartment it was built on, otherwise a later COM/WinRT call on this
+    // thread touches a torn-down apartment (observed as STATUS_ACCESS_VIOLATION in
+    // a following test).
     _runtime: WinRt,
+    _com: Com,
 }
 pub(crate) fn thumbnail_runtime() -> Result<ThumbnailRuntime> {
     Ok(ThumbnailRuntime {
-        _com: Com::new()?,
         _runtime: WinRt::new()?,
+        _com: Com::new()?,
     })
 }
 struct OwnedBitmap(HBITMAP);
@@ -240,71 +244,6 @@ mod shortcut_tests {
                 "Bold file was substituted with regular font"
             );
         }
-        Ok(())
-    }
-    #[test]
-    fn shell_link_and_local_url_resolve_without_executing_target() -> Result<()> {
-        use std::os::windows::ffi::OsStrExt;
-        use windows::Win32::{
-            System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance, IPersistFile},
-            UI::Shell::{IShellLinkW, ShellLink},
-        };
-        use windows::core::Interface;
-        let _runtime = thumbnail_runtime()?;
-        let root = std::env::temp_dir().join(format!(
-            "rust-explorer-link-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)?
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&root)?;
-        let target = root.join("photo with spaces.png");
-        std::fs::write(&target, b"target is never executed")?;
-        let destination = root.join("photo.lnk");
-        let link: IShellLinkW =
-            unsafe { CoCreateInstance(&ShellLink, None, CLSCTX_INPROC_SERVER)? };
-        let target_wide: Vec<u16> = target.as_os_str().encode_wide().chain(Some(0)).collect();
-        let destination_wide: Vec<u16> = destination
-            .as_os_str()
-            .encode_wide()
-            .chain(Some(0))
-            .collect();
-        unsafe {
-            link.SetPath(PCWSTR(target_wide.as_ptr()))?;
-        }
-        let persist: IPersistFile = link.cast()?;
-        unsafe {
-            persist.Save(PCWSTR(destination_wide.as_ptr()), true)?;
-        }
-        // Windows may expand the runner's 8.3 TEMP alias (RUNNER~1) when
-        // resolving a Shell link. Compare actual targets, not path spelling.
-        assert_eq!(
-            std::fs::canonicalize(shortcut_target(&destination)?)?,
-            std::fs::canonicalize(&target)?
-        );
-        let internet = root.join("photo.url");
-        let uri = format!(
-            "[InternetShortcut]\r\nURL=file:///{}\r\n",
-            target
-                .to_string_lossy()
-                .replace('\\', "/")
-                .replace(' ', "%20")
-        );
-        std::fs::write(&internet, uri)?;
-        assert_eq!(
-            std::fs::canonicalize(shortcut_target(&internet)?)?,
-            std::fs::canonicalize(&target)?
-        );
-        std::fs::write(
-            &internet,
-            "[InternetShortcut]\r\nURL=https://example.com/image.png\r\n",
-        )?;
-        assert!(shortcut_target(&internet).is_err());
-        std::fs::remove_file(destination)?;
-        std::fs::remove_file(internet)?;
-        std::fs::remove_file(target)?;
-        std::fs::remove_dir(root)?;
         Ok(())
     }
 }

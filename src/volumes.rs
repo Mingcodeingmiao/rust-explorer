@@ -57,6 +57,10 @@ pub fn basic(path: &Path) -> Volume {
         kind = 4;
     }
     let name = match kind {
+        // DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR: a removed or disconnected mapping
+        // still has a letter in HKCU\Network, so never call it a local disk.
+        0 => "未知设备",
+        1 => "未连接",
         2 => "可移动磁盘",
         4 => "网络驱动器",
         5 => "DVD 驱动器",
@@ -74,7 +78,39 @@ pub fn basic(path: &Path) -> Volume {
         read_only: kind == 5,
     }
 }
+/// `SEM_FAILCRITICALERRORS` must already be active for the *first* query against
+/// a possibly-disconnected network drive, and the previous mode must be restored
+/// afterwards. Both were wrong before: the guard was installed after the first
+/// `GetDiskFreeSpaceExW` and never undone.
+pub(crate) struct QuietVolumeErrors {
+    previous: windows::Win32::System::Diagnostics::Debug::THREAD_ERROR_MODE,
+    active: bool,
+}
+impl QuietVolumeErrors {
+    pub(crate) fn suppress() -> Self {
+        use windows::Win32::System::Diagnostics::Debug::{
+            SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
+        };
+        let mut previous = THREAD_ERROR_MODE(0);
+        let active =
+            unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, Some(&mut previous)) }.is_ok();
+        Self { previous, active }
+    }
+}
+impl Drop for QuietVolumeErrors {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
+                    self.previous,
+                    None,
+                );
+            }
+        }
+    }
+}
 pub fn info(path: &Path) -> Volume {
+    let _quiet = QuietVolumeErrors::suppress();
     let mut volume = basic(path);
     if volume.kind == 4 {
         // This function runs only in a killable helper (800 ms total budget).
@@ -96,10 +132,6 @@ pub fn info(path: &Path) -> Volume {
         }
         let mut flags = 0;
         unsafe {
-            let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
-                windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
-                None,
-            );
             if GetVolumeInformationW(
                 PCWSTR(path.as_ptr()),
                 None,
@@ -123,10 +155,6 @@ pub fn info(path: &Path) -> Volume {
     let mut flags = 0;
     unsafe {
         // Empty optical/card readers must not raise a system error dialog.
-        let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
-            windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
-            None,
-        );
         if GetVolumeInformationW(
             PCWSTR(path.as_ptr()),
             Some(&mut name),
@@ -214,6 +242,25 @@ pub fn bounded<T: serde::de::DeserializeOwned>(
     );
     Ok(serde_json::from_slice(&output)?)
 }
+/// Snapshot taken earlier in this process. All windows live in one process, so a
+/// window that opens later can reuse the drive list instead of enumerating every
+/// drive (and spawning a helper per drive) again.
+static SNAPSHOT_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Volume>)>> =
+    std::sync::Mutex::new(None);
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Snapshot from this process, if one was taken recently enough to be reused.
+pub fn cached_snapshot() -> Option<Vec<Volume>> {
+    let guard = SNAPSHOT_CACHE.lock().ok()?;
+    let (taken, volumes) = guard.as_ref()?;
+    (taken.elapsed() < SNAPSHOT_TTL).then(|| volumes.clone())
+}
+
+pub fn remember_snapshot(volumes: &[Volume]) {
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), volumes.to_vec()));
+    }
+}
 pub fn snapshot() -> Vec<Volume> {
     let mut result: Vec<Volume> = roots()
         .into_iter()
@@ -248,6 +295,7 @@ pub fn snapshot() -> Vec<Volume> {
             });
         }
     }
+    remember_snapshot(&result);
     result
 }
 #[derive(Serialize, Deserialize)]

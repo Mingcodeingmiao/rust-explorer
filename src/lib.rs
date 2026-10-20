@@ -5,6 +5,7 @@ pub mod disk_usage;
 pub mod file_filter;
 pub mod file_hints;
 pub mod file_history;
+pub mod file_tip;
 pub mod fluent_icons;
 pub mod fs;
 pub mod icon_layout;

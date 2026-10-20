@@ -38,12 +38,14 @@ pub fn collect(text: &str) -> anyhow::Result<Vec<Candidate>> {
         {
             continue;
         }
-        let Ok(kind) = entry.file_type() else {
+        // `DirEntry::file_type` does not follow reparse points, so a directory
+        // junction or symlink would complete as a file. Ask for the target type.
+        let Ok(metadata) = entry.metadata() else {
             continue;
         };
         matches.push(Candidate {
             path: entry.path(),
-            directory: kind.is_dir(),
+            directory: metadata.is_dir(),
         });
         if matches.len() >= 256 {
             break;

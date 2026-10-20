@@ -2,6 +2,55 @@
 
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
+## [0.7.5] - 2026-10-20
+
+See [complete release notes](docs/v0.7.5.md) and the [roadmap](ROADMAP.md).
+
+This release fixes the context menu and how new windows are opened, and trims menu/window startup costs.
+
+### Fixed
+
+- Context menus were cancelled by Windows 10-20 ms after they appeared while shown by a helper process, which also took activation away from the application (its taskbar button flipped to the inactive look). Menus are now built and shown **inside the application process**, owned by the application window; that owner is a child window, so the main window keeps its DWM active frame (shadow) and the application stays the active process.
+- The file hover card no longer interferes with the context menu. It is a separate click-through native window (`WS_EX_TRANSPARENT`, `HTTRANSPARENT`, `MA_NOACTIVATE`) placed below-right of the pointer like Explorer, dismissed when a menu opens, and sized from `rem_size x monitor DPI scale`.
+- Right-click jitter is measured strictly between the press and the release (12 px), so moving the pointer while the menu is still being built no longer suppresses it. Menus raised from button-down still wait for the release, plus a 30 ms settle.
+- Menu results are returned without a trailing newline. The application compares exact strings (`command:paste`, `rename`, `properties`, `refresh`, `command:quick-pinned`), so the newline had silently disabled paste, open-in-new-tab, open-in-new-window, delete and the Quick Access refresh.
+- The Shell's `delete` and `paste` verbs now run through the application's own implementations instead of blocking the menu task on their confirmation/progress dialogs (the UI used to stay on "正在处理系统操作").
+- Verbs with their own modal dialog (`format`, `print`, `share`, `burn`) are delegated to a detached helper, and in-process `InvokeCommand` no longer sets `SEE_MASK_NOASYNC`, so no menu action can block the application.
+- The drive "Format" command is not a registry verb (`HKCR\Drive\shell\format` does not exist), so `ShellExecuteExW("format")` led nowhere after the UAC prompt. It now relaunches this executable elevated (`runas` + `--format-drive <letter>`), which calls `SHFormatDrive`.
+- A folder is now listed the way the settings resolve it: the view saved for that folder, otherwise the built-in default (This PC / portable devices use tiles, other folders use details). A window opened for a drive no longer keeps the default folder's presentation (tiles + type grouping), because the window now re-resolves the view when its tab is replaced.
+- Quick Access: a folder that is already pinned shows "从快速访问取消固定" (routed to `unpinfromhome`), the list refreshes immediately after a pin or unpin, and the background snapshot resolves per-entry pin state within a bounded probe budget.
+- The "re-show a menu that vanished within 120 ms" retry was removed: it existed to paper over the cross-process activation race.
+
+### Performance
+
+- Menu build cost: about 250-300 ms cold and 40-80 ms warm, with a `GetCommandString` cache that removes two redundant passes per menu.
+- Drives and Quick Access are cached per process (20 s TTL each): a window that opens later reuses the snapshot instead of enumerating drives and spawning another Quick Access helper, so the sidebar appears immediately.
+- Only the target folder is passed to a new window.
+
+### Build
+
+- The Shell-link/Internet-shortcut test now runs as an integration test (`tests/shortcut_targets.rs`). It initializes a COM apartment, and the unit tests share one thread: uninitializing there made the next test crash with `STATUS_ACCESS_VIOLATION`. `scripts/check.ps1` runs that test in its own process.
+
+## [0.7.4] - 2026-10-19
+
+See [complete release notes](docs/v0.7.4.md) and the [roadmap](ROADMAP.md).
+
+Maintenance release for Shell/COM and Win32 usage defects found in an audit.
+
+### Fixed
+
+- Junction and directory-symlink thumbnails were always rejected as "file changed": the identity check followed reparse points while the entry itself was built from `symlink_metadata`.
+- Drive-root drop containment: a canonicalized root (`\\?\C:\`) carries a trailing separator, so the string-prefix check let a drive root be dropped into its own subfolder. Paths are compared by component now.
+- Portable-device (MTP) property sheets were opened without holding an STA and without a message pump, so they could close immediately or never appear.
+- Volume queries now install `SEM_FAILCRITICALERRORS` before the first call and restore the previous mode; `DRIVE_UNKNOWN`/`DRIVE_NO_ROOT_DIR` are reported as unknown/disconnected instead of "local disk".
+- `SHGetKnownFolderPath` results are released even when the string conversion fails.
+- Multi-selection context menus no longer reject a shared parent folder that differs only in letter case.
+- Path completion and icon reads use the same `symlink_metadata` source as the entry, and Shell calls run with an initialized apartment and a message pump.
+
+### Build
+
+- `cargo test` runs on Windows again: the embedded application manifest (ComCtl32 v6) is now linked into every target, so the `TaskDialogIndirect` import that gpui pulls in resolves in test binaries. Core suite: 96 passed, 1 ignored.
+
 ## [0.7.3] - 2026-10-19
 
 See [complete release notes](docs/v0.7.3.md) and the [roadmap](ROADMAP.md).

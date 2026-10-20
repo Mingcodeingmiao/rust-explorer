@@ -128,6 +128,11 @@ struct FileDragState {
     target: Option<PathBuf>,
     mode: shell::TransferMode,
 }
+/// Pointer travel that turns a right-click into a right-drag. The system drag
+/// rectangle (`SM_CXDRAG`) is about 4 px, which a normal hand jitter can exceed
+/// while still intending a click, so give the gesture noticeably more slack; the
+/// native menu host applies the same tolerance before it refuses to show a menu.
+const RIGHT_DRAG_SLOP: f64 = 12.0;
 struct RightFileDrag {
     index: usize,
     paths: Vec<PathBuf>,
@@ -349,6 +354,40 @@ impl Drop for Explorer {
         self.cancel.store(true, Ordering::Relaxed);
         self.preview_cancel.store(true, Ordering::Relaxed);
     }
+}
+
+/// How a folder should be listed: the view saved for it in the settings file,
+/// otherwise the built-in default for that kind of folder. This is resolved every
+/// time a folder is listed, so a window never depends on what another window used.
+fn resolved_view(settings: &rust_explorer::settings::Settings, path: &std::path::Path) -> ViewMode {
+    let saved = settings.folder_views.get(path).copied();
+    let fallback = built_in_view(path);
+    let resolved = if settings.remember_views {
+        saved.unwrap_or(fallback)
+    } else {
+        fallback
+    };
+    view_trace(format!(
+        "resolved folder={:?} remember={} saved={:?} default={:?} -> {:?}",
+        path, settings.remember_views, saved, fallback, resolved
+    ));
+    resolved
+}
+fn built_in_view(path: &std::path::Path) -> ViewMode {
+    if volumes::is_computer(path) {
+        ViewMode::Tiles
+    } else if path.to_string_lossy().starts_with("mtp-root:") {
+        ViewMode::Tiles
+    } else {
+        // Explorer's own default for an ordinary folder.
+        ViewMode::Details
+    }
+}
+
+/// Diagnostic: how a folder's listing view was decided. Written to the menu trace
+/// log when `RUST_EXPLORER_MENU_TRACE=1`.
+fn view_trace(message: impl std::fmt::Display) {
+    rust_explorer::shell::menu_trace(format!("view: {message}"));
 }
 
 impl Explorer {
@@ -659,19 +698,14 @@ impl Explorer {
             settings.quick_access_system_migrated = true;
             settings.enqueue_save();
         }
-        let mut view = settings
-            .folder_views
-            .get(&initial)
-            .copied()
-            .filter(|_| settings.remember_views)
-            .unwrap_or(if volumes::is_computer(&initial) {
-                ViewMode::Tiles
-            } else {
-                settings.view
-            });
+        let mut view = resolved_view(&settings, &initial);
         if initial.to_string_lossy().starts_with("mtp-root:") {
             view = ViewMode::Tiles;
         }
+        view_trace(format!(
+            "new window initial={:?} remember={} -> view={:?}",
+            initial, settings.remember_views, view
+        ));
         let this = Self {
             marquee: None,
             view,
@@ -1019,18 +1053,40 @@ impl Explorer {
         }
         cx.notify();
     }
+    /// Resolve how the given folder should be listed and reset the grouping that
+    /// belongs to that kind of folder. A window built for one folder and then
+    /// pointed at another must not keep the first folder's presentation.
+    pub(super) fn apply_listing_defaults(&mut self, path: &std::path::Path) {
+        self.view = resolved_view(&self.settings, path);
+        if rust_explorer::shell_folder::is_recycle_bin_path(path) {
+            self.view = ViewMode::Details;
+        }
+        if path.to_string_lossy().starts_with("mtp-root:") {
+            self.view = ViewMode::Tiles;
+        }
+        // Grouping is a property of the folder being listed, not of the window:
+        // This PC groups by type, an ordinary folder starts ungrouped.
+        self.group = if volumes::is_computer(path) {
+            "kind".into()
+        } else {
+            String::new()
+        };
+        view_trace(format!(
+            "listing defaults for {:?} -> view={:?} group={:?}",
+            path, self.view, self.group
+        ));
+    }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.settings.remember_views {
-            self.view = self.settings.folder_views.get(&path).copied().unwrap_or(
-                if volumes::is_computer(&path) {
-                    ViewMode::Tiles
-                } else {
-                    self.settings.view
-                },
-            );
+            self.view = resolved_view(&self.settings, &path);
+            view_trace(format!(
+                "navigate {:?} -> view={:?} group={:?}",
+                path, self.view, self.group
+            ));
         }
         if rust_explorer::shell_folder::is_recycle_bin_path(&path) {
             self.view = ViewMode::Details;
+            view_trace(format!("navigate {:?} is recycling bin -> Details", path));
         }
         if volumes::is_computer(&path) && !volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
@@ -2007,6 +2063,18 @@ impl Explorer {
         if self.busy {
             return;
         }
+        rust_explorer::shell::menu_trace(format!(
+            "app: menu() rb_down={}",
+            (unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                    windows::Win32::UI::Input::KeyboardAndMouse::VK_RBUTTON.0 as i32,
+                )
+            } as u16
+                & 0x8000)
+                != 0
+        ));
+        // The hover card must never overlap the menu it was opened next to.
+        rust_explorer::file_tip::hide_current();
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
             self.system_menu(cx);
             return;
@@ -2056,6 +2124,17 @@ impl Explorer {
         cx.notify();
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
+        rust_explorer::shell::menu_trace(format!(
+            "app: system_menu() rb_down={}",
+            (unsafe {
+                windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(
+                    windows::Win32::UI::Input::KeyboardAndMouse::VK_RBUTTON.0 as i32,
+                )
+            } as u16
+                & 0x8000)
+                != 0
+        ));
+        rust_explorer::file_tip::hide_current();
         if navigation::is_shell_folder(&self.dir())
             && !rust_explorer::shell_folder::is_recycle_bin_path(&self.dir())
             && !self.selected.is_empty()
@@ -2074,6 +2153,7 @@ impl Explorer {
                     y,
                     dark: self.theme.dark,
                     expanded: self.computer_open,
+                    owner: shell::active_window_owner(),
                 },
                 cx,
             );
@@ -2094,9 +2174,17 @@ impl Explorer {
             return;
         }
         let (x, y) = shell::cursor();
+        let paths = self.paths();
+        // The Shell's file-system menu always offers `pintohome`; tell the host when
+        // that folder is already pinned so it can present the unpin action instead.
+        let quick_access_pinned = paths.len() == 1
+            && self
+                .system_quick_access
+                .iter()
+                .any(|item| item.path == paths[0] && item.pinned == Some(true));
         self.run_shell(
             shell::Request::ThemedMenu {
-                paths: self.paths(),
+                paths,
                 folder: self.dir(),
                 x,
                 y,
@@ -2118,6 +2206,8 @@ impl Explorer {
                 undo: !self.undo_stack.is_empty(),
                 redo: !self.redo_stack.is_empty(),
                 can_paste: self.can_paste(),
+                quick_access_pinned,
+                owner: shell::active_window_owner(),
             },
             cx,
         );
@@ -2513,16 +2603,7 @@ impl Explorer {
         self.reveal_pending = !self.external_reveal.is_empty();
         self.reveal_scroll = None;
         if self.settings.remember_views {
-            self.view = self
-                .settings
-                .folder_views
-                .get(&self.dir())
-                .copied()
-                .unwrap_or(if volumes::is_computer(&self.dir()) {
-                    ViewMode::Tiles
-                } else {
-                    self.settings.view
-                });
+            self.view = resolved_view(&self.settings, &self.dir());
         }
         if !was_computer && volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
@@ -3548,7 +3629,7 @@ impl Render for Explorer {
                             .as_ref()
                             .map(|r| (r.index, r.paths.clone(), r.start, r.active));
                         if let Some((index, paths, start, active)) = right {
-                            if active || (event.position - start).magnitude() > 4. {
+                            if active || (event.position - start).magnitude() > RIGHT_DRAG_SLOP {
                                 if !active {
                                     if !v.selected.contains(&index) {
                                         v.select(index, false, false, w, cx);
@@ -4905,6 +4986,8 @@ impl Render for Explorer {
 
 pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
     rust_explorer::fluent_icons::initialize();
+    // Context menus are now built in-process, so there is no helper to pre-warm;
+    // the Shell's handlers are loaded together with the application's own COM.
     Application::new()
         .with_assets(rust_explorer::fluent_icons::Assets)
         .run(move |cx: &mut App| {
