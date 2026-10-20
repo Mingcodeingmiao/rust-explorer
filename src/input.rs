@@ -48,6 +48,7 @@ pub struct TextInput {
     pub compact: bool,
     pub single_line_scroll: bool,
     pub click_to_end: bool,
+    pub double_click_select_all: bool,
     drag_anchor: Option<Point<Pixels>>,
     scroll_x: Pixels,
 }
@@ -68,6 +69,7 @@ impl TextInput {
             compact: false,
             single_line_scroll: false,
             click_to_end: false,
+            double_click_select_all: false,
             drag_anchor: None,
             scroll_x: px(0.),
         }
@@ -80,6 +82,23 @@ impl TextInput {
     }
     pub fn value(&self) -> String {
         self.content.to_string()
+    }
+    pub fn text_command_available(&self, command: &str, can_paste: bool) -> bool {
+        match command {
+            "cut" | "copy" => !self.selected_range.is_empty(),
+            "paste" => can_paste,
+            "all" => !self.content.is_empty(),
+            _ => false,
+        }
+    }
+    pub fn text_command(&mut self, command: &str, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle);
+        match command {
+            "cut" => self.cut(&Cut, window, cx),
+            "copy" => self.copy(&Copy, window, cx),
+            "paste" => self.paste(&Paste, window, cx),
+            _ => self.select_all(&SelectAll, window, cx),
+        }
     }
     pub fn set_value(&mut self, value: String, cx: &mut Context<Self>) {
         self.content = value.into();
@@ -178,8 +197,15 @@ impl TextInput {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        cx.stop_propagation();
         self.is_selecting = true;
         self.drag_anchor = None;
+
+        if self.double_click_select_all && event.click_count >= 2 {
+            self.is_selecting = false;
+            self.select_all(&SelectAll, window, cx);
+            return;
+        }
 
         if self.click_to_end && !event.modifiers.shift {
             self.drag_anchor = Some(event.position);
@@ -582,7 +608,7 @@ impl Element for TextElement {
             underline: None,
             strikethrough: None,
         };
-        let runs = if let Some(marked_range) = input.marked_range.as_ref() {
+        let mut runs = if let Some(marked_range) = input.marked_range.as_ref() {
             vec![
                 TextRun {
                     len: marked_range.start,
@@ -608,6 +634,38 @@ impl Element for TextElement {
         } else {
             vec![run]
         };
+
+        // Split existing IME runs at selection boundaries so selected glyphs
+        // remain white in both themes without losing composition underlines.
+        if !selected_range.is_empty() {
+            let mut offset = 0;
+            runs = runs
+                .into_iter()
+                .flat_map(|run| {
+                    let start = offset;
+                    offset += run.len;
+                    let mut boundaries = vec![start, offset];
+                    for boundary in [selected_range.start, selected_range.end] {
+                        if boundary > start && boundary < offset {
+                            boundaries.push(boundary);
+                        }
+                    }
+                    boundaries.sort_unstable();
+                    boundaries
+                        .windows(2)
+                        .map(|pair| TextRun {
+                            len: pair[1] - pair[0],
+                            color: if selected_range.contains(&pair[0]) {
+                                rgb(0xffffff).into()
+                            } else {
+                                run.color
+                            },
+                            ..run.clone()
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+        }
 
         let font_size = style.font_size.to_pixels(window.rem_size());
         let line = window
@@ -663,8 +721,8 @@ impl Element for TextElement {
                 };
                 selection.push(fill(
                     Bounds::new(origin + p, size(width.max(px(1.)), line_height)),
-                    // Windows' text selection colour (rgb(0,120,212)).
-                    rgb(0x0078D4),
+                    // Windows text selection: rgb(0,120,215).
+                    rgb(0x0078D7),
                 ));
             }
         }
@@ -730,6 +788,7 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .relative()
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -752,6 +811,20 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::suggest_previous))
             .on_action(cx.listener(Self::suggest_next))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|v, _, w, cx| {
+                    cx.stop_propagation();
+                    w.focus(&v.focus_handle);
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Right,
+                cx.listener(|_, e: &MouseUpEvent, _, cx| {
+                    cx.stop_propagation();
+                    cx.emit(InputEvent::ContextMenu(e.position));
+                }),
+            )
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -778,6 +851,7 @@ impl Focusable for TextInput {
 }
 
 pub enum InputEvent {
+    ContextMenu(Point<Pixels>),
     Suggestion(i32),
     Changed,
     Submit,

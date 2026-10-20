@@ -9,9 +9,9 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.7.6。** 本次修复文件视图里的**快捷方式图标**：`.url` 重新有图标预览（不再把网址当文件目标解析，改取 .url 自身图标），快捷方式预览图统一叠加**链接箭头**（Shell 的图像接口不会叠加覆盖图标），自绘链接徽标尺寸按 Explorer 的比例调整（超大 27.5%、大 25%、中等 15.6%，其余不变）。详见 [0.7.6 更新说明](docs/v0.7.6.md)。0.7.5 修复了右键菜单与新窗口打开行为并做性能优化（见 [0.7.5 更新说明](docs/v0.7.5.md)）；0.7.4 修复了审计发现的 Shell/COM 与 Win32 调用缺陷（见 [0.7.4 更新说明](docs/v0.7.4.md)）。0.7.3 引入的可恢复实验性默认文件夹关联、内部回收站、启动页与标签页设置保持不变；MTP/WPD 设备传输仍可能要求串行读写，同一手机内直接复制/移动受设备能力限制，可使用电脑中转；不宣称与 Explorer 完全等价。
+**当前版本为 0.7.6。** 整合 PR #27 及后续修复：回收站列设置和删除确认、深色选中颜色、快速访问、系统操作停止/详情、地址栏及重命名编辑、启动图标和磁盘信息加载。支持清空缓存，改善系统菜单 COM 初始化与新建/格式化窗口行为。详见 [0.7.6 更新说明](docs/v0.7.6.md) 和 [已知边界](KNOWN_ISSUES.md)。实验性默认文件夹关联保留备份、限时试用和恢复机制，默认不启用；MTP 同设备内复制/移动仍受设备能力限制。
 
-最新已发布下载：[Rust Explorer 0.7.5](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.5)。本页描述的 0.7.6 改动已在主分支，尚未发布安装包；请完整解压 Windows x64 ZIP，并核对同页的 `SHA256SUMS.txt`。
+最新已发布下载：[Rust Explorer 0.7.6](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.6)。请完整解压 Windows x64 ZIP，并核对同页的 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时请先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 

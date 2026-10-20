@@ -76,14 +76,33 @@ struct Icons {
     failures: HashMap<IconRequest, (std::time::Instant, u8)>,
     retrying: std::collections::HashSet<IconRequest>,
     requests: mpsc::Sender<IconRequest>,
+    priority: mpsc::Sender<IconRequest>,
     results: mpsc::Receiver<(IconRequest, Option<PathBuf>)>,
     pixels: u32,
     dark: bool,
+    generation: u64,
 }
 impl Icons {
     fn new() -> Self {
         let (tx, rx) = mpsc::channel::<IconRequest>();
         let (results_tx, results) = mpsc::channel();
+        let (priority, urgent) = mpsc::channel::<IconRequest>();
+        let urgent_results = results_tx.clone();
+        std::thread::Builder::new()
+            .name("navigation-icons".into())
+            .spawn(move || {
+                while let Ok(first) = urgent.recv() {
+                    let mut batch = vec![first];
+                    batch.extend(urgent.try_iter().take(7));
+                    let paths = native_assets::icons(batch.clone());
+                    for (key, path) in batch.into_iter().zip(paths) {
+                        if urgent_results.send((key, path)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            })
+            .expect("navigation icon worker");
         std::thread::Builder::new()
             .name("system-icons".into())
             .spawn(move || {
@@ -105,12 +124,20 @@ impl Icons {
             failures: HashMap::new(),
             retrying: Default::default(),
             requests: tx,
+            priority,
             results,
             pixels: 20,
             dark: true,
+            generation: 0,
         }
     }
-    fn get(&mut self, key: IconRequest) -> Option<PathBuf> {
+    fn get(&mut self, mut key: IconRequest) -> Option<PathBuf> {
+        key.epoch = key.epoch.wrapping_add(self.generation << 32);
+        if self.images.len() >= 2048 && !self.images.contains_key(&key) {
+            self.images.clear();
+            self.failures.clear();
+            self.retrying.clear();
+        }
         let previous = if key.epoch != 0 {
             self.images.iter().find_map(|(old, path)| {
                 if old.path == key.path && old.pixels == key.pixels && old.name == key.name {
@@ -134,11 +161,48 @@ impl Icons {
             return path.clone();
         }
         self.images.insert(key.clone(), previous.clone());
-        let _ = self.requests.send(key);
+        self.request(key);
         previous
+    }
+    fn request(&self, key: IconRequest) {
+        let priority = key.name != "file"
+            || (key.directory && key.path.has_root() && key.path.parent().is_none());
+        let _ = if priority {
+            self.priority.send(key)
+        } else {
+            self.requests.send(key)
+        };
     }
 }
 thread_local! {static ICONS:RefCell<Icons>=RefCell::new(Icons::new());}
+thread_local! {static ICON_IMAGES:RefCell<Option<Entity<ThumbnailImages>>> = const { RefCell::new(None) };}
+pub fn initialize_image_cache(cx: &mut App) {
+    ICON_IMAGES.with(|cache| {
+        if cache.borrow().is_none() {
+            *cache.borrow_mut() = Some(ThumbnailImages::new(cx));
+        }
+    });
+}
+pub fn reset_image_cache(cx: &mut App) {
+    ICON_IMAGES.with(|cache| *cache.borrow_mut() = Some(ThumbnailImages::new(cx)));
+}
+fn icon_image(path: PathBuf) -> Img {
+    let image = img(path);
+    if let Some(cache) = ICON_IMAGES.with(|cache| cache.borrow().clone()) {
+        image.image_cache(&cache)
+    } else {
+        image
+    }
+}
+pub fn clear_cache() {
+    ICONS.with(|icons| {
+        let mut icons = icons.borrow_mut();
+        icons.images.clear();
+        icons.failures.clear();
+        icons.retrying.clear();
+        icons.generation = icons.generation.wrapping_add(1);
+    });
+}
 pub fn set_pixels(pixels: u32) {
     ICONS.with(|v| v.borrow_mut().pixels = pixels.clamp(16, 96));
 }
@@ -187,7 +251,7 @@ pub fn drain() -> bool {
             .collect();
         for key in retry {
             v.retrying.insert(key.clone());
-            let _ = v.requests.send(key);
+            v.request(key);
         }
         changed
     })
@@ -464,11 +528,17 @@ pub fn file_icon_sized(path: &Path, directory: bool, color: u32, logical: f32) -
         .items_center()
         .justify_center()
         .when_some(image.clone(), |d, path| {
-            d.child(img(path).size_full().object_fit(ObjectFit::Contain))
+            d.child(icon_image(path).size_full().object_fit(ObjectFit::Contain))
         })
         .when(image.is_none(), |d| {
             d.child(drawn_icon_sized(
-                if directory { "folder" } else { "file" },
+                if directory && path.has_root() && path.parent().is_none() {
+                    "drive"
+                } else if directory {
+                    "folder"
+                } else {
+                    "file"
+                },
                 color,
                 logical,
             ))
@@ -497,7 +567,7 @@ pub fn associated_app_icon(path: &Path, color: u32, logical: f32) -> AnyElement 
         .size(ui(logical))
         .flex_shrink_0()
         .when_some(image.clone(), |d, path| {
-            d.child(img(path).size_full().object_fit(ObjectFit::Contain))
+            d.child(icon_image(path).size_full().object_fit(ObjectFit::Contain))
         })
         .when(image.is_none(), |d| {
             d.child(file_icon_sized(path, false, color, logical))
@@ -511,7 +581,7 @@ fn picture_or_draw_sized(
     logical: f32,
 ) -> AnyElement {
     if let Some(path) = path {
-        img(path)
+        icon_image(path)
             .size(ui(logical))
             .flex_shrink_0()
             .object_fit(ObjectFit::Contain)

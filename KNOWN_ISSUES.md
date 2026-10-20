@@ -10,7 +10,7 @@
 - Release binaries are currently unsigned. Verify the release checksum and source before running.
 - Version 0.7.6 includes experimental folder/drive associations (introduced in 0.7.3), disabled by default. They do not replace Win+E, the desktop Shell or software that explicitly starts Explorer. Keep the recovery files and restore the association before moving/removing the executable. See [recovery instructions](docs/default-folder-browser.md).
 - Dual-pane browsing, a separate top favorites bar and double-clicking folder whitespace to go up are not implemented in 0.7.6. Quick Access can optionally open folders in new tabs. See the [roadmap](ROADMAP.md) for planned work; open contributor PRs are not automatically included.
-- In 0.7.5 and later, right-click menus are built and displayed on an STA thread inside the application process. A third-party Shell extension that hangs can stall that menu; an extension crash can affect the application. File operations and previews continue to use separate helpers where applicable.
+- In 0.7.6, UI native menus and tracked Shell operations run in separate STA helper processes. Stop requests attempt to close owned dialogs; force-stop ends only the corresponding helper and does not roll back completed changes. External/elevated Windows hosts may need manual closing. Format completion in operation history means the dialog launch request completed, not that the drive was formatted.
 
 See the detailed [0.6.2 audit](docs/audit-0.6.2.md) for the distinction between source checks and actual GUI validation. Please report reproducible issues using disposable files and the repository's bug template.
 

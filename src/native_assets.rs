@@ -37,8 +37,10 @@ impl IconRequest {
         // handlers. Portable-device child folders/files use generic stock icons
         // so a phone folder does not issue one slow Shell icon request each.
         let shell_root = path.to_string_lossy().starts_with("mtp-root:");
-        let custom_folder =
-            directory && path.is_absolute() && crate::system_icons::folder_has_custom_icon(path);
+        // This constructor runs during GUI layout. Even probing desktop.ini can
+        // block on disconnected drives, so folder customization is resolved only
+        // by the bounded provider helper, using the actual path as its key.
+        let custom_folder = directory && path.is_absolute();
         let per_item = shell_root
             || custom_folder
             || (path.is_absolute()
@@ -127,6 +129,56 @@ fn cache_root() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
         .join("RustExplorer/cache/native-v6-r5")
+}
+/// Remove only this application's generated native PNGs; never follow links.
+pub fn clear_disk_cache() -> Result<(usize, usize)> {
+    clear_cache_at(&cache_root())
+}
+fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
+    use std::os::windows::fs::MetadataExt;
+    let metadata = match std::fs::symlink_metadata(root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        metadata.is_dir() && metadata.file_attributes() & 0x400 == 0,
+        "缓存目录是链接，未进行清理"
+    );
+    let mut removed = 0;
+    let mut failed = 0;
+    for folder in [root.to_path_buf(), root.join("thumbnails-v6")] {
+        let Ok(metadata) = std::fs::symlink_metadata(&folder) else {
+            continue;
+        };
+        if metadata.file_attributes() & 0x400 != 0 || !metadata.is_dir() {
+            continue;
+        }
+        for entry in std::fs::read_dir(&folder)? {
+            let Ok(entry) = entry else {
+                failed += 1;
+                continue;
+            };
+            let Ok(metadata) = entry.file_type() else {
+                failed += 1;
+                continue;
+            };
+            if !metadata.is_file() || metadata.is_symlink() {
+                continue;
+            }
+            if !matches!(
+                entry.path().extension().and_then(|s| s.to_str()),
+                Some("png" | "tmp")
+            ) {
+                continue;
+            }
+            match std::fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(_) => failed += 1,
+            }
+        }
+    }
+    Ok((removed, failed))
 }
 fn cache_path(key: impl Hash) -> Result<PathBuf> {
     let root = cache_root();
@@ -653,6 +705,24 @@ pub fn resolve_shortcut(path: &Path, cancel: &Arc<AtomicBool>) -> Result<PathBuf
     }
 }
 pub fn icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
+    if items.len() > 1
+        && items
+            .iter()
+            .any(|item| item.directory && item.path.has_root() && item.path.parent().is_none())
+    {
+        // A stalled network/optical icon must not discard already available local
+        // drive icons when the batch deadline expires.
+        return std::thread::scope(|scope| {
+            let tasks: Vec<_> = items
+                .into_iter()
+                .map(|item| scope.spawn(move || icons(vec![item]).into_iter().next().flatten()))
+                .collect();
+            tasks
+                .into_iter()
+                .map(|task| task.join().unwrap_or_default())
+                .collect()
+        });
+    }
     let count = items.len();
     let cancel = Arc::new(AtomicBool::new(false));
     match call(
@@ -816,5 +886,42 @@ impl ThumbnailSession {
 impl Drop for ThumbnailSession {
     fn drop(&mut self) {
         self.stop();
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    #[test]
+    fn clearing_generated_cache_preserves_other_files_and_directories() {
+        let root = std::env::temp_dir().join(format!(
+            "re-cache-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(root.join("thumbnails-v6")).unwrap();
+        std::fs::create_dir(root.join("other")).unwrap();
+        for file in [
+            "icon.png",
+            "keep.txt",
+            "thumbnails-v6/thumb.png",
+            "thumbnails-v6/keep.txt",
+            "other/untouched.png",
+        ] {
+            std::fs::write(root.join(file), b"fixture").unwrap();
+        }
+        assert_eq!(super::clear_cache_at(&root).unwrap(), (2, 0));
+        assert!(!root.join("icon.png").exists());
+        assert!(!root.join("thumbnails-v6/thumb.png").exists());
+        for file in ["keep.txt", "thumbnails-v6/keep.txt", "other/untouched.png"] {
+            assert!(root.join(file).exists());
+            std::fs::remove_file(root.join(file)).unwrap();
+        }
+        std::fs::remove_dir(root.join("thumbnails-v6")).unwrap();
+        std::fs::remove_dir(root.join("other")).unwrap();
+        std::fs::remove_dir(&root).unwrap();
+        assert_eq!(super::clear_cache_at(&root).unwrap(), (0, 0));
     }
 }

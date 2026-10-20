@@ -4,18 +4,26 @@ Notable changes are recorded here. Versions before 1.0 may change behavior and c
 
 ## [0.7.6] - 2026-10-20
 
-See [complete release notes](docs/v0.7.6.md) and the [roadmap](ROADMAP.md).
-
-Shortcut icons in the file view.
+See [complete release notes](docs/v0.7.6.md) and the [roadmap](ROADMAP.md). Includes merged PR #27 and subsequent fixes.
 
 ### Fixed
 
-- `.url` shortcuts get an icon preview again. A web shortcut has no file target, so resolving it produced `文件不支持缩略图`; the Shell is now asked for the shortcut file's own icon (the site icon when Windows has one).
-- Shortcut previews drawn from the Shell's icon fallback now carry the link arrow in the bottom-left. `IShellItemImageFactory` never adds the overlay, so shortcuts looked like ordinary files; the badge is composed into the bitmap with Windows' up-left arrow.
-- Items without a Shell thumbnail fall back to their Shell icon, which is what Explorer shows. Previously only the video whitelist asked the Shell, so a shortcut to an application (for example `Telegram.lnk`) produced no image at all.
-- The address bar's leading icon always uses the system glyph U+E7F4 (Segoe Fluent Icons on Windows 11, Segoe MDL2 Assets on Windows 10); Windows 11 was drawing the embedded SVG instead.
-- The self-drawn link badge follows Explorer's proportions: 27.5 % of the icon at extra-large, 25 % at large and 15.6 % at medium icons. Tiles, list and details keep their previous overlay size.
-- Thumbnail cache versions were raised (`native-v6-r4`, `thumbnails-v5`) so existing caches cannot serve the old, badge-less images.
+- Recycle Bin column resize/order/visibility settings and sorting, separately persisted from normal folders (#23).
+- Unicode deletion-confirmation names instead of internal PIDL identifiers (#22); clearer dark selection contrast (#21).
+- Startup drive capacity and icon loading: publish local volumes before portable-device enumeration, separate navigation icon work, isolate slow drive requests, and move desktop.ini reads off the GUI thread (#28).
+- Quick Access enumeration no longer depends on Shell-menu pin probes.
+- Native menus and operations use isolated STA helpers, propagate initialization failures, and avoid RPC_E_CHANGED_MODE on shared executor threads.
+- Native new-folder commands use asynchronous creation and inline rename. Format-dialog launch validates drive roots and provides a valid parent; it no longer waits for the external host or mistakes closing it for a failed format.
+- Right-click item targeting follows visible icons, text and metadata rather than empty row/card space.
+- Address/rename caret selection and text menus; light text selection and inactive title/tab colors; maximized-window drag restoration.
+- Modified-date sorting keeps files before folders in both directions.
+- Shortcut icon/thumbnail fallback, Internet shortcuts, link badges and updated cache versions.
+
+### Added and optimized
+
+- System-operation history with elapsed time, outcome, graceful stop and per-operation force-stop.
+- Clear generated caches from the selection menu; bounded icon/image caches and improved child-process/Win32 handle cleanup.
+- Windows x64 package, notices, documentation and SHA-256 checksum. Local checks: 103 core tests and one shortcut integration test passed, one interactive test skipped; all-target check and release build passed. Validation limits are documented in the release notes.
 
 ## [0.7.5] - 2026-10-20
 

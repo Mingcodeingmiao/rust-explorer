@@ -262,18 +262,30 @@ pub fn remember_snapshot(volumes: &[Volume]) {
     }
 }
 pub fn snapshot() -> Vec<Volume> {
-    let mut result: Vec<Volume> = roots()
-        .into_iter()
-        .map(|path| {
-            let basic = basic(&path);
-            bounded(
-                "--volume-info",
-                &serde_json::to_string(&path).unwrap(),
-                Duration::from_millis(800),
-            )
-            .unwrap_or(basic)
-        })
-        .collect();
+    let roots = roots();
+    let mut result: Vec<Volume> = std::thread::scope(|scope| {
+        let tasks: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                scope.spawn(move || {
+                    bounded(
+                        "--volume-info",
+                        &serde_json::to_string(path).unwrap(),
+                        Duration::from_millis(800),
+                    )
+                    .unwrap_or_else(|_| basic(path))
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .zip(&roots)
+            .map(|(task, path)| task.join().unwrap_or_else(|_| basic(path)))
+            .collect()
+    });
+    // Publish local capacities before a disconnected phone/network provider is
+    // allowed to consume its own timeout budget.
+    remember_snapshot(&result);
     // Portable/MTP devices have no filesystem path; list them through the
     // Shell namespace in an isolated helper.
     if let Ok(devices) =

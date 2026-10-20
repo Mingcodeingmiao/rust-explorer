@@ -57,18 +57,17 @@ pub struct Listing {
     pub parents: Vec<(String, PathBuf)>,
 }
 
-struct Com(bool);
+struct Com;
 impl Com {
-    fn new() -> Self {
-        // RPC_E_CHANGED_MODE means COM is already initialized; use it as-is.
-        Self(unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok())
+    fn new() -> Result<Self> {
+        // A thread already in MTA cannot silently be treated as STA.
+        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
+        Ok(Self)
     }
 }
 impl Drop for Com {
     fn drop(&mut self) {
-        if self.0 {
-            unsafe { CoUninitialize() };
-        }
+        unsafe { CoUninitialize() };
     }
 }
 
@@ -162,7 +161,9 @@ fn ancestors(root: &IShellItem) -> Result<Vec<(String, PathBuf)>> {
 
 /// Whether a Shell namespace item is a folder.
 pub fn is_folder(path: &Path) -> bool {
-    let _com = Com::new();
+    let Ok(_com) = Com::new() else {
+        return false;
+    };
     let Ok(item) = item(path) else {
         return false;
     };
@@ -190,7 +191,7 @@ pub fn pidl(path: &Path) -> Result<Vec<u8>> {
     if let Some(bytes) = decode_pidl(path) {
         return Ok(bytes);
     }
-    let _com = Com::new();
+    let _com = Com::new()?;
     let item = item(path)?;
     unsafe { item_pidl(&item) }
 }
@@ -202,7 +203,7 @@ pub fn properties(path: &Path) -> Result<()> {
     // STA and pump messages until the sheet closes, exactly like the file-system
     // path in `shell::properties`. Otherwise the sheet is torn down (or never
     // appears) as soon as the helper process finishes the request.
-    let _com = Com::new();
+    let _com = Com::new()?;
     let pidl = pidl(path)?;
     use windows::Win32::{
         Foundation::HWND,
@@ -397,7 +398,7 @@ pub fn resolve_display_path(text: &str) -> Result<PathBuf> {
     if text.starts_with("mtp:") || text.starts_with("mtp-root:") {
         return Ok(PathBuf::from(text));
     }
-    let _com = Com::new();
+    let _com = Com::new()?;
     let root = item(Path::new(THIS_PC))?;
     let root_name = unsafe { display_name(&root, SIGDN_NORMALDISPLAY) }.unwrap_or_default();
     let mut parts: Vec<&str> = text
@@ -437,7 +438,7 @@ pub fn resolve_display_path(text: &str) -> Result<PathBuf> {
 
 /// Enumerate a portable device or other Shell namespace folder.
 pub fn list(path: &Path) -> Result<Listing> {
-    let _com = Com::new();
+    let _com = Com::new()?;
     let root = item(path)?;
     let items = enumerate(path)?;
     let name = unsafe { display_name(&root, SIGDN_NORMALDISPLAY) }
@@ -530,7 +531,7 @@ pub fn list(path: &Path) -> Result<Listing> {
 /// Items shown under This PC that do not expose a filesystem path. This
 /// includes MTP phones, cameras and other portable devices.
 pub fn device_paths() -> Result<Vec<(String, PathBuf)>> {
-    let _com = Com::new();
+    let _com = Com::new()?;
     let this_pc = Path::new(THIS_PC);
     let mut result = Vec::new();
     for item in enumerate(this_pc)? {
@@ -607,7 +608,7 @@ pub fn parent(path: &Path) -> Result<PathBuf> {
     {
         return Ok(crate::volumes::computer());
     }
-    let _com = Com::new();
+    let _com = Com::new()?;
     let current = item(path)?;
     let parent = unsafe { current.GetParent() }?;
     let parsing =
@@ -635,6 +636,31 @@ pub fn parent(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn shell_sta_guard_rejects_a_thread_already_initialized_as_mta() {
+        std::thread::spawn(|| {
+            use windows::Win32::System::Com::COINIT_MULTITHREADED;
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+                .ok()
+                .unwrap();
+            struct Mta;
+            impl Drop for Mta {
+                fn drop(&mut self) {
+                    unsafe { CoUninitialize() };
+                }
+            }
+            let _mta = Mta;
+            let error = Com::new()
+                .err()
+                .expect("MTA must not be silently accepted as STA");
+            assert_eq!(
+                error.downcast_ref::<windows::core::Error>().unwrap().code(),
+                windows::Win32::Foundation::RPC_E_CHANGED_MODE
+            );
+        })
+        .join()
+        .unwrap();
+    }
 
     #[test]
     fn up_uses_shell_ancestry_and_restores_device_root_alias() {

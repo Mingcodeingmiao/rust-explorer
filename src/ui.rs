@@ -200,7 +200,17 @@ impl Render for RecycledRow {
     }
 }
 
+struct SystemOperation {
+    id: u64,
+    label: String,
+    started: Instant,
+    finished: Option<Instant>,
+    status: String,
+    control: shell::OperationControl,
+}
 struct Explorer {
+    system_operations: Vec<SystemOperation>,
+    next_operation: u64,
     marquee: Option<Marquee>,
     settings: Settings,
     options: Option<Settings>,
@@ -214,6 +224,7 @@ struct Explorer {
     columns_resize: Option<(usize, f32, f32)>,
     volume_columns_resize: Option<(usize, f32, f32)>,
     sidebar_resize: Option<(f32, f32)>,
+    text_menu_target: Option<Entity<TextInput>>,
     preview_resize: Option<(f32, f32)>,
     scroll_drag: Option<(bool, f32, f32, f32)>,
     aux_scroll_drag: Option<(ScrollHandle, f32, f32, f32)>,
@@ -475,6 +486,7 @@ impl Explorer {
         launch: Option<rust_explorer::launch_request::LaunchRequest>,
         cx: &mut Context<Self>,
     ) -> Self {
+        visual::initialize_image_cache(cx);
         let folder_handler = std::env::args_os()
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
@@ -505,7 +517,7 @@ impl Explorer {
             cx.new(|cx| TextInput::new(initial.display().to_string(), "输入文件夹路径", cx));
         address.update(cx, |input, _| {
             input.single_line_scroll = true;
-            input.click_to_end = true;
+            input.click_to_end = false;
         });
         let search = cx.new(|cx| TextInput::new(String::new(), "搜索此文件夹", cx));
         let dialog_input = cx.new(|cx| TextInput::new(String::new(), "名称", cx));
@@ -515,6 +527,11 @@ impl Explorer {
                 &address,
                 window,
                 |this, input, event, window, cx| match event {
+                    InputEvent::ContextMenu(position) => {
+                        this.text_menu_target = Some(input.clone());
+                        this.popup = Some(("text-menu".into(), *position));
+                        cx.notify();
+                    }
                     InputEvent::Submit => {
                         if let Some(choice) = this.address_choice {
                             if let Some(candidate) = this.address_candidates.get(choice).cloned() {
@@ -632,6 +649,11 @@ impl Explorer {
                 &search,
                 window,
                 |this, input, event, window, cx| match event {
+                    InputEvent::ContextMenu(position) => {
+                        this.text_menu_target = Some(input.clone());
+                        this.popup = Some(("text-menu".into(), *position));
+                        cx.notify();
+                    }
                     InputEvent::Submit => {
                         this.tabs[this.active].query = input.read(cx).value();
                         window.focus(&this.focus);
@@ -667,23 +689,26 @@ impl Explorer {
                 },
             ),
         );
-        subscriptions.push(
-            cx.subscribe_in(
-                &dialog_input,
-                window,
-                |this, _, event, window, cx| match event {
-                    InputEvent::Submit => this.confirm_dialog(window, cx),
-                    InputEvent::Cancel => this.close_dialog(window, cx),
-                    InputEvent::Changed => {
-                        if this.inline_rename.is_some() {
-                            this.invalidate_list();
-                            cx.notify();
-                        }
+        subscriptions.push(cx.subscribe_in(
+            &dialog_input,
+            window,
+            |this, input, event, window, cx| match event {
+                InputEvent::ContextMenu(position) => {
+                    this.text_menu_target = Some(input.clone());
+                    this.popup = Some(("text-menu".into(), *position));
+                    cx.notify();
+                }
+                InputEvent::Submit => this.confirm_dialog(window, cx),
+                InputEvent::Cancel => this.close_dialog(window, cx),
+                InputEvent::Changed => {
+                    if this.inline_rename.is_some() {
+                        this.invalidate_list();
+                        cx.notify();
                     }
-                    InputEvent::Suggestion(_) => {}
-                },
-            ),
-        );
+                }
+                InputEvent::Suggestion(_) => {}
+            },
+        ));
         let (watch_tx, watch_rx) = mpsc::channel();
         let (usage_tx, usage_rx) = mpsc::channel();
         let (drag_tx, drag_rx) = mpsc::channel();
@@ -720,6 +745,7 @@ impl Explorer {
             columns_resize: None,
             volume_columns_resize: None,
             sidebar_resize: None,
+            text_menu_target: None,
             preview_resize: None,
             scroll_drag: None,
             aux_scroll_drag: None,
@@ -820,6 +846,8 @@ impl Explorer {
             descending: false,
             loading: false,
             busy: false,
+            system_operations: Vec::new(),
+            next_operation: 0,
             system_menu_active: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -893,6 +921,28 @@ impl Explorer {
                         }
                         this.refresh_quick_access(cx);
                         this.refresh_computer_name(cx);
+                        if this.volume_busy {
+                            if let Some(snapshot) = volumes::cached_snapshot() {
+                                if snapshot != this.volumes {
+                                    this.volumes = snapshot;
+                                    if this.is_home() {
+                                        this.sync_computer_entries();
+                                    }
+                                    cx.notify();
+                                }
+                            }
+                        }
+                        if this
+                            .popup
+                            .as_ref()
+                            .is_some_and(|(kind, _)| kind == "system-operations")
+                            && this
+                                .system_operations
+                                .iter()
+                                .any(|op| op.finished.is_none())
+                        {
+                            cx.notify();
+                        }
                         if !this.volume_busy && this.volume_tick.elapsed() > Duration::from_secs(3)
                         {
                             this.refresh_volumes(cx);
@@ -1781,6 +1831,17 @@ impl Explorer {
         released
     }
     fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
+        if self
+            .system_operations
+            .iter()
+            .filter(|op| op.finished.is_none())
+            .count()
+            >= 8
+        {
+            self.error = Some("同时运行的系统操作过多，请先停止或关闭现有操作".into());
+            cx.notify();
+            return;
+        }
         let invalidates_usage = matches!(
             &request,
             shell::Request::EmptyRecycleBin
@@ -1805,6 +1866,7 @@ impl Explorer {
                 | shell::Request::PropertiesMany { .. }
                 | shell::Request::SharingAccess { .. }
                 | shell::Request::AdvancedShare { .. }
+                | shell::Request::InvokeVerb { .. }
         );
         if self.busy && !passive {
             return;
@@ -1821,6 +1883,26 @@ impl Explorer {
         if !passive {
             self.busy = true;
         }
+        self.next_operation += 1;
+        let operation_id = self.next_operation;
+        let control = shell::OperationControl::default();
+        if self.system_operations.len() >= 32 {
+            if let Some(index) = self
+                .system_operations
+                .iter()
+                .position(|op| op.finished.is_some())
+            {
+                self.system_operations.remove(index);
+            }
+        }
+        self.system_operations.push(SystemOperation {
+            id: operation_id,
+            label: shell::operation_label(&request),
+            started: Instant::now(),
+            finished: None,
+            status: "正在进行".into(),
+            control: control.clone(),
+        });
         self.error = None;
         let recycle_menu = match &request {
             shell::Request::Menu { folder, .. } | shell::Request::ThemedMenu { folder, .. } => {
@@ -1839,6 +1921,7 @@ impl Explorer {
                     | shell::Request::PropertiesMany { .. }
                     | shell::Request::SharingAccess { .. }
                     | shell::Request::AdvancedShare { .. }
+                    | shell::Request::InvokeVerb { .. }
                     | shell::Request::Menu { .. }
                     | shell::Request::ThemedMenu { .. }
             );
@@ -1868,7 +1951,7 @@ impl Explorer {
             vec![]
         };
         let task = cx.background_executor().spawn(async move {
-            let result = shell::execute_output(request);
+            let result = shell::execute_controlled(request, control);
             let mut history = result
                 .as_ref()
                 .ok()
@@ -1890,6 +1973,24 @@ impl Explorer {
         cx.spawn(async move |view, cx| {
             let (result, history) = task.await;
             view.update(cx, |this, cx| {
+                if let Some(op) = this
+                    .system_operations
+                    .iter_mut()
+                    .find(|op| op.id == operation_id)
+                {
+                    op.finished = Some(Instant::now());
+                    op.status = if op.control.stopping() {
+                        "已停止（请确认部分操作结果）".into()
+                    } else if let Err(error) = &result {
+                        format!("失败：{error:#}")
+                    } else if let Some(error) =
+                        history.as_ref().and_then(|history| history.error.as_ref())
+                    {
+                        format!("失败：{error}")
+                    } else {
+                        "已完成".into()
+                    };
+                }
                 if invalidates_usage {
                     disk_usage::invalidate_cache();
                 }
@@ -2199,6 +2300,8 @@ impl Explorer {
                     Sort::Kind => "kind",
                     Sort::Size => "size",
                     Sort::Created => "created",
+                    Sort::Original => "original",
+                    Sort::Deleted => "deleted",
                 }
                 .into(),
                 descending: self.descending,
@@ -2381,6 +2484,10 @@ impl Explorer {
         };
         self.dialog_input.update(cx, |v, cx| {
             v.compact = matches!(&self.dialog, Some(Dialog::Rename(_)));
+            v.double_click_select_all = matches!(
+                &self.dialog,
+                Some(Dialog::Rename(_) | Dialog::RenameVolume { .. })
+            );
             v.set_value(name, cx);
             if matches!(&self.dialog, Some(Dialog::Rename(_))) {
                 v.focus_filename(window, cx, directory);
@@ -3015,18 +3122,16 @@ impl Explorer {
 }
 
 /// Display name of a path, without the directory: dialogs mention the item only.
-fn item_name(path: &std::path::Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string())
+fn item_name(path: &std::path::Path, entries: &[Entry]) -> String {
+    fs::dialog_item_name(path, entries)
 }
 
 /// First `limit` item names, one per line, with an ellipsis when there are more.
-fn item_names(paths: &[std::path::PathBuf], limit: usize) -> String {
+fn item_names(paths: &[std::path::PathBuf], limit: usize, entries: &[Entry]) -> String {
     let mut names: Vec<String> = paths
         .iter()
         .take(limit)
-        .map(|path| item_name(path))
+        .map(|path| item_name(path, entries))
         .collect();
     if paths.len() > limit {
         names.push("……".into());
@@ -3200,9 +3305,11 @@ impl Render for Explorer {
         let t = self.theme;
         let mut root = div()
             .id("explorer")
-            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, w, cx| {
-                if v.system_menu_active {
-                    cx.stop_propagation();
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, w, _cx| {
+                if v.popup
+                    .as_ref()
+                    .is_some_and(|(kind, _)| kind == "text-menu")
+                {
                     return;
                 }
                 if v.editing_address {
@@ -3723,7 +3830,7 @@ impl Render for Explorer {
                     }
                     if let Some((index, start, width)) = v.columns_resize {
                         if event.dragging() {
-                            v.settings.columns[index].1 = (width
+                            v.active_columns_mut()[index].1 = (width
                                 + (f32::from(event.position.x) - start) / v.zoom)
                                 .clamp(64., 1200.);
                             v.invalidate_list();
@@ -4484,114 +4591,121 @@ impl Render for Explorer {
                                 .child(title.clone()),
                         ),
                 );
-            let element =
-                match &self.preview {
-                    Preview::Empty => div()
-                        .flex_1()
-                        .flex()
-                        .flex_col()
-                        .items_center()
-                        .justify_center()
-                        .gap_3()
-                        .text_color(rgb(t.muted))
-                        .child(icon("\u{e8a5}", t.muted))
-                        .child(if self.selected.len() > 1 {
-                            format!("已选择 {} 个项目", self.selected.len())
-                        } else {
-                            "选择文件以预览".into()
-                        })
-                        .into_any_element(),
-                    Preview::Loading => div()
-                        .p_5()
-                        .text_color(rgb(t.muted))
-                        .child("正在准备预览…")
-                        .into_any_element(),
-                    Preview::Message(message) => div()
-                        .p_5()
-                        .text_color(rgb(t.muted))
-                        .child(message.clone())
-                        .into_any_element(),
-                    Preview::Image(path) | Preview::Video(path) => div()
-                        .flex_1()
-                        .min_h_0()
-                        .p_3()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .child(img(path.clone()).size_full().object_fit(ObjectFit::Contain))
-                        .into_any_element(),
-                    Preview::Text(lines, truncated, encoding) => {
-                        let lines = lines.clone();
-                        div()
-                            .flex_1()
-                            .min_h_0()
-                            .flex()
-                            .flex_col()
-                            .child(
-                                div()
-                                    .px_3()
-                                    .py_1()
-                                    .text_color(rgb(t.muted))
-                                    .text_size(ui(11.))
-                                    .child(*encoding),
-                            )
-                            .when(*truncated, |d| {
-                                d.child(
-                                    div()
-                                        .px_3()
-                                        .py_2()
-                                        .text_color(rgb(t.accent))
-                                        .child("预览已截断（最多 256 KB / 6000 行）"),
-                                )
-                            })
-                            .child(
-                                uniform_list("text-preview", lines.len(), move |range, _, _| {
-                                    range
-                                        .map(|i| {
-                                            div()
-                                                .h(ui(22.))
-                                                .px_3()
-                                                .font_family("Consolas")
-                                                .text_size(ui(12.))
-                                                .overflow_hidden()
-                                                .child(lines[i].clone())
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .flex_1()
-                                .min_h_0(),
-                            )
-                            .into_any_element()
-                    }
-                    Preview::Pdf { path, page, pages } => div()
+            let element = match &self.preview {
+                Preview::Empty => div()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_3()
+                    .text_color(rgb(t.muted))
+                    .child(icon("\u{e8a5}", t.muted))
+                    .child(if self.selected.len() > 1 {
+                        format!("已选择 {} 个项目", self.selected.len())
+                    } else {
+                        "选择文件以预览".into()
+                    })
+                    .into_any_element(),
+                Preview::Loading => div()
+                    .p_5()
+                    .text_color(rgb(t.muted))
+                    .child("正在准备预览…")
+                    .into_any_element(),
+                Preview::Message(message) => div()
+                    .p_5()
+                    .text_color(rgb(t.muted))
+                    .child(message.clone())
+                    .into_any_element(),
+                Preview::Image(path) | Preview::Video(path) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(path.clone())
+                            .image_cache(&self.thumbnail_images)
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                Preview::Text(lines, truncated, encoding) => {
+                    let lines = lines.clone();
+                    div()
                         .flex_1()
                         .min_h_0()
                         .flex()
                         .flex_col()
                         .child(
                             div()
-                                .h(ui(36.))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .child(
-                                    button("pdf-prev", "←", t)
-                                        .on_click(cx.listener(|v, _, _, cx| v.pdf_step(-1, cx))),
-                                )
-                                .child(format!("{} / {}", page + 1, pages))
-                                .child(
-                                    button("pdf-next", "→", t)
-                                        .on_click(cx.listener(|v, _, _, cx| v.pdf_step(1, cx))),
-                                ),
+                                .px_3()
+                                .py_1()
+                                .text_color(rgb(t.muted))
+                                .text_size(ui(11.))
+                                .child(*encoding),
                         )
+                        .when(*truncated, |d| {
+                            d.child(
+                                div()
+                                    .px_3()
+                                    .py_2()
+                                    .text_color(rgb(t.accent))
+                                    .child("预览已截断（最多 256 KB / 6000 行）"),
+                            )
+                        })
                         .child(
-                            div().flex_1().min_h_0().p_3().child(
-                                img(path.clone()).size_full().object_fit(ObjectFit::Contain),
-                            ),
+                            uniform_list("text-preview", lines.len(), move |range, _, _| {
+                                range
+                                    .map(|i| {
+                                        div()
+                                            .h(ui(22.))
+                                            .px_3()
+                                            .font_family("Consolas")
+                                            .text_size(ui(12.))
+                                            .overflow_hidden()
+                                            .child(lines[i].clone())
+                                    })
+                                    .collect::<Vec<_>>()
+                            })
+                            .flex_1()
+                            .min_h_0(),
                         )
-                        .into_any_element(),
-                };
+                        .into_any_element()
+                }
+                Preview::Pdf { path, page, pages } => div()
+                    .flex_1()
+                    .min_h_0()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(ui(36.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .gap_2()
+                            .child(
+                                button("pdf-prev", "←", t)
+                                    .on_click(cx.listener(|v, _, _, cx| v.pdf_step(-1, cx))),
+                            )
+                            .child(format!("{} / {}", page + 1, pages))
+                            .child(
+                                button("pdf-next", "→", t)
+                                    .on_click(cx.listener(|v, _, _, cx| v.pdf_step(1, cx))),
+                            ),
+                    )
+                    .child(
+                        div().flex_1().min_h_0().p_3().child(
+                            img(path.clone())
+                                .image_cache(&self.thumbnail_images)
+                                .size_full()
+                                .object_fit(ObjectFit::Contain),
+                        ),
+                    )
+                    .into_any_element(),
+            };
             let element =
                 if self.settings.details_pane || matches!(self.preview, Preview::Message(_)) {
                     let selected: Vec<_> = self
@@ -4654,7 +4768,12 @@ impl Render for Explorer {
             body = body.child(pane);
         }
         root = root.child(body);
-        let status = if self.busy {
+        let status = if self.busy
+            || self
+                .system_operations
+                .iter()
+                .any(|op| op.finished.is_none())
+        {
             "正在处理系统操作…".to_owned()
         } else if self.loading {
             "正在加载…".to_owned()
@@ -4708,7 +4827,43 @@ impl Render for Explorer {
                 .bg(rgb(t.chrome))
                 .text_size(ui(12.))
                 .text_color(rgb(t.muted))
-                .child(status)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            div()
+                                .id("system-operation-details")
+                                .cursor_pointer()
+                                .child(status)
+                                .on_click(cx.listener(|v, _, w, cx| {
+                                    v.popup =
+                                        Some(("system-operations".into(), w.mouse_position()));
+                                    cx.notify();
+                                })),
+                        )
+                        .when(
+                            self.system_operations
+                                .iter()
+                                .any(|op| op.finished.is_none()),
+                            |d| {
+                                d.child(button("system-operation-stop", "停止", t).on_click(
+                                    cx.listener(|v, _, _, cx| {
+                                        for op in v
+                                            .system_operations
+                                            .iter_mut()
+                                            .filter(|op| op.finished.is_none())
+                                        {
+                                            op.control.stop(false);
+                                            op.status = "正在请求停止".into();
+                                        }
+                                        cx.notify();
+                                    }),
+                                ))
+                            },
+                        ),
+                )
                 .child(format!(
                     "{:.0}% · Ctrl +/− 缩放 · Ctrl+0 重置",
                     self.zoom * 100.
@@ -4865,11 +5020,11 @@ impl Render for Explorer {
                     Dialog::Delete(paths) => (
                         "删除文件",
                         match paths.as_slice() {
-                            [path] => format!("是否删除 {}？", item_name(path)),
+                            [path] => format!("是否删除 {}？", item_name(path, &self.entries)),
                             _ => format!(
                                 "是否删除这 {} 个项目？\n{}",
                                 paths.len(),
-                                item_names(&paths, 3)
+                                item_names(&paths, 3, &self.entries)
                             ),
                         },
                         true,
@@ -4879,12 +5034,12 @@ impl Render for Explorer {
                         match paths.as_slice() {
                             [path] => format!(
                                 "是否删除 {}？\n不会移至回收站，无法通过本程序撤销。",
-                                item_name(path)
+                                item_name(path, &self.entries)
                             ),
                             _ => format!(
                                 "是否删除这 {} 个项目？\n不会移至回收站，无法通过本程序撤销。\n\n{}",
                                 paths.len(),
-                                item_names(&paths, 3)
+                                item_names(&paths, 3, &self.entries)
                             ),
                         },
                         true,

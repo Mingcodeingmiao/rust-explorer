@@ -188,7 +188,11 @@ unsafe fn display_name(item: &IShellItem, kind: SIGDN) -> Result<String> {
 }
 
 pub fn snapshot() -> Result<Vec<Item>> {
+    let trace = std::env::var_os("RUST_EXPLORER_QUICK_ACCESS_TRACE").is_some();
     unsafe {
+        if trace {
+            eprintln!("quick-access: initialize");
+        }
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let _apartment = Apartment;
         // The same shell namespace used by Explorer's Quick Access location.
@@ -196,15 +200,19 @@ pub fn snapshot() -> Result<Vec<Item>> {
             w!("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}"),
             None,
         )?;
+        if trace {
+            eprintln!("quick-access: bind enumeration");
+        }
         let enumeration: IEnumShellItems = root.BindToHandler(None, &BHID_EnumItems)?;
         let mut items = Vec::new();
-        // Knowing whether an entry is pinned costs one context-menu instantiation
-        // per item (~40 ms, more on the first call). Stay well inside the helper's
-        // 1600 ms budget: probe the first entries only and stop at a deadline that
-        // starts with the first probe, so enumeration does not eat the budget.
-        let mut probe_start: Option<std::time::Instant> = None;
-        let mut probed = 0usize;
+        // Never instantiate context menus while loading the list. A single Shell
+        // extension can block QueryContextMenu beyond the entire helper deadline;
+        // checking elapsed time before that call cannot bound its duration. Pin
+        // commands resolve their canonical verbs separately in set_pinned().
         loop {
+            if trace {
+                eprintln!("quick-access: next {}", items.len());
+            }
             let mut fetched = 0;
             let mut batch = [None];
             enumeration.Next(&mut batch, Some(&mut fetched))?;
@@ -226,23 +234,10 @@ pub fn snapshot() -> Result<Vec<Item>> {
                 continue;
             }
             let name = display_name(&item, SIGDN_NORMALDISPLAY).unwrap_or_else(|_| path.clone());
-            let pinned = if probed < 16 {
-                let start = *probe_start.get_or_insert_with(std::time::Instant::now);
-                if start.elapsed() < std::time::Duration::from_millis(900) {
-                    probed += 1;
-                    inventory(&item)
-                        .ok()
-                        .and_then(|menu| pin_state(&menu.commands))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             items.push(Item {
                 name,
                 path: path.into(),
-                pinned,
+                pinned: None,
             });
             if items.len() >= 256 {
                 break;

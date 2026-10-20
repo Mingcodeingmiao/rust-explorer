@@ -43,14 +43,14 @@ impl Theme {
                 text: 0xf2f2f2,
                 muted: 0xaaaaaa,
                 hover: 0x2b2b2b,
-                selection: 0x333d49,
+                selection: 0x36536a,
                 accent: 0x76b9ed,
             }
         } else {
             Self {
                 dark,
                 background: 0xffffff,
-                chrome: 0xe9e9e9,
+                chrome: 0xdddddd,
                 panel: 0xf8f8f8,
                 input: 0xffffff,
                 border: 0xe5e5e5,
