@@ -1200,11 +1200,10 @@ impl Explorer {
                     .flex()
                     .justify_center()
                     .child(visual::icon(
-                        if rust_explorer::system_icons::windows_11() {
-                            "computer"
-                        } else {
-                            "address-computer"
-                        },
+                        // The system glyph U+E7F4 in both cases: Segoe Fluent Icons
+                        // on Windows 11, Segoe MDL2 Assets on Windows 10. The embedded
+                        // SVG is only a fallback when neither font is installed.
+                        "address-computer",
                         t.text,
                     )),
             )

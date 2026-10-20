@@ -8,9 +8,9 @@
 - DPI, IME, narrow windows, all filter combinations and third-party Shell extensions have not been exhaustively tested. Third-party software compatibility layers are intentionally outside the project's scope.
 - Everything is optional. Without a usable installed Everything client/SDK, search falls back to filtering names in the current directory; it does not silently scan the entire disk.
 - Release binaries are currently unsigned. Verify the release checksum and source before running.
-- Version 0.7.5 includes experimental folder/drive associations (introduced in 0.7.3), disabled by default. They do not replace Win+E, the desktop Shell or software that explicitly starts Explorer. Keep the recovery files and restore the association before moving/removing the executable. See [recovery instructions](docs/default-folder-browser.md).
-- Dual-pane browsing, a separate top favorites bar and double-clicking folder whitespace to go up are not implemented in 0.7.5. Quick Access can optionally open folders in new tabs. See the [roadmap](ROADMAP.md) for planned work; open contributor PRs are not automatically included.
-- In 0.7.5, right-click menus are built and displayed on an STA thread inside the application process. A third-party Shell extension that hangs can stall that menu; an extension crash can affect the application. File operations and previews continue to use separate helpers where applicable.
+- Version 0.7.6 includes experimental folder/drive associations (introduced in 0.7.3), disabled by default. They do not replace Win+E, the desktop Shell or software that explicitly starts Explorer. Keep the recovery files and restore the association before moving/removing the executable. See [recovery instructions](docs/default-folder-browser.md).
+- Dual-pane browsing, a separate top favorites bar and double-clicking folder whitespace to go up are not implemented in 0.7.6. Quick Access can optionally open folders in new tabs. See the [roadmap](ROADMAP.md) for planned work; open contributor PRs are not automatically included.
+- In 0.7.5 and later, right-click menus are built and displayed on an STA thread inside the application process. A third-party Shell extension that hangs can stall that menu; an extension crash can affect the application. File operations and previews continue to use separate helpers where applicable.
 
 See the detailed [0.6.2 audit](docs/audit-0.6.2.md) for the distinction between source checks and actual GUI validation. Please report reproducible issues using disposable files and the repository's bug template.
 

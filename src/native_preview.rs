@@ -37,6 +37,66 @@ pub struct Bitmap {
     pub rgba: Vec<u8>,
 }
 
+/// Draw Explorer's shortcut arrow in the bottom-left corner of a thumbnail.
+///
+/// The Shell exposes the link overlay only inside a complete icon, so a preview
+/// bitmap produced by `IShellItemImageFactory` carries no arrow; shortcuts would
+/// otherwise look like ordinary files.
+pub fn with_link_badge(mut bitmap: Bitmap) -> Bitmap {
+    let short = bitmap.width.min(bitmap.height);
+    let edge = ((short as f32 * 0.28).round() as u32).clamp(8, short.max(8));
+    if bitmap.width < edge || bitmap.height < edge {
+        return bitmap;
+    }
+    let x0 = 0u32;
+    let y0 = bitmap.height - edge;
+    let border = [160u8, 160, 160, 255];
+    let background = [255u8, 255, 255, 255];
+    let arrow = [0x00u8, 0x67, 0xC0, 255];
+    for y in 0..edge {
+        for x in 0..edge {
+            let (px, py) = (x0 + x, y0 + y);
+            let index = ((py * bitmap.width + px) * 4) as usize;
+            let u = (x as f32 + 0.5) / edge as f32;
+            let v = (y as f32 + 0.5) / edge as f32;
+            let on_border = x == 0 || y == 0 || x + 1 == edge || y + 1 == edge;
+            let color = if on_border {
+                border
+            } else if in_link_arrow(u, v) {
+                arrow
+            } else {
+                background
+            };
+            bitmap.rgba[index..index + 4].copy_from_slice(&color);
+        }
+    }
+    bitmap
+}
+
+/// Arrow glyph of the shortcut badge, in normalized badge coordinates. Windows
+/// draws it pointing to the upper-left.
+fn in_link_arrow(u: f32, v: f32) -> bool {
+    // Shaft: a thick diagonal line from the lower-right towards the upper-left.
+    let (ax, ay, bx, by) = (0.70f32, 0.70f32, 0.34f32, 0.34f32);
+    let (dx, dy) = (bx - ax, by - ay);
+    let t = (((u - ax) * dx + (v - ay) * dy) / (dx * dx + dy * dy)).clamp(0.0, 1.0);
+    let shaft_distance = ((u - (ax + dx * t)).powi(2) + (v - (ay + dy * t)).powi(2)).sqrt();
+    if shaft_distance < 0.085 {
+        return true;
+    }
+    // Head: a triangle pointing to the upper-left corner.
+    let (p0, p1, p2) = ((0.28f32, 0.28f32), (0.60f32, 0.31f32), (0.31f32, 0.60f32));
+    let sign = |a: (f32, f32), b: (f32, f32), c: (f32, f32)| {
+        (a.0 - c.0) * (b.1 - c.1) - (b.0 - c.0) * (a.1 - c.1)
+    };
+    let d1 = sign((u, v), p0, p1);
+    let d2 = sign((u, v), p1, p2);
+    let d3 = sign((u, v), p2, p0);
+    let has_negative = d1 < 0.0 || d2 < 0.0 || d3 < 0.0;
+    let has_positive = d1 > 0.0 || d2 > 0.0 || d3 > 0.0;
+    !(has_negative && has_positive)
+}
+
 struct Com;
 impl Com {
     fn new() -> Result<Self> {
@@ -279,15 +339,28 @@ fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap>
     } else {
         SIIGBF_THUMBNAILONLY
     };
-    let bitmap = OwnedBitmap(
-        unsafe {
-            factory
-                .GetImage(bounds, flags | SIIGBF_INCACHEONLY)
-                .or_else(|_| factory.GetImage(bounds, flags))
+    // Apps and documents without a thumbnail still have a Shell icon, and that is
+    // what Explorer shows for them (for example a shortcut to an executable).
+    match unsafe {
+        factory
+            .GetImage(bounds, flags | SIIGBF_INCACHEONLY)
+            .or_else(|_| factory.GetImage(bounds, flags))
+    } {
+        Ok(bitmap) => bitmap_pixels(OwnedBitmap(bitmap).0, folder_alpha),
+        Err(_) => {
+            let icon = unsafe {
+                factory.GetImage(
+                    bounds,
+                    windows::Win32::UI::Shell::SIIGBF_ICONONLY
+                        | windows::Win32::UI::Shell::SIIGBF_BIGGERSIZEOK,
+                )
+            }
+            .context("系统未提供此文件的缩略图或图标")?;
+            // Icons are transparent; keep their alpha whatever the caller preferred
+            // for photos or folder compositions.
+            bitmap_pixels(OwnedBitmap(icon).0, true)
         }
-        .context("系统未提供此文件的缩略图")?,
-    );
-    bitmap_pixels(bitmap.0, folder_alpha)
+    }
 }
 
 fn bitmap_pixels(bitmap: HBITMAP, folder_alpha: bool) -> Result<Bitmap> {
