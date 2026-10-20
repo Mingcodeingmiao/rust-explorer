@@ -40,6 +40,22 @@ pub struct Entry {
     pub kind: String,
 }
 
+/// Labels for confirmation dialogs must use Shell display names, not PIDL tokens.
+pub fn dialog_item_name(path: &Path, entries: &[Entry]) -> String {
+    if let Some(entry) = entries.iter().find(|entry| entry.path == path) {
+        if !entry.name.is_empty() {
+            return entry.name.clone();
+        }
+    }
+    if crate::shell_folder::is_shell_path(path) {
+        return "所选 Shell 项目".into();
+    }
+    path.file_name()
+        .unwrap_or(path.as_os_str())
+        .to_string_lossy()
+        .into_owned()
+}
+
 impl Entry {
     pub fn from_path(path: PathBuf) -> Result<Self> {
         let metadata =
@@ -136,6 +152,8 @@ pub fn link_from_attributes(path: &Path, attributes: u32) -> bool {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Sort {
     Name,
+    Original,
+    Deleted,
     Modified,
     Created,
     Kind,
@@ -144,11 +162,26 @@ pub enum Sort {
 
 pub fn sort(entries: &mut [Entry], column: Sort, descending: bool) {
     entries.sort_unstable_by(|a, b| {
-        b.directory.cmp(&a.directory).then_with(|| {
+        let directory_order = if column == Sort::Modified {
+            a.directory.cmp(&b.directory)
+        } else {
+            b.directory.cmp(&a.directory)
+        };
+        directory_order.then_with(|| {
             let value = match column {
                 Sort::Name => natural_cmp(&a.name, &b.name),
                 Sort::Modified => a.modified.cmp(&b.modified),
                 Sort::Created => a.created.cmp(&b.created),
+                Sort::Original => a
+                    .recycle
+                    .as_ref()
+                    .map(|i| &i.original_location)
+                    .cmp(&b.recycle.as_ref().map(|i| &i.original_location)),
+                Sort::Deleted => a
+                    .recycle
+                    .as_ref()
+                    .and_then(|i| i.deleted)
+                    .cmp(&b.recycle.as_ref().and_then(|i| i.deleted)),
                 Sort::Kind => a.kind.cmp(&b.kind),
                 Sort::Size => a.size.cmp(&b.size),
             };
@@ -292,6 +325,65 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn modified_sort_keeps_files_before_folders_in_both_directions() {
+        let file = recycled("file", "recycle:0000", "D:\\", 1);
+        let mut folder = recycled("folder", "recycle:0100", "D:\\", 1);
+        folder.directory = true;
+        for descending in [false, true] {
+            let mut entries = vec![folder.clone(), file.clone()];
+            sort(&mut entries, Sort::Modified, descending);
+            assert!(!entries[0].directory);
+            assert!(entries[1].directory);
+        }
+    }
+    fn recycled(name: &str, token: &str, original: &str, deleted: u64) -> Entry {
+        Entry {
+            recycle: Some(RecycleInfo {
+                original_location: original.into(),
+                deleted: Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(deleted)),
+            }),
+            path: token.into(),
+            name: name.into(),
+            directory: false,
+            link: false,
+            hidden: false,
+            system: false,
+            size: 0,
+            total: None,
+            free: None,
+            modified: None,
+            created: None,
+            kind: "TXT 文件".into(),
+        }
+    }
+    #[test]
+    fn recycle_confirmation_uses_unicode_display_names_not_pidl_tokens() {
+        let entry = recycled("测试报告💾.txt", "recycle:00001400abcd", "D:\\报告", 2);
+        assert_eq!(
+            dialog_item_name(&entry.path, std::slice::from_ref(&entry)),
+            "测试报告💾.txt"
+        );
+        let fallback = dialog_item_name(Path::new("recycle:00001400abcd"), &[]);
+        assert!(!fallback.contains("00001400"));
+        assert_eq!(
+            dialog_item_name(Path::new("C:\\folder\\报告.txt"), &[]),
+            "报告.txt"
+        );
+    }
+    #[test]
+    fn recycle_columns_sort_by_original_location_and_deletion_date() {
+        let mut entries = vec![
+            recycled("a.txt", "recycle:0000", "D:\\z", 1),
+            recycled("z.txt", "recycle:0100", "D:\\a", 2),
+        ];
+        sort(&mut entries, Sort::Original, false);
+        assert_eq!(entries[0].name, "z.txt");
+        sort(&mut entries, Sort::Deleted, false);
+        assert_eq!(entries[0].name, "a.txt");
+        sort(&mut entries, Sort::Deleted, true);
+        assert_eq!(entries[0].name, "z.txt");
+    }
     #[test]
     fn older_entry_payloads_default_to_not_a_link() {
         let old = r#"{"path":"old.txt","name":"old.txt","directory":false,"hidden":false,"size":4,"modified":null,"kind":"TXT"}"#;

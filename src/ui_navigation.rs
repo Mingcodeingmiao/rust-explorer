@@ -161,6 +161,8 @@ impl Explorer {
                         Sort::Name => "name",
                         Sort::Modified => "modified",
                         Sort::Created => "created",
+                        Sort::Original => "original",
+                        Sort::Deleted => "deleted",
                         Sort::Kind => "kind",
                         Sort::Size => "size",
                     }
@@ -1186,6 +1188,61 @@ impl Explorer {
                 .text_ellipsis()
                 .child(value)
         };
+        let right_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+        let paint_bounds = right_bounds.clone();
+        let measure = |text: String| {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(t.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text.into(), px(13. * self.zoom), &[run], None)
+                    .width,
+            ) / self.zoom
+        };
+        let mut right_regions = Vec::new();
+        if details {
+            let mut x = 0.;
+            for (key, cell) in volume_columns {
+                let value = match key.as_str() {
+                    "name" => volume.label.clone(),
+                    "kind" => volume_type(volume).into(),
+                    "total" => volume.total.map(fs::size_label).unwrap_or_default(),
+                    "free" => volume.free.map(fs::size_label).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let text = measure(value);
+                let occupied = (text + if key == "name" { 32. } else { 8. }).min(cell - 12.);
+                let left = if matches!(key.as_str(), "total" | "free") {
+                    x + cell - occupied - 8.
+                } else {
+                    x + 4.
+                };
+                right_regions.push((left, 0., occupied, 34.));
+                x += cell;
+            }
+        } else if grid {
+            right_regions.push(((width - size) / 2. - 4., 4., size + 8., size + 8.));
+            let text = (measure(volume.label.clone()) + 16.).min(width - 8.);
+            right_regions.push(((width - text) / 2., size + 8., text, 64.));
+        } else {
+            let occupied = (size
+                + 24.
+                + measure(volume.label.clone()).max(if small {
+                    0.
+                } else {
+                    measure(space.clone())
+                }))
+            .min(width - 4.);
+            right_regions.push((4., 0., occupied, if small { 34. } else { 96. }));
+        }
+        let zoom = self.zoom;
         let mut row = div()
             .id(("volume", index))
             .w(ui(width))
@@ -1234,6 +1291,7 @@ impl Explorer {
             .child(
                 canvas(
                     move |bounds, _, _| {
+                        paint_bounds.set(bounds);
                         drop_bounds
                             .borrow_mut()
                             .push((bounds_path.clone(), bounds, true));
@@ -1274,6 +1332,13 @@ impl Explorer {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
+                    let point = e.position - right_bounds.get().origin;
+                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
+                    if !right_regions.iter().any(|(left, top, width, height)| {
+                        x >= *left && x <= left + width && y >= *top && y <= top + height
+                    }) {
+                        return;
+                    }
                     cx.stop_propagation();
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);

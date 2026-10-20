@@ -48,6 +48,93 @@ fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
         .collect()
 }
 struct Com;
+#[derive(Clone, Default)]
+pub struct OperationControl {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    force: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+impl OperationControl {
+    pub fn stop(&self, force: bool) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if force {
+            self.force.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    pub fn stopping(&self) -> bool {
+        self.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+thread_local! {
+    static OPERATION_CONTROL: RefCell<Option<OperationControl>> = const { RefCell::new(None) };
+}
+pub fn execute_controlled(mut request: Request, control: OperationControl) -> Result<String> {
+    // Every user-facing Shell operation is killable without terminating a GUI
+    // thread. A helper owns its popup; never create cross-process child windows.
+    match &mut request {
+        Request::ThemedMenu { owner, .. } | Request::ComputerMenu { owner, .. } => *owner = 0,
+        _ => {}
+    }
+    OPERATION_CONTROL.with(|slot| *slot.borrow_mut() = Some(control));
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            OPERATION_CONTROL.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+    let _reset = Reset;
+    execute_one_shot(request)
+}
+pub fn operation_label(request: &Request) -> String {
+    let name = match request {
+        Request::Menu { .. } | Request::ThemedMenu { .. } | Request::ComputerMenu { .. } => {
+            "系统右键菜单"
+        }
+        Request::Properties { .. } | Request::PropertiesMany { .. } => "属性",
+        Request::Delete { .. } => "移到回收站",
+        Request::PermanentDelete { .. } => "永久删除",
+        Request::Rename { .. } => "重命名",
+        Request::RecordCreated { .. } => "记录新建项目",
+        Request::Share { .. } | Request::AdvancedShare { .. } | Request::SharingAccess { .. } => {
+            "共享设置"
+        }
+        Request::InvokeVerb { verb, .. } if verb.eq_ignore_ascii_case("format") => "打开格式化窗口",
+        Request::InvokeVerb { verb, .. } => return format!("系统命令：{verb}"),
+        _ => "系统操作",
+    };
+    name.into()
+}
+
+unsafe fn close_process_windows(pid: u32) {
+    unsafe extern "system" fn close(hwnd: HWND, param: LPARAM) -> BOOL {
+        let mut current = hwnd;
+        for _ in 0..16 {
+            let mut pid = 0;
+            unsafe {
+                GetWindowThreadProcessId(current, Some(&mut pid));
+            }
+            if pid == param.0 as u32 {
+                // Some Windows dialogs are hosted by dllhost but owned by the
+                // helper's window. Request cancellation there too; do not kill
+                // a shared system host process.
+                unsafe {
+                    let _ = PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0));
+                }
+                break;
+            }
+            let Ok(owner) = (unsafe { GetWindow(current, GW_OWNER) }) else {
+                break;
+            };
+            if owner.is_invalid() || owner == current {
+                break;
+            }
+            current = owner;
+        }
+        BOOL(1)
+    }
+    unsafe {
+        let _ = EnumWindows(Some(close), LPARAM(pid as isize));
+    }
+}
 impl Com {
     fn new() -> Result<Self> {
         unsafe {
@@ -625,8 +712,27 @@ fn menu_owner(request: &Request) -> Option<HWND> {
     }
 }
 
-/// Build and show the menu on the calling thread, owned by the application window.
+/// GPUI's shared workers may already be MTA. Never change their apartment or
+/// ignore RPC_E_CHANGED_MODE: create the menu and all its COM objects on a fresh STA.
 fn execute_menu_in_process(request: Request) -> Result<String> {
+    on_menu_sta(move || execute_menu_on_sta(request))
+}
+
+fn on_menu_sta<T: Send + 'static>(
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<T> {
+    std::thread::Builder::new()
+        .name("shell-menu-sta".into())
+        .spawn(move || {
+            let _com = Com::new()?;
+            operation()
+        })
+        .context("Could not start Shell menu STA")?
+        .join()
+        .map_err(|_| anyhow::anyhow!("Shell menu STA panicked"))?
+}
+
+fn execute_menu_on_sta(request: Request) -> Result<String> {
     MENU_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
     struct ClearMenuActive;
     impl Drop for ClearMenuActive {
@@ -635,8 +741,6 @@ fn execute_menu_in_process(request: Request) -> Result<String> {
         }
     }
     let _clear = ClearMenuActive;
-    // This runs on a GPUI background thread, which has no COM apartment yet.
-    let _com = Com::new().ok();
     let output = match request {
         Request::ThemedMenu {
             paths,
@@ -762,7 +866,27 @@ fn execute_one_shot(request: Request) -> Result<String> {
         .stderr(Stdio::piped());
     use std::os::windows::process::CommandExt;
     cmd.creation_flags(0x08000000);
-    let mut child = cmd.spawn()?;
+    struct OwnedChild(std::process::Child);
+    impl std::ops::Deref for OwnedChild {
+        type Target = std::process::Child;
+        fn deref(&self) -> &Self::Target {
+            &self.0
+        }
+    }
+    impl std::ops::DerefMut for OwnedChild {
+        fn deref_mut(&mut self) -> &mut Self::Target {
+            &mut self.0
+        }
+    }
+    impl Drop for OwnedChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().ok().flatten().is_none() {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+    }
+    let mut child = OwnedChild(cmd.spawn()?);
     // Native menus are displayed by this child, not by the GPUI parent window.
     // Forward the current application's foreground permission to that helper.
     unsafe {
@@ -775,13 +899,27 @@ fn execute_one_shot(request: Request) -> Result<String> {
     let error_reader = std::thread::spawn(move || read_bounded(stderr, 1024 * 1024));
     let writer = std::thread::spawn(move || input.write_all(&payload));
     let mut timed_out = false;
-    let status = if pin_deadline {
+    let control = OPERATION_CONTROL.with(|slot| slot.borrow().clone());
+    let mut stopped = false;
+    let status = if pin_deadline || control.is_some() {
         let start = std::time::Instant::now();
         loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
-            if start.elapsed() >= std::time::Duration::from_secs(5) {
+            if let Some(control) = &control {
+                if control.stopping() && !stopped {
+                    stopped = true;
+                    unsafe {
+                        close_process_windows(child.id());
+                    }
+                }
+                if control.force.load(std::sync::atomic::Ordering::Relaxed) {
+                    child.kill().context("无法强行停止系统操作进程")?;
+                    break child.wait()?;
+                }
+            }
+            if pin_deadline && start.elapsed() >= std::time::Duration::from_secs(5) {
                 timed_out = true;
                 let _ = child.kill();
                 break child.wait()?;
@@ -800,6 +938,7 @@ fn execute_one_shot(request: Request) -> Result<String> {
     let stderr = error_reader
         .join()
         .map_err(|_| anyhow::anyhow!("helper stderr reader failed"))??;
+    anyhow::ensure!(!stopped, "系统操作已停止；可能已完成部分操作，请刷新确认");
     anyhow::ensure!(
         !timed_out,
         "系统快速访问操作超过 5 秒，请刷新后确认当前固定状态"
@@ -827,6 +966,66 @@ fn execute_one_shot(request: Request) -> Result<String> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+    #[test]
+    fn format_targets_are_exact_drive_roots_and_failures_are_not_success() {
+        for value in ["c", "C:", "c:\\", "C:/"] {
+            assert_eq!(format_drive_letter(value).unwrap(), 'C');
+        }
+        for value in [
+            "",
+            "hello",
+            "C:\\data",
+            "\\\\server\\share",
+            "shell:ComputerFolder",
+            "1:",
+        ] {
+            assert!(format_drive_letter(value).is_err(), "{value}");
+        }
+        assert!(format_result(SHFMT_CANCEL.0).is_ok());
+        assert!(format_result(0).is_ok());
+        assert!(format_result(SHFMT_ERROR.0).is_err());
+        assert!(format_result(SHFMT_NOFORMAT.0).is_err());
+    }
+    #[test]
+    fn native_menu_uses_fresh_sta_when_caller_is_mta() {
+        std::thread::spawn(|| {
+            unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }
+                .ok()
+                .unwrap();
+            struct Mta;
+            impl Drop for Mta {
+                fn drop(&mut self) {
+                    unsafe { CoUninitialize() }
+                }
+            }
+            let _mta = Mta;
+            let caller = std::thread::current().id();
+            on_menu_sta(move || {
+                assert_ne!(caller, std::thread::current().id());
+                let mut apartment = APTTYPE_CURRENT;
+                let mut qualifier = APTTYPEQUALIFIER_NONE;
+                unsafe { CoGetApartmentType(&mut apartment, &mut qualifier)? };
+                assert!(apartment == APTTYPE_STA || apartment == APTTYPE_MAINSTA);
+                // Exercise the real Shell context-menu creation path without
+                // displaying a popup or executing any command.
+                let output = execute_menu_on_sta(Request::InspectMenu {
+                    paths: vec![],
+                    folder: std::env::temp_dir(),
+                    computer: false,
+                    host_commands: true,
+                })?;
+                assert!(!output.is_empty());
+                Ok(())
+            })
+            .unwrap();
+            let mut apartment = APTTYPE_CURRENT;
+            let mut qualifier = APTTYPEQUALIFIER_NONE;
+            unsafe { CoGetApartmentType(&mut apartment, &mut qualifier) }.unwrap();
+            assert_eq!(apartment, APTTYPE_MTA);
+        })
+        .join()
+        .unwrap();
+    }
     #[test]
     #[ignore = "Requires an interactive Windows Shell; deletes only its own empty temporary fixture"]
     fn native_delete_survives_unsupported_progress_caption() {
@@ -1231,9 +1430,8 @@ pub fn dispatch(request: Request) -> Result<()> {
             // Deliberately omit ALLOWUNDO, ADDUNDORECORD and RECYCLEONDELETE.
             // Never retry this operation through Request::Delete on failure.
             op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0))?;
-            // Some installed Shell implementations return E_NOTIMPL for this
-            // optional caption setter. It must not cancel a queued deletion.
-            let _ = op.SetProgressMessage(w!("正在永久删除项目"));
+            // SetProgressMessage is documented as not implemented. Keep the
+            // system-provided Unicode progress caption instead.
             for path in paths {
                 if !crate::shell_folder::is_shell_path(&path) {
                     anyhow::ensure!(
@@ -1272,7 +1470,6 @@ pub fn dispatch(request: Request) -> Result<()> {
                 )
             };
             op.SetOperationFlags(flags)?;
-            let _ = op.SetProgressMessage(w!("正在删除项目"));
             for path in paths {
                 let item = item(&path)?;
                 op.DeleteItem(&item, None)?;
@@ -1434,6 +1631,10 @@ pub fn properties_many(paths: &[PathBuf]) -> Result<()> {
 // Property sheets are modeless and can be created after ShellExecuteEx returns.
 // Keep the isolated STA alive and dispatch messages until its sheets close.
 pub(crate) unsafe fn pump_property_windows() {
+    unsafe { pump_property_windows_scoped(false) }
+}
+
+unsafe fn pump_property_windows_scoped(current_thread_only: bool) {
     unsafe extern "system" fn count(hwnd: HWND, param: LPARAM) -> BOOL {
         let mut pid = 0;
         unsafe {
@@ -1463,8 +1664,19 @@ pub(crate) unsafe fn pump_property_windows() {
             }
         }
         let mut windows = 0usize;
-        // Thread id zero is not accepted by EnumThreadWindows.
-        let _ = unsafe { EnumWindows(Some(count), LPARAM(&mut windows as *mut _ as isize)) };
+        let param = LPARAM(&mut windows as *mut _ as isize);
+        if current_thread_only {
+            // The application's main window must not keep a menu worker alive.
+            let _ = unsafe {
+                EnumThreadWindows(
+                    windows::Win32::System::Threading::GetCurrentThreadId(),
+                    Some(count),
+                    param,
+                )
+            };
+        } else {
+            let _ = unsafe { EnumWindows(Some(count), param) };
+        }
         observed |= windows > 0;
         if windows == 0 && (observed || start.elapsed() > std::time::Duration::from_secs(3)) {
             break;
@@ -1753,27 +1965,62 @@ impl Drop for Popup {
 /// elevated helper: `SHFormatDrive` formats from the calling process, so it needs
 /// administrator rights, and its dialog is modal until the user closes it.
 pub fn format_drive(drive: &str) -> Result<()> {
-    let letter = drive
-        .chars()
-        .find(|value| value.is_ascii_alphabetic())
-        .context("缺少驱动器盘符")?
-        .to_ascii_uppercase();
-    anyhow::ensure!(letter.is_ascii_alphabetic(), "无效的驱动器盘符：{drive}");
+    let letter = format_drive_letter(drive)?;
     let index = (letter as u8 - b'A') as u32;
-    let _com = Com::new().ok();
+    let _com = Com::new()?;
+    // SHFormatDrive requires a non-NULL parent, even inside a helper process.
+    let module = unsafe { windows::Win32::System::LibraryLoader::GetModuleHandleW(None)? };
+    let owner = MenuWindow(unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            w!("STATIC"),
+            w!("Rust Explorer"),
+            WS_POPUP,
+            CW_USEDEFAULT,
+            CW_USEDEFAULT,
+            1,
+            1,
+            None,
+            None,
+            Some(HINSTANCE(module.0)),
+            None,
+        )?
+    });
     // Returns when the dialog closes (or immediately with SHFMT_ERROR on failure).
-    let _ = unsafe {
+    let result = unsafe {
         windows::Win32::UI::Shell::SHFormatDrive(
-            HWND::default(),
+            owner.0,
             index,
             windows::Win32::UI::Shell::SHFMT_ID_DEFAULT,
             windows::Win32::UI::Shell::SHFMT_OPT_FULL,
         )
     };
-    Ok(())
+    format_result(result)
 }
 
-/// Start this executable elevated (UAC) with the given arguments.
+fn format_drive_letter(drive: &str) -> Result<char> {
+    let bytes = drive.as_bytes();
+    anyhow::ensure!(
+        matches!(bytes, [letter] if letter.is_ascii_alphabetic())
+            || matches!(bytes, [letter, b':'] if letter.is_ascii_alphabetic())
+            || matches!(bytes, [letter, b':', b'\\' | b'/'] if letter.is_ascii_alphabetic()),
+        "格式化需要准确的本地驱动器根路径：{drive}"
+    );
+    Ok((bytes[0] as char).to_ascii_uppercase())
+}
+
+fn format_result(result: u32) -> Result<()> {
+    match SHFMT_RET(result) {
+        SHFMT_ERROR => bail!("Windows 格式化对话框返回错误 (SHFMT_ERROR)"),
+        SHFMT_NOFORMAT => bail!("Windows 无法格式化此驱动器 (SHFMT_NOFORMAT)"),
+        // Closing/cancelling the dialog is not a successful format or an error.
+        SHFMT_CANCEL => Ok(()),
+        _ => Ok(()),
+    }
+}
+
+/// Launch the Windows-owned formatting workflow, without interpreting the
+/// elevated dialog host's eventual process exit code as a file operation result.
 fn elevate_self(arguments: &[&str]) -> Result<()> {
     let file = wide(std::env::current_exe()?.as_os_str());
     let parameters = wide(arguments.join(" ").as_str());
@@ -1788,6 +2035,15 @@ fn elevate_self(arguments: &[&str]) -> Result<()> {
         ..Default::default()
     };
     unsafe { ShellExecuteExW(&mut info) }.context("无法以管理员身份启动该操作")?;
+    if !info.hProcess.is_invalid() {
+        // This request opens a system dialog; it does not perform a format.
+        // Cancellation and closing the external host are handled by Windows.
+        // Waiting here could leave the application busy after its dialog closes,
+        // and an external host exit code is not a reliable formatting outcome.
+        unsafe {
+            let _ = CloseHandle(info.hProcess);
+        }
+    }
     Ok(())
 }
 
@@ -1795,15 +2051,14 @@ fn invoke_verb(paths: &[PathBuf], verb: &str) -> Result<()> {
     // "Format" is not a registry verb: it comes from the Shell's drive menu and
     // needs the elevated format UI, so relaunch ourselves with `runas`.
     if verb.eq_ignore_ascii_case("format") {
-        for path in paths {
-            let letter = path
-                .to_string_lossy()
-                .chars()
-                .find(|value| value.is_ascii_alphabetic())
-                .context("无法确定要格式化的驱动器")?;
-            elevate_self(&["--format-drive", &letter.to_string()])?;
-        }
+        anyhow::ensure!(paths.len() == 1, "请仅选择一个要格式化的驱动器");
+        let letter = format_drive_letter(&paths[0].to_string_lossy())?;
+        elevate_self(&["--format-drive", &letter.to_string()])?;
         return Ok(());
+    }
+    if is_start_pin_verb(verb) {
+        anyhow::ensure!(paths.len() == 1, "请仅选择一个项目");
+        return invoke_start_pin(&paths[0], verb, HWND::default());
     }
     for path in paths {
         let file = wide(path.as_os_str());
@@ -1819,6 +2074,9 @@ fn invoke_verb(paths: &[PathBuf], verb: &str) -> Result<()> {
             ..Default::default()
         };
         unsafe { ShellExecuteExW(&mut info) }.context("无法执行该操作")?;
+    }
+    unsafe {
+        pump_property_windows();
     }
     Ok(())
 }
@@ -2222,12 +2480,6 @@ fn context_menu_options(
         )?;
         let _owner = MenuWindow(hwnd);
         menu_trace("menu: owner window ready");
-        // In-process menus run on a background thread that has no apartment yet.
-        let _com = if app_owner.is_some() {
-            Com::new().ok()
-        } else {
-            None
-        };
         menu_trace("menu: owner window ready");
         let _ = windows::Win32::Graphics::Gdi::UpdateWindow(hwnd);
         if let Some(dark) = dark {
@@ -2499,6 +2751,13 @@ fn context_menu_options(
                 emit!("properties");
                 return Ok(output);
             }
+            if paths.is_empty() && verb == "newfolder" {
+                // Shell's New handler expects an Explorer IShellView for rename
+                // activation. Let our existing asynchronous create/select/rename
+                // workflow own this operation instead.
+                emit!("command:new-folder");
+                return Ok(output);
+            }
             if matches!(verb.as_str(), "open" | "explore") && !paths.is_empty() {
                 emit!("command:file-open");
                 return Ok(output);
@@ -2526,6 +2785,22 @@ fn context_menu_options(
                 crate::shell::copy_to_clipboard(paths, verb == "cut")?;
                 return Ok(output);
             }
+            if is_start_pin_verb(&verb)
+                || matches!(verb.as_str(), "format" | "print" | "share" | "burn")
+            {
+                // Return the request to the UI so failures are displayed, instead
+                // of discarding them in an unobserved detached thread.
+                let request = Request::InvokeVerb {
+                    paths: if paths.is_empty() {
+                        vec![folder.to_path_buf()]
+                    } else {
+                        paths.to_vec()
+                    },
+                    verb: verb.clone(),
+                };
+                emit!("command:shell-verb:{}", serde_json::to_string(&request)?);
+                return Ok(output);
+            }
             if is_start_pin_verb(&verb) && paths.len() == 1 {
                 invoke_start_pin(&paths[0], &verb, hwnd)?;
                 return Ok(output);
@@ -2542,15 +2817,6 @@ fn context_menu_options(
             // Verbs that open a modal dialog of their own (format, print, share,
             // burn) block the calling thread until the dialog closes. Delegate them
             // to a detached helper so the application never waits for them.
-            if app_owner.is_some() && matches!(verb.as_str(), "format" | "print" | "share" | "burn")
-            {
-                let paths = paths.to_vec();
-                let verb = verb.clone();
-                std::thread::spawn(move || {
-                    let _ = execute_one_shot(Request::InvokeVerb { paths, verb });
-                });
-                return Ok(output);
-            }
             let mut info = CMINVOKECOMMANDINFOEX {
                 cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
                 // `SEE_MASK_NOASYNC` forces the verb to finish before InvokeCommand
@@ -2599,7 +2865,7 @@ fn context_menu_options(
                 verb.as_str(),
                 "copy" | "cut" | "copyaspath" | "pintohome" | "unpinfromhome"
             ) {
-                pump_property_windows();
+                pump_property_windows_scoped(app_owner.is_some());
             }
         }
         Ok(output)

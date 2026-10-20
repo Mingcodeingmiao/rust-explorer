@@ -60,6 +60,7 @@ pub struct Settings {
     pub folders_first: bool,
     pub remember_views: bool,
     pub columns: Vec<(String, f32)>,
+    pub recycle_columns: Vec<(String, f32)>,
     pub volume_columns: Vec<(String, f32)>,
     pub volume_sort: String,
     pub volume_descending: bool,
@@ -109,6 +110,7 @@ impl Default for Settings {
                 ("size".into(), 110.),
             ],
             volume_columns: default_volume_columns(),
+            recycle_columns: default_recycle_columns(),
             volume_sort: "name".into(),
             volume_descending: false,
             folder_views: Default::default(),
@@ -154,6 +156,7 @@ impl Settings {
             s.columns.insert(0, ("name".into(), 300.));
         }
         normalize_volume_columns(&mut s.volume_columns);
+        normalize_recycle_columns(&mut s.recycle_columns);
         if !["name", "kind", "total", "free"].contains(&s.volume_sort.as_str()) {
             s.volume_sort = "name".into();
         }
@@ -234,6 +237,19 @@ mod toolbar_tests {
     }
 }
 
+pub fn default_recycle_columns() -> Vec<(String, f32)> {
+    [
+        ("name", 260.),
+        ("original", 270.),
+        ("deleted", 170.),
+        ("size", 100.),
+        ("kind", 150.),
+        ("modified", 170.),
+    ]
+    .into_iter()
+    .map(|(id, width)| (id.into(), width))
+    .collect()
+}
 fn default_volume_columns() -> Vec<(String, f32)> {
     [
         ("name", 280.),
@@ -244,6 +260,25 @@ fn default_volume_columns() -> Vec<(String, f32)> {
     .into_iter()
     .map(|(key, width)| (key.into(), width))
     .collect()
+}
+fn normalize_recycle_columns(columns: &mut Vec<(String, f32)>) {
+    let defaults = default_recycle_columns();
+    let mut seen = std::collections::HashSet::new();
+    columns.retain_mut(|(id, width)| {
+        if !defaults.iter().any(|(key, _)| key == id) || !seen.insert(id.clone()) {
+            return false;
+        }
+        let fallback = defaults.iter().find(|(key, _)| key == id).unwrap().1;
+        *width = if width.is_finite() {
+            width.clamp(64., 1200.)
+        } else {
+            fallback
+        };
+        true
+    });
+    if !columns.iter().any(|(id, _)| id == "name") {
+        columns.insert(0, ("name".into(), 260.));
+    }
 }
 fn normalize_volume_columns(columns: &mut Vec<(String, f32)>) {
     let previous = std::mem::take(columns);
@@ -263,6 +298,26 @@ fn normalize_volume_columns(columns: &mut Vec<(String, f32)>) {
 }
 #[cfg(test)]
 mod volume_column_tests {
+    #[test]
+    fn recycle_columns_keep_their_own_order_widths_and_visibility() {
+        let mut settings: super::Settings = serde_json::from_str("{}").unwrap();
+        let ordinary = settings.columns.clone();
+        settings.recycle_columns = vec![
+            ("deleted".into(), 310.),
+            ("name".into(), f32::NAN),
+            ("deleted".into(), 80.),
+            ("unknown".into(), 100.),
+        ];
+        super::normalize_recycle_columns(&mut settings.recycle_columns);
+        assert_eq!(
+            settings.recycle_columns,
+            vec![("deleted".into(), 310.), ("name".into(), 260.)]
+        );
+        let saved = serde_json::to_string(&settings).unwrap();
+        let loaded: super::Settings = serde_json::from_str(&saved).unwrap();
+        assert_eq!(loaded.recycle_columns, settings.recycle_columns);
+        assert_eq!(loaded.columns, ordinary);
+    }
     #[test]
     fn contributor_and_local_shift_settings_share_one_state() {
         let contributor: super::Settings =

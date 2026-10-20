@@ -135,17 +135,17 @@ pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> 
                 return Ok(icon);
             }
         }
-        if path.is_absolute() && folder_has_custom_icon(path) {
-            if let Ok(icon) = shell_image(path, true, size, false) {
-                return Ok(icon);
-            }
-        }
         if path.parent().is_none() && path.has_root() {
             // Let the Shell supply the current Windows/BitLocker/optical overlays.
             if let Ok(icon) = shell_image(path, true, size, false) {
                 return Ok(icon);
             }
             return stock_icon(SIID_DRIVEFIXED, size);
+        }
+        if path.is_absolute() && folder_has_custom_icon(path) {
+            if let Ok(icon) = shell_image(path, true, size, false) {
+                return Ok(icon);
+            }
         }
         // Preserve the native icons of the user's actual known folders, even
         // when OneDrive or a policy has redirected them to a different drive.

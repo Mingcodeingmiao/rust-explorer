@@ -46,6 +46,13 @@ unsafe extern "system" fn frame_proc(
             let _ = RemoveWindowSubclass(hwnd, Some(frame_proc), id);
         } else if msg == WM_COPYDATA {
             return crate::instance::receive(hwnd, lparam);
+        } else if matches!(msg, WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK)
+            && wparam.0 == HTCAPTION as usize
+        {
+            // Let Windows own caption dragging/restoring. Dispatching this as
+            // a GPUI mouse event can have its default action suppressed by focus
+            // handlers, especially when dragging a maximized window down.
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
         } else if msg == WM_NCHITTEST
             && !IsZoomed(hwnd).as_bool()
             && !IsIconic(hwnd).as_bool()

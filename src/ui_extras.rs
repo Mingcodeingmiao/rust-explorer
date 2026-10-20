@@ -318,10 +318,23 @@ pub(super) fn compare_entries(
     column: Sort,
     descending: bool,
 ) -> std::cmp::Ordering {
+    if column == Sort::Modified && a.directory != b.directory {
+        return a.directory.cmp(&b.directory);
+    }
     let value = match column {
         Sort::Name => fs::natural_cmp(&a.name, &b.name),
         Sort::Modified => a.modified.cmp(&b.modified),
         Sort::Created => a.created.cmp(&b.created),
+        Sort::Original => a
+            .recycle
+            .as_ref()
+            .map(|i| &i.original_location)
+            .cmp(&b.recycle.as_ref().map(|i| &i.original_location)),
+        Sort::Deleted => a
+            .recycle
+            .as_ref()
+            .and_then(|i| i.deleted)
+            .cmp(&b.recycle.as_ref().and_then(|i| i.deleted)),
         Sort::Kind => a.kind.cmp(&b.kind),
         Sort::Size => a.size.cmp(&b.size),
     }
@@ -333,6 +346,8 @@ fn is_image_entry(entry: &Entry) -> bool {
 }
 fn column_sort(id: &str) -> Sort {
     match id {
+        "original" => Sort::Original,
+        "deleted" => Sort::Deleted,
         "modified" => Sort::Modified,
         "created" => Sort::Created,
         "kind" => Sort::Kind,
@@ -342,6 +357,8 @@ fn column_sort(id: &str) -> Sort {
 }
 fn column_label(id: &str, usage: bool) -> &'static str {
     match id {
+        "original" => "原位置",
+        "deleted" => "删除日期",
         "modified" => "修改日期",
         "created" => "创建日期",
         "kind" => "类型",
@@ -1625,7 +1642,9 @@ impl Explorer {
         let usage = &self.usage;
         let folders_first = self.settings.folders_first;
         Arc::make_mut(&mut self.entries).sort_by(|a, b| {
-            let dir = if folders_first {
+            let dir = if column == Sort::Modified {
+                a.directory.cmp(&b.directory)
+            } else if folders_first {
                 b.directory.cmp(&a.directory)
             } else {
                 std::cmp::Ordering::Equal
@@ -2065,7 +2084,11 @@ impl Explorer {
                     // Leave the top 4 px free of a drag hit region so the
                     // native top resize border still works; the caption
                     // buttons themselves remain flush with the window top.
-                    .h(ui(28.4))
+                    .h(if window.is_maximized() {
+                        ui(32.4)
+                    } else {
+                        ui(28.4)
+                    })
                     .w(ui(64.))
                     .flex_1()
                     .min_w(ui(64.))
@@ -2130,52 +2153,20 @@ impl Explorer {
         }
         strip.child(controls).into_any_element()
     }
-    pub(super) fn column_widths(&self, available: f32) -> Vec<(String, f32)> {
+    pub(super) fn active_columns_mut(&mut self) -> &mut Vec<(String, f32)> {
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
-            let scale = (available / 1120.).max(1.);
-            return [
-                ("name", 260.),
-                ("original", 270.),
-                ("deleted", 170.),
-                ("size", 100.),
-                ("kind", 150.),
-                ("modified", 170.),
-            ]
-            .into_iter()
-            .map(|(id, width)| (id.to_string(), width * scale))
-            .collect();
+            &mut self.settings.recycle_columns
+        } else {
+            &mut self.settings.columns
+        }
+    }
+    pub(super) fn column_widths(&self, _available: f32) -> Vec<(String, f32)> {
+        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+            return self.settings.recycle_columns.clone();
         }
         self.settings.columns.clone()
     }
     pub(super) fn render_header(&self, available: f32, cx: &mut Context<Self>) -> AnyElement {
-        if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
-            let mut header = div()
-                .h(ui(34.))
-                .flex_shrink_0()
-                .flex()
-                .border_b_1()
-                .border_color(rgb(self.theme.border));
-            for (id, width) in self.column_widths(available) {
-                header = header.child(
-                    div()
-                        .w(ui(width))
-                        .h_full()
-                        .flex_shrink_0()
-                        .px_3()
-                        .flex()
-                        .items_center()
-                        .border_r_1()
-                        .border_color(rgb(self.theme.border))
-                        .child(match id.as_str() {
-                            "original" => "原位置",
-                            "deleted" => "删除日期",
-                            "kind" => "项目类型",
-                            _ => column_label(&id, false),
-                        }),
-                );
-            }
-            return header.into_any_element();
-        }
         let t = self.theme;
         let widths = self.column_widths(available);
         let total: f32 = widths.iter().map(|(_, w)| *w).sum();
@@ -2234,13 +2225,14 @@ impl Explorer {
                     .on_drag(drag, |drag, _, _, cx| cx.new(|_| drag.clone()))
                     .on_drop(cx.listener(move |v, drag: &DragColumn, _, cx| {
                         cx.stop_propagation();
-                        if let Some(from) =
-                            v.settings.columns.iter().position(|(id, _)| id == &drag.id)
+                        if let Some(from) = v
+                            .active_columns_mut()
+                            .iter()
+                            .position(|(id, _)| id == &drag.id)
                         {
-                            let column = v.settings.columns.remove(from);
-                            v.settings
-                                .columns
-                                .insert(index.min(v.settings.columns.len()), column);
+                            let column = v.active_columns_mut().remove(from);
+                            let columns = v.active_columns_mut();
+                            columns.insert(index.min(columns.len()), column);
                             v.invalidate_list();
                             v.save_settings(cx);
                             cx.notify();
@@ -2549,6 +2541,153 @@ impl Explorer {
         let drop_path = entry.path.clone();
         let drop_directory = entry.directory;
         let painted_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+        let measure = |text: String| {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(t.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text.into(), px(13. * self.zoom), &[run], None)
+                    .width,
+            ) / self.zoom
+        };
+        let mut hit_regions: Vec<(f32, f32, f32, f32)> = Vec::new();
+        if details {
+            let height = if self.settings.compact {
+                rust_explorer::layout_metrics::COMPACT_FILE_ROW
+            } else {
+                34.
+            };
+            let mut x = 0.;
+            for (id, width) in self.column_widths(self.layout_width) {
+                let (text, extra) = match id.as_str() {
+                    "name" => (
+                        natural_name.clone(),
+                        28. + if self.settings.checkboxes { 30. } else { 0. },
+                    ),
+                    "modified" => (entry.date(), 0.),
+                    "created" => (format_date(entry.created), 0.),
+                    "kind" => (entry.kind.clone(), 0.),
+                    "size" => (self.entry_size_text(entry), 0.),
+                    "original" => (
+                        entry
+                            .recycle
+                            .as_ref()
+                            .map(|i| i.original_location.clone())
+                            .unwrap_or_default(),
+                        0.,
+                    ),
+                    "deleted" => (
+                        format_date(entry.recycle.as_ref().and_then(|i| i.deleted)),
+                        0.,
+                    ),
+                    _ => (String::new(), 0.),
+                };
+                if !text.is_empty() || extra > 0. {
+                    let occupied = (measure(text) + extra + 8.).min((width - 16.).max(0.));
+                    let left = if id == "size" {
+                        x + width - 12. - occupied
+                    } else {
+                        x + 8.
+                    };
+                    hit_regions.push((
+                        left,
+                        ((height - 26.) / 2.).max(0.),
+                        occupied,
+                        height.min(26.),
+                    ));
+                }
+                x += width;
+            }
+        } else if large {
+            let icon = self.view.icon_size();
+            hit_regions.push(((item_width - icon) / 2. - 4., 0., icon + 8., icon + 8.));
+            let width = (text_width + 12.).min(item_width - 16.);
+            hit_regions.push((
+                (item_width - width) / 2.,
+                icon + 8.,
+                width,
+                name_lines * 20. + 8.,
+            ));
+        } else if self.view == ViewMode::Content {
+            let presentation = rust_explorer::thumbnails::Key::from_entry(
+                entry,
+                visual::thumbnail_pixels(self.view.icon_size()),
+            )
+            .and_then(|key| self.thumbnails.presentation(&key))
+            .unwrap_or_default();
+            let image = presentation.source_width > 0 && presentation.source_height > 0;
+            let inner = (item_width - 24.).max(0.);
+            let (first, visible) = rust_explorer::layout_metrics::content_columns(inner, image);
+            let icon = self.view.icon_size();
+            hit_regions.push((8., (74. - icon) / 2. - 4., icon + 8., icon + 8.));
+            let title_width = text_width.max(if entry.directory || image {
+                0.
+            } else {
+                measure(entry.kind.clone())
+            });
+            hit_regions.push((
+                12. + icon + 8.,
+                12.,
+                (title_width + 8.).min((first - icon - 8.).max(0.)),
+                50.,
+            ));
+            if visible {
+                let metadata = (inner - first - 16.).clamp(1., 240.);
+                let text = if image {
+                    measure(format!("大小：{}", self.entry_size_text(entry)))
+                } else {
+                    measure(format!("修改日期：{}", entry.date()))
+                        .max(measure(format!("大小：{}", self.entry_size_text(entry))))
+                };
+                hit_regions.push((
+                    item_width - 12. - metadata,
+                    10.,
+                    (text + 8.).min(metadata),
+                    54.,
+                ));
+                if image {
+                    let middle = (inner - first - metadata - 16.).max(1.);
+                    let text = measure(format!("类型：{}", entry.kind)).max(measure(format!(
+                        "分辨率：{} x {}",
+                        presentation.source_width, presentation.source_height
+                    )));
+                    hit_regions.push((first + 20., 10., (text + 8.).min(middle), 54.));
+                }
+            }
+        } else if self.view == ViewMode::Tiles {
+            hit_regions.push((
+                8.,
+                4.,
+                (self.view.icon_size()
+                    + text_width.max(measure(format!(
+                        "{}  {}",
+                        entry.kind,
+                        self.entry_size_text(entry)
+                    )))
+                    + 24.)
+                    .min(item_width - 16.),
+                66.,
+            ));
+        } else {
+            hit_regions.push((
+                8.,
+                0.,
+                (text_width + 40.).min(item_width - 16.),
+                if self.settings.compact { 26. } else { 34. },
+            ));
+        }
+        let right_regions = std::rc::Rc::new(hit_regions);
+        let down_regions = right_regions.clone();
+        let down_bounds = painted_bounds.clone();
+        let up_bounds = painted_bounds.clone();
+        let zoom = self.zoom;
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
@@ -2648,6 +2787,13 @@ impl Explorer {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                    let point = e.position - down_bounds.get().origin;
+                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
+                    if !down_regions.iter().any(|(left, top, width, height)| {
+                        x >= *left && x <= left + width && y >= *top && y <= top + height
+                    }) {
+                        return;
+                    }
                     cx.stop_propagation();
                     v.rename_token += 1;
                     let paths = if v.selected.contains(&index) {
@@ -2666,6 +2812,13 @@ impl Explorer {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseUpEvent, w, cx| {
+                    let point = e.position - up_bounds.get().origin;
+                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
+                    if !right_regions.iter().any(|(left, top, width, height)| {
+                        x >= *left && x <= left + width && y >= *top && y <= top + height
+                    }) {
+                        return;
+                    }
                     cx.stop_propagation();
                     v.rename_token += 1;
                     if !v.selected.contains(&index) {
@@ -3217,7 +3370,7 @@ impl MenuItem {
     }
 }
 impl Explorer {
-    fn menu_items(&self, kind: &str) -> Vec<MenuItem> {
+    fn menu_items(&self, kind: &str, cx: &App) -> Vec<MenuItem> {
         if let Some(column) = kind.strip_prefix("filter-menu:") {
             let choices: Vec<(String, String)> = match column {
                 "name" => rust_explorer::file_filter::NAMES
@@ -3256,6 +3409,56 @@ impl Explorer {
             .collect();
         }
         match kind {
+            "system-operations" => self
+                .system_operations
+                .iter()
+                .rev()
+                .flat_map(|op| {
+                    let elapsed = op
+                        .finished
+                        .unwrap_or_else(Instant::now)
+                        .duration_since(op.started)
+                        .as_secs_f32();
+                    let mut items = vec![
+                        MenuItem::new(
+                            "operation-info",
+                            format!("{} · {:.1}秒 · {}", op.label, elapsed, op.status),
+                        )
+                        .enable(false),
+                    ];
+                    if op.finished.is_none() {
+                        items.push(MenuItem::new(
+                            format!("operation-stop:{}", op.id),
+                            "停止（请求关闭系统窗口）",
+                        ));
+                        items.push(MenuItem::new(
+                            format!("operation-force:{}", op.id),
+                            "强行停止（可能已完成部分操作）",
+                        ));
+                    }
+                    items.push(MenuItem::separator());
+                    items
+                })
+                .collect(),
+            "text-menu" => [
+                ("cut", "剪切    Ctrl+X"),
+                ("copy", "复制    Ctrl+C"),
+                ("paste", "粘贴    Ctrl+V"),
+                ("all", "全选    Ctrl+A"),
+            ]
+            .into_iter()
+            .filter(|(id, _)| {
+                let can_paste = *id == "paste"
+                    && cx
+                        .read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .is_some_and(|text| !text.is_empty());
+                self.text_menu_target
+                    .as_ref()
+                    .is_some_and(|input| input.read(cx).text_command_available(id, can_paste))
+            })
+            .map(|(id, label)| MenuItem::new(format!("text:{id}"), label))
+            .collect(),
             "drop-menu" => vec![
                 MenuItem::new("drop:copy", "复制到这里"),
                 MenuItem::new("drop:move", "移动到这里"),
@@ -3479,18 +3682,22 @@ impl Explorer {
                 MenuItem::new(format!("group:{id}"), *label).check(self.group == *id)
             })
             .collect(),
-            "columns" => ["name", "modified", "kind", "size", "created"]
-                .iter()
-                .map(|id| {
-                    MenuItem::new(format!("column:{id}"), column_label(id, self.usage_enabled))
-                        .check(self.settings.columns.iter().any(|(key, _)| key == id))
-                        .enable(*id != "name")
-                })
-                .chain([
-                    MenuItem::separator(),
-                    MenuItem::new("reset-columns", "重置列宽和顺序"),
-                ])
-                .collect(),
+            "columns" => if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+                vec!["name", "original", "deleted", "size", "kind", "modified"]
+            } else {
+                vec!["name", "modified", "kind", "size", "created"]
+            }
+            .iter()
+            .map(|id| {
+                MenuItem::new(format!("column:{id}"), column_label(id, self.usage_enabled))
+                    .check(self.column_widths(0.).iter().any(|(key, _)| key == id))
+                    .enable(*id != "name")
+            })
+            .chain([
+                MenuItem::separator(),
+                MenuItem::new("reset-columns", "重置列宽和顺序"),
+            ])
+            .collect(),
             "new-menu" => {
                 let mut items = vec![
                     MenuItem::new("new-folder", "文件夹"),
@@ -3572,6 +3779,7 @@ impl Explorer {
                     MenuItem::new("select-all", "全部选择"),
                     MenuItem::new("select-none", "全部取消").enable(any),
                     MenuItem::new("select-invert", "反向选择"),
+                    MenuItem::new("clear-cache", "清空缓存"),
                     MenuItem::separator(),
                     MenuItem::new("properties", "属性"),
                     MenuItem::new("options", "选项"),
@@ -3621,7 +3829,7 @@ impl Explorer {
             .flex()
             .flex_col()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
-        for (index, item) in self.menu_items(kind).into_iter().enumerate() {
+        for (index, item) in self.menu_items(kind, cx).into_iter().enumerate() {
             if item.id == "-" {
                 panel = panel.child(div().h(ui(1.)).flex_shrink_0().my_1().bg(rgb(t.border)));
                 offset += 9.;
@@ -3712,9 +3920,72 @@ impl Explorer {
     }
     pub(super) fn render_popup(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let (kind, position) = self.popup.clone().unwrap();
+        if kind == "system-operations" {
+            let t = self.theme;
+            let mut panel = div()
+                .id("system-operation-panel")
+                .w(ui(520.))
+                .max_w(px((f32::from(window.viewport_size().width) - 24.).max(120.)))
+                .max_h(px((f32::from(window.viewport_size().height) - 80.).max(80.)))
+                .overflow_y_scroll()
+                .p_3()
+                .rounded(ui(8.))
+                .bg(rgb(t.input))
+                .border_1()
+                .border_color(rgb(t.border))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .child(div().text_size(ui(15.)).child("系统操作详情"));
+            if self.system_operations.is_empty() {
+                panel = panel.child("暂无系统操作记录");
+            }
+            for op in self.system_operations.iter().rev() {
+                let elapsed = op
+                    .finished
+                    .unwrap_or_else(Instant::now)
+                    .duration_since(op.started)
+                    .as_secs_f32();
+                let id = op.id;
+                let mut card = div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .pb_2()
+                    .border_b_1()
+                    .border_color(rgb(t.border))
+                    .child(op.label.clone())
+                    .child(format!("用时：{elapsed:.1} 秒"))
+                    .child(div().whitespace_normal().child(op.status.clone()));
+                if op.finished.is_none() {
+                    card = card.child(div().flex().gap_2()
+                        .child(button(("stop-operation", id), "停止", t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-stop:{id}"), w, cx))))
+                        .child(button(("force-operation", id), "强行停止", t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-force:{id}"), w, cx)))))
+                        .child(div().text_size(ui(11.)).text_color(rgb(t.muted)).child("强行停止不会回滚已完成的文件操作；提升权限的系统窗口可能需要手动关闭。"));
+                }
+                panel = panel.child(card);
+            }
+            return div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|v, _, _, cx| {
+                        v.popup = None;
+                        cx.notify();
+                    }),
+                )
+                .child(panel)
+                .into_any_element();
+        }
         let width = 260. * self.zoom;
         let height = self
-            .menu_items(&kind)
+            .menu_items(&kind, cx)
             .iter()
             .map(|i| {
                 if i.id == "-" {
@@ -3774,11 +4045,11 @@ impl Explorer {
             .child(self.menu_panel(&kind, x, y, 0, max_y, cx));
         if let Some((sub, offset)) = &self.submenu {
             if self
-                .menu_items(&kind)
+                .menu_items(&kind, cx)
                 .iter()
                 .any(|i| i.id == format!("submenu:{sub}"))
             {
-                let child_height = (self.menu_items(sub).len() as f32 * 34. + 16.) * self.zoom;
+                let child_height = (self.menu_items(sub, cx).len() as f32 * 34. + 16.) * self.zoom;
                 let child_x = if x + width * 2. < f32::from(window.viewport_size().width) {
                     x + width - 2.
                 } else {
@@ -3789,11 +4060,11 @@ impl Explorer {
                 overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, max_y, cx));
                 if let Some((nested, offset)) = &self.nested_submenu {
                     if self
-                        .menu_items(sub)
+                        .menu_items(sub, cx)
                         .iter()
                         .any(|i| i.id == format!("submenu:{nested}"))
                     {
-                        let height = ((self.menu_items(nested).len() as f32 * 34. + 16.)
+                        let height = ((self.menu_items(nested, cx).len() as f32 * 34. + 16.)
                             * self.zoom)
                             .min(580. * self.zoom);
                         let nested_x =
@@ -3813,6 +4084,80 @@ impl Explorer {
         overlay.into_any_element()
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
+        if id == "clear-cache" {
+            self.usage_cancel.store(true, Ordering::Relaxed);
+            self.usage_revision += 1;
+            self.usage_running = false;
+            self.usage.clear();
+            self.usage_enabled = false;
+            disk_usage::invalidate_cache();
+            visual::clear_cache();
+            visual::reset_image_cache(cx);
+            self.thumbnails = rust_explorer::thumbnails::Loader::new();
+            self.thumbnail_images = visual::ThumbnailImages::new(cx);
+            self.invalidate_list();
+            self.sync_thumbnails();
+            self.status = "正在清空缓存…".into();
+            let task = cx
+                .background_executor()
+                .spawn(async { rust_explorer::native_assets::clear_disk_cache() });
+            cx.spawn(async move |view, cx| {
+                let result = task.await;
+                let _ = view.update(cx, |v, cx| {
+                    visual::clear_cache();
+                    visual::reset_image_cache(cx);
+                    v.thumbnails = rust_explorer::thumbnails::Loader::new();
+                    v.thumbnail_images = visual::ThumbnailImages::new(cx);
+                    v.status = match result {
+                        Ok((removed, failed)) => format!("已清空缓存 · 删除 {removed} 个生成文件 · {failed} 个文件正在使用或无法删除"),
+                        Err(error) => format!("内存缓存已清空，磁盘缓存清理失败：{error:#}"),
+                    };
+                    v.sync_thumbnails();
+                    cx.notify();
+                });
+            }).detach();
+            cx.notify();
+            return;
+        }
+        if let Some((force, number)) = id
+            .strip_prefix("operation-stop:")
+            .map(|id| (false, id))
+            .or_else(|| id.strip_prefix("operation-force:").map(|id| (true, id)))
+        {
+            if let Ok(number) = number.parse::<u64>() {
+                if let Some(op) = self
+                    .system_operations
+                    .iter_mut()
+                    .find(|op| op.id == number && op.finished.is_none())
+                {
+                    op.control.stop(force);
+                    op.status = if force {
+                        "正在强行停止"
+                    } else {
+                        "正在请求停止"
+                    }
+                    .into();
+                }
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(payload) = id.strip_prefix("shell-verb:") {
+            match serde_json::from_str::<shell::Request>(payload) {
+                Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
+                _ => self.error = Some("无效的系统菜单操作".into()),
+            }
+            cx.notify();
+            return;
+        }
+        if let Some(command) = id.strip_prefix("text:") {
+            self.popup = None;
+            if let Some(input) = self.text_menu_target.take() {
+                input.update(cx, |input, cx| input.text_command(command, w, cx));
+            }
+            cx.notify();
+            return;
+        }
         if id == "quick-pinned" || id == "quick-unpinned" {
             // The native menu already changed the Shell's Quick Access list; pull the
             // new state immediately instead of waiting for the periodic refresh.
@@ -3998,13 +4343,16 @@ impl Explorer {
             return;
         }
         if let Some(id) = id.strip_prefix("column:") {
-            if let Some(index) = self.settings.columns.iter().position(|(key, _)| key == id) {
+            if let Some(index) = self
+                .active_columns_mut()
+                .iter()
+                .position(|(key, _)| key == id)
+            {
                 if id != "name" {
-                    self.settings.columns.remove(index);
+                    self.active_columns_mut().remove(index);
                 }
             } else {
-                self.settings
-                    .columns
+                self.active_columns_mut()
                     .push((id.into(), if id == "created" { 156. } else { 110. }));
             }
             self.invalidate_list();
@@ -4220,6 +4568,8 @@ impl Explorer {
                                     Sort::Name => "name",
                                     Sort::Modified => "modified",
                                     Sort::Created => "created",
+                                    Sort::Original => "original",
+                                    Sort::Deleted => "deleted",
                                     Sort::Kind => "kind",
                                     Sort::Size => "size",
                                 }
@@ -4282,7 +4632,14 @@ impl Explorer {
             }
             "ascending" => self.sort_current(self.sort, false),
             "descending" => self.sort_current(self.sort, true),
-            "reset-columns" => self.settings.columns = Settings::default().columns,
+            "reset-columns" => {
+                let defaults = if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
+                    rust_explorer::settings::default_recycle_columns()
+                } else {
+                    Settings::default().columns
+                };
+                *self.active_columns_mut() = defaults;
+            }
             "select-all" => {
                 self.selected = self.visible_file_indices();
                 self.clear_preview();
