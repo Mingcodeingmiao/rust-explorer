@@ -1200,11 +1200,10 @@ impl Explorer {
                     .flex()
                     .justify_center()
                     .child(visual::icon(
-                        if rust_explorer::system_icons::windows_11() {
-                            "computer"
-                        } else {
-                            "address-computer"
-                        },
+                        // The system glyph U+E7F4 in both cases: Segoe Fluent Icons
+                        // on Windows 11, Segoe MDL2 Assets on Windows 10. The embedded
+                        // SVG is only a fallback when neither font is installed.
+                        "address-computer",
                         t.text,
                     )),
             )
@@ -1289,7 +1288,7 @@ impl Explorer {
         }
         let width = self.layout_width.max(200.);
         let cell = match self.view {
-            ViewMode::ExtraLarge => 224.,
+            ViewMode::ExtraLarge => 328.,
             ViewMode::Large => 164.,
             ViewMode::Medium => 124.,
             ViewMode::Small => 210.,
@@ -2824,22 +2823,8 @@ impl Explorer {
                     )
                 })
                 .when(
-                    (has_thumbnail && presentation.shortcut)
-                        || (entry.link
-                            && !entry.path.extension().is_some_and(|e| {
-                                e.eq_ignore_ascii_case("lnk") || e.eq_ignore_ascii_case("url")
-                            })),
-                    |d| {
-                        d.child(
-                            div()
-                                .absolute()
-                                .left_0()
-                                .bottom_0()
-                                .size(ui(16.))
-                                .bg(rgb(0xffffff))
-                                .child(visual::icon("shortcut", 0x0067c0)),
-                        )
-                    },
+                    (has_thumbnail && presentation.shortcut) || entry.link,
+                    |d| d.child(visual::link_badge(self.view.icon_size())),
                 );
             if self.view == ViewMode::Content {
                 let inner = (item_width - 24.).max(0.);
@@ -3147,7 +3132,7 @@ impl Explorer {
                     ViewMode::Details | ViewMode::Content => 1,
                     _ => {
                         let cell = match self.view {
-                            ViewMode::ExtraLarge => 224.,
+                            ViewMode::ExtraLarge => 328.,
                             ViewMode::Large => 164.,
                             ViewMode::Medium => 124.,
                             ViewMode::Small => 210.,

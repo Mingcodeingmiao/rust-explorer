@@ -279,15 +279,28 @@ fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap>
     } else {
         SIIGBF_THUMBNAILONLY
     };
-    let bitmap = OwnedBitmap(
-        unsafe {
-            factory
-                .GetImage(bounds, flags | SIIGBF_INCACHEONLY)
-                .or_else(|_| factory.GetImage(bounds, flags))
+    // Apps and documents without a thumbnail still have a Shell icon, and that is
+    // what Explorer shows for them (for example a shortcut to an executable).
+    match unsafe {
+        factory
+            .GetImage(bounds, flags | SIIGBF_INCACHEONLY)
+            .or_else(|_| factory.GetImage(bounds, flags))
+    } {
+        Ok(bitmap) => bitmap_pixels(OwnedBitmap(bitmap).0, folder_alpha),
+        Err(_) => {
+            let icon = unsafe {
+                factory.GetImage(
+                    bounds,
+                    windows::Win32::UI::Shell::SIIGBF_ICONONLY
+                        | windows::Win32::UI::Shell::SIIGBF_BIGGERSIZEOK,
+                )
+            }
+            .context("系统未提供此文件的缩略图或图标")?;
+            // Icons are transparent; keep their alpha whatever the caller preferred
+            // for photos or folder compositions.
+            bitmap_pixels(OwnedBitmap(icon).0, true)
         }
-        .context("系统未提供此文件的缩略图")?,
-    );
-    bitmap_pixels(bitmap.0, folder_alpha)
+    }
 }
 
 fn bitmap_pixels(bitmap: HBITMAP, folder_alpha: bool) -> Result<Bitmap> {

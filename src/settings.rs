@@ -26,7 +26,8 @@ impl ViewMode {
     ];
     pub fn icon_size(self) -> f32 {
         match self {
-            Self::ExtraLarge => 154.,
+            // 257 = the previous 154 enlarged by 1.67, closer to Explorer's jumbo icons.
+            Self::ExtraLarge => 257.,
             Self::Large => 102.,
             Self::Medium => 64.,
             Self::Tiles | Self::Content => 40.,

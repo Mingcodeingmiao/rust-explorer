@@ -126,7 +126,7 @@ fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
-        .join("RustExplorer/cache/native-v6-r3")
+        .join("RustExplorer/cache/native-v6-r5")
 }
 fn cache_path(key: impl Hash) -> Result<PathBuf> {
     let root = cache_root();
@@ -137,7 +137,7 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
 }
 
 fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v4");
+    let root = cache_root().join("thumbnails-v6");
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
@@ -330,17 +330,18 @@ pub fn serve(json: &str) -> Result<()> {
                     && metadata.modified().ok() == item.modified,
                 "文件已变化"
             );
-            let shortcut = !directory
-                && matches!(
-                    item.path
-                        .extension()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_ascii_lowercase()
-                        .as_str(),
-                    "lnk" | "url"
-                );
-            let target = if shortcut {
+            let extension = item
+                .path
+                .extension()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_ascii_lowercase();
+            let shortcut = !directory && matches!(extension.as_str(), "lnk" | "url");
+            // A `.lnk` points at a file whose own artwork is what Explorer shows. A
+            // `.url` usually points at a web page: resolving it would leave us with a
+            // URL and no icon, so the Shell is asked for the shortcut file's own icon
+            // (the site favicon) instead.
+            let target = if extension == "lnk" {
                 crate::native_preview::shortcut_target(&item.path)?
             } else {
                 item.path.clone()
@@ -375,7 +376,7 @@ pub fn serve(json: &str) -> Result<()> {
                 shortcut_epoch: item.shortcut_epoch,
             };
             let output = if shortcut {
-                let root = cache_root().join("thumbnails-v4");
+                let root = cache_root().join("thumbnails-v6");
                 std::fs::create_dir_all(&root)?;
                 let mut hash = std::collections::hash_map::DefaultHasher::new();
                 (&item, &resolved).hash(&mut hash);
@@ -423,15 +424,21 @@ pub fn serve(json: &str) -> Result<()> {
                     );
                     crate::native_preview::photo_thumbnail(&resolved.path, pixels)?
                 } else {
+                    // A shortcut to an app or document has no thumbnail of its own,
+                    // but the Shell can still hand back its icon — which is what
+                    // Explorer shows. Everything else stays on the video whitelist.
                     anyhow::ensure!(
-                        matches!(
-                            extension.as_str(),
-                            "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
-                        ),
+                        shortcut
+                            || matches!(
+                                extension.as_str(),
+                                "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
+                            ),
                         "文件不支持缩略图"
                     );
                     crate::native_preview::file_thumbnail(&resolved.path, pixels)?
                 };
+                // No badge is painted into the bitmap: the view draws one link
+                // arrow per tile, so baking a second one here produced two arrows.
                 save_png(&output, bitmap.width, bitmap.height, &bitmap.rgba)?;
                 if let Some(root) = output.parent() {
                     prune_thumbnail_cache(root);

@@ -269,11 +269,19 @@ pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
 }
 /// Badge for reparse links whose shared class icon has no Shell overlay.
 /// Do not add to .lnk/.url icons: their per-item Shell bitmap owns its arrow.
+///
+/// The Shell exposes the link overlay only as part of a complete icon (there is no
+/// standalone overlay bitmap API), so the arrow stays drawn; its size follows the
+/// icon size the way Explorer's overlay does.
 pub fn link_badge(logical: f32) -> AnyElement {
-    // Extra-large overlays are twice the previous 18 px cap; small/list/detail
-    // icons all use the same 8 px overlay.
+    // One badge per item, sized from the icon: a fixed 16 px box looked oversized
+    // next to extra-large icons and tiny next to medium ones.
     let edge = if logical >= 140. {
-        36.
+        logical * 0.20
+    } else if logical >= 96. {
+        logical * 0.20
+    } else if logical >= 56. {
+        logical * 0.20
     } else {
         (logical * 0.36).clamp(8., 18.)
     };

@@ -6,7 +6,7 @@ use gpui::{
     EntityInputHandler, FocusHandle, Focusable, GlobalElementId, KeyBinding, LayoutId, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, PaintQuad, Pixels, Point, SharedString, Style,
     TextRun, UTF16Selection, UnderlineStyle, Window, WrappedLine, actions, div, fill, prelude::*,
-    px, relative, rgb, rgba, size,
+    px, relative, rgb, size,
 };
 use unicode_segmentation::*;
 
@@ -273,11 +273,21 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_position(
-            position - bounds.origin + gpui::point(self.scroll_x, px(0.)),
-            self.last_line_height,
-        )
-        .unwrap_or(0)
+        let local = position - bounds.origin + gpui::point(self.scroll_x, px(0.));
+        // Positions outside the shaped text do not resolve to an index; map them to
+        // the nearest end instead of falling back to the start of the line.
+        if local.x <= px(0.) {
+            return 0;
+        }
+        let end = line
+            .position_for_index(self.content.len(), self.last_line_height)
+            .map(|position| position.x)
+            .unwrap_or_default();
+        if local.x >= end {
+            return self.content.len();
+        }
+        line.closest_index_for_position(local, self.last_line_height)
+            .unwrap_or(0)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -653,7 +663,8 @@ impl Element for TextElement {
                 };
                 selection.push(fill(
                     Bounds::new(origin + p, size(width.max(px(1.)), line_height)),
-                    rgba(0x3311ff30),
+                    // Windows' text selection colour (rgb(0,120,212)).
+                    rgb(0x0078D4),
                 ));
             }
         }
