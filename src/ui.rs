@@ -269,6 +269,8 @@ struct Explorer {
     own_window: Option<AnyWindowHandle>,
     tab_drag: Option<Arc<AtomicBool>>,
     tab_tip: Option<crate::tab_tip::TabTip>,
+    /// Scale the tab card was built for (zoom × monitor DPI).
+    tab_tip_scale: f32,
     volumes: Vec<Volume>,
     storage_volumes: Vec<Volume>,
     volume_busy: bool,
@@ -796,6 +798,7 @@ impl Explorer {
             own_window: Some(window.window_handle()),
             tab_drag: None,
             tab_tip: None,
+            tab_tip_scale: 1.0,
             volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
             storage_volumes: Vec::new(),
             volume_busy: false,

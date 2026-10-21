@@ -156,15 +156,19 @@ impl Render for NameTip {
         // GPUI pixels are logical: the native card needs the monitor DPI as well as
         // the user's zoom, otherwise it renders at 100% size on a scaled display.
         let scale = (f32::from(window.rem_size()) / 16.) * window.scale_factor();
-        if shell::menu_active() {
-            // A topmost card must not appear while a native menu is on screen.
+        if shell::menu_active() || !window.is_window_active() {
+            // The card belongs to this window: a native menu, deactivation or another
+            // application taking the foreground must hide it rather than leave it on
+            // screen.
             if let Some(tip) = self.tip.as_mut() {
                 tip.hide();
             }
             return div().into_any_element();
         }
         if self.tip.is_none() || (self.tip_scale - scale).abs() > 0.01 {
-            self.tip = rust_explorer::file_tip::FileTip::new(scale, self.theme.dark);
+            let owner = shell::active_window_owner();
+            let owner = (owner != 0).then_some(owner as isize);
+            self.tip = rust_explorer::file_tip::FileTip::new(owner, scale, self.theme.dark);
             self.tip_scale = scale;
         }
         let text = std::iter::once(self.hint.name.clone())
@@ -1870,15 +1874,19 @@ impl Explorer {
         if unsafe { GetWindowRect(HWND(hwnd as _), &mut rect) }.is_err() {
             return;
         }
-        let scale = window.scale_factor();
+        let dpi = window.scale_factor();
+        // Native text needs the user's zoom as well as the monitor DPI, the same rule
+        // the file hover card uses.
+        let scale = (f32::from(window.rem_size()) / 16.) * dpi;
         let text = self.tab_full_path(&path);
-        let x = rect.left + (f32::from(bounds.left()) * scale).round() as i32;
-        let tab_top = rect.top + (f32::from(bounds.top()) * scale).round() as i32;
-        if self.tab_tip.is_none() {
-            self.tab_tip = crate::tab_tip::TabTip::new(scale, self.theme.dark);
+        let x = rect.left + (f32::from(bounds.left()) * dpi).round() as i32;
+        let tab_bottom = rect.top + (f32::from(bounds.bottom()) * dpi).round() as i32;
+        if self.tab_tip.is_none() || (self.tab_tip_scale - scale).abs() > 0.01 {
+            self.tab_tip = crate::tab_tip::TabTip::new(Some(hwnd as isize), scale, self.theme.dark);
+            self.tab_tip_scale = scale;
         }
         if let Some(tip) = &mut self.tab_tip {
-            tip.show(&text, x, tab_top, scale);
+            tip.show(&text, x, tab_bottom, scale);
         }
     }
     fn hide_tab_tip(&mut self) {
