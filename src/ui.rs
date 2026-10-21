@@ -559,9 +559,25 @@ impl Explorer {
                             this.navigate(PathBuf::from(typed), cx);
                             return;
                         }
+                        // Quick Access and the Recycle Bin have no filesystem
+                        // path: the address bar shows their display name, so
+                        // typing that name back has to return to the location
+                        // instead of probing the disk. A real relative entry
+                        // with the same name still wins.
+                        if let Some(path) =
+                            rust_explorer::shell_folder::resolve_named_location(typed)
+                            && !rust_explorer::path_completion::resolve_input(&this.dir(), typed)
+                                .is_some_and(|relative| relative.exists())
+                        {
+                            this.open_address_path(path, window, cx);
+                            return;
+                        }
                         let portable_display = typed.contains('\\')
                             && (typed.starts_with(&this.computer_name)
                                 || typed.starts_with("此电脑")
+                                // This PC's name is renamable, so a bin
+                                // breadcrumb is recognized by its second part.
+                                || rust_explorer::shell_folder::is_recycle_bin_address(typed)
                                 || this.volumes.iter().any(|volume| {
                                     volume.kind == 7 && typed.starts_with(&volume.label)
                                 }));
