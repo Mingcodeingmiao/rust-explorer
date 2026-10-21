@@ -6,13 +6,20 @@ Notable changes are recorded here. Versions before 1.0 may change behavior and c
 
 See [complete release notes](docs/v0.7.6.md) and the [roadmap](ROADMAP.md). Includes merged PR #27 and subsequent fixes.
 
+### 2026-10-21 revision (same version, PR #30)
+
+- Restore owner-backed context menus to an in-process independent STA thread. The original package spawned a fresh helper for every right-click, repeatedly cold-loading Shell extensions and causing latency.
+- Retain cancellable helpers for file operations; add prominent source/contributor/agent warnings against merging the menu and operation paths again.
+- Correct file/tab tooltip ownership, placement and scaling; remove global topmost behavior over other applications.
+- Replace the Windows ZIP and checksum, and retarget v0.7.6 to the revised source. Original release source remains available at b070f8c917805936e1ec40959d3622ddd3cba2de; the previous archive SHA-256 is recorded in the release notes.
+
 ### Fixed
 
 - Recycle Bin column resize/order/visibility settings and sorting, separately persisted from normal folders (#23).
 - Unicode deletion-confirmation names instead of internal PIDL identifiers (#22); clearer dark selection contrast (#21).
 - Startup drive capacity and icon loading: publish local volumes before portable-device enumeration, separate navigation icon work, isolate slow drive requests, and move desktop.ini reads off the GUI thread (#28).
 - Quick Access enumeration no longer depends on Shell-menu pin probes.
-- Native menus and operations use isolated STA helpers, propagate initialization failures, and avoid RPC_E_CHANGED_MODE on shared executor threads.
+- Owner-backed native menus use an independent in-process STA; file operations use isolated helpers. Initialization failures are propagated rather than ignoring RPC_E_CHANGED_MODE on shared executor threads.
 - Native new-folder commands use asynchronous creation and inline rename. Format-dialog launch validates drive roots and provides a valid parent; it no longer waits for the external host or mistakes closing it for a failed format.
 - Right-click item targeting follows visible icons, text and metadata rather than empty row/card space.
 - Address/rename caret selection and text menus; light text selection and inactive title/tab colors; maximized-window drag restoration.
