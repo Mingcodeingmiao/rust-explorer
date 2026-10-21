@@ -2696,6 +2696,29 @@ impl Explorer {
         let down_bounds = painted_bounds.clone();
         let up_bounds = painted_bounds.clone();
         let zoom = self.zoom;
+        // A selected item answers a right click anywhere inside its own cell;
+        // an unselected one still requires a text/icon/metadata hit, so
+        // right-clicking the empty part of another row keeps the background
+        // menu and does not steal the selection.
+        let hit_test = move |v: &Self,
+                             bounds: Bounds<Pixels>,
+                             position: Point<Pixels>,
+                             regions: &[(f32, f32, f32, f32)]| {
+            let local = position - bounds.origin;
+            let (x, y) = (f32::from(local.x) / zoom, f32::from(local.y) / zoom);
+            let (width, height) = (
+                f32::from(bounds.size.width) / zoom,
+                f32::from(bounds.size.height) / zoom,
+            );
+            rust_explorer::layout_metrics::right_click_hits(
+                regions,
+                x,
+                y,
+                width,
+                height,
+                v.selected.contains(&index),
+            )
+        };
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
@@ -2795,11 +2818,7 @@ impl Explorer {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseDownEvent, _, cx| {
-                    let point = e.position - down_bounds.get().origin;
-                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
-                    if !down_regions.iter().any(|(left, top, width, height)| {
-                        x >= *left && x <= left + width && y >= *top && y <= top + height
-                    }) {
+                    if !hit_test(v, down_bounds.get(), e.position, &down_regions) {
                         return;
                     }
                     cx.stop_propagation();
@@ -2820,11 +2839,7 @@ impl Explorer {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseUpEvent, w, cx| {
-                    let point = e.position - up_bounds.get().origin;
-                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
-                    if !right_regions.iter().any(|(left, top, width, height)| {
-                        x >= *left && x <= left + width && y >= *top && y <= top + height
-                    }) {
+                    if !hit_test(v, up_bounds.get(), e.position, &right_regions) {
                         return;
                     }
                     cx.stop_propagation();

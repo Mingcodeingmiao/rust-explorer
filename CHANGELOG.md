@@ -10,12 +10,13 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 
 - Context menus are shown in the application process again with their window owner. The "cancellable operations" change had routed them through the one-shot helper, which started a helper process and cold-loaded Shell extensions on every right click (about 250 ms, near 1 s with many extensions) instead of the 40-80 ms in-process path. Other tracked Shell operations keep their one-shot helper and stop/force-stop controls.
 - File and tab hover cards are owned by the application window, never topmost, clamped inside it, and dismissed when the window is inactive, the pointer leaves, or a menu opens. Tab cards sit flush with the window top and flip below it at the screen edge; both scale with zoom × system DPI.
+- An already selected item answers a right click anywhere inside its own cell; an unselected one still requires an icon, name or metadata hit, so right-clicking the empty part of a row keeps the background menu and does not change the selection.
 - Address bar: the displayed names of Quick Access and the Recycle Bin (`快速访问`, `此电脑\回收站`, folders inside the bin) navigate back to their location instead of being resolved against the disk, including after This PC was renamed. Recycled folders show only their own name in the address bar and title.
 
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
-- Local checks: 106 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed.
+- Local checks: 107 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed.
 
 ## [0.7.6] - 2026-10-20
 
