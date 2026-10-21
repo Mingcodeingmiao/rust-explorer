@@ -2,6 +2,10 @@
 
 欢迎报告问题、改进文档或提交小而清晰的 Pull Request。项目目前面向 Windows 10/11 x64，仍在迭代中。
 
+> [!CAUTION]
+> **右键菜单性能红线：不得把带主窗口 owner 的菜单改回“一次性 helper + 可取消操作”，不得清零 owner。**
+> 这会导致每次右键启动进程并冷加载 Shell 扩展，曾造成接近一秒的延迟。PR #30 已恢复进程内独立 STA 菜单路径。删除/复制等文件操作仍使用可取消 helper；不要再次把两类请求合并。详见 [维护约束](AGENTS.md)。
+
 ## 开发环境
 
 1. 安装 Rust stable、Visual Studio C++ Build Tools 和 Windows SDK（含 `fxc.exe`）。Rust 2024 edition 至少需要 Rust 1.85；实际构建依赖以当前 stable 和 `Cargo.lock` 为准。
