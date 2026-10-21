@@ -13,6 +13,11 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 - An already selected item answers a right click anywhere inside its own cell; an unselected one still requires an icon, name or metadata hit, so right-clicking the empty part of a row keeps the background menu and does not change the selection.
 - Address bar: the displayed names of Quick Access and the Recycle Bin (`快速访问`, `此电脑\回收站`, folders inside the bin) navigate back to their location instead of being resolved against the disk, including after This PC was renamed. Recycled folders show only their own name in the address bar and title.
 
+### Changed
+
+- Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings.
+- The three "open at startup" choices on the General tab are laid out in one row instead of three.
+
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
