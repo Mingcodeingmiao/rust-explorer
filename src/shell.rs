@@ -67,13 +67,37 @@ impl OperationControl {
 thread_local! {
     static OPERATION_CONTROL: RefCell<Option<OperationControl>> = const { RefCell::new(None) };
 }
-pub fn execute_controlled(mut request: Request, control: OperationControl) -> Result<String> {
-    // Every user-facing Shell operation is killable without terminating a GUI
-    // thread. A helper owns its popup; never create cross-process child windows.
-    match &mut request {
-        Request::ThemedMenu { owner, .. } | Request::ComputerMenu { owner, .. } => *owner = 0,
-        _ => {}
+/// ⚠️ 警告（WARNING，勿回退）：**右键菜单绝对不要走"一次性 helper + 可取消"的请求路径**。
+///
+/// 菜单必须保留 `owner`（应用窗口）并留在**应用进程内**构建、显示（见
+/// [`execute_menu_in_process`]）。一旦把菜单请求送去 `execute_one_shot`：
+///
+/// * 每次右键都会新起一个 `rust-explorer.exe` 子进程，并在其中**冷启动**重新加载
+///   全部 Shell 扩展——实测首次 **≈250 ms，本机扩展多时可达 1 秒**；而进程内热路径
+///   只要 **40–80 ms**。
+/// * 菜单是"用户点一下就关"的交互，本来就不需要 `OperationControl` 的取消能力；
+///   取消语义只对删除/复制/格式化这类长操作有意义。
+/// * 菜单的 `owner` 一定不能在这里被清零（`*owner = 0`）。`owner = Some(hwnd)` 时
+///   `execute_output` 才会走 [`execute_menu_in_process`]，否则会退回 helper，菜单
+///   还会重新出现"被系统瞬间取消 / 抢激活 / 任务栏变灰"等 0.7.5 已修好的问题。
+///
+/// 历史教训：0.7.6 之后的一次"系统操作可取消"改动曾把菜单也并入 one-shot，导致右键
+/// 菜单从 40–80 ms 退化到接近 1 秒。请勿再次合并这两类请求。
+pub fn execute_controlled(request: Request, control: OperationControl) -> Result<String> {
+    // Menus stay on the in-process path added in 0.7.5 (see the warning above).
+    if is_menu_request(&request) {
+        if cfg!(feature = "desktop") {
+            debug_assert!(
+                menu_owner(&request).is_some(),
+                "菜单请求必须携带 owner 才能在应用进程内显示；\
+                 若这里失败，说明有人又把 owner 清零或漏传了（会让右键菜单退化到 ~1s）"
+            );
+        }
+        menu_trace("menu: in-process (cancellable operations keep their helper)");
+        return execute_output(request);
     }
+    // Every other user-facing Shell operation is killable without terminating a GUI
+    // thread. A helper owns its popup; never create cross-process child windows.
     OPERATION_CONTROL.with(|slot| *slot.borrow_mut() = Some(control));
     struct Reset;
     impl Drop for Reset {
@@ -692,9 +716,8 @@ fn execute_menu_output(request: Request) -> Result<String> {
 }
 pub fn execute_output(request: Request) -> Result<String> {
     if is_menu_request(&request) {
-        // A request that names an owner window runs inside the application process:
-        // the app stays the active process, so no helper steals activation and the
-        // taskbar button never flips to the inactive state.
+        // ⚠️ 不要删除这个分支：菜单必须在应用进程内显示（见 execute_controlled 的警告）。
+        // 只有没有 owner 的旧式/CLI 调用才会退回 helper。
         if menu_owner(&request).is_some() {
             return execute_menu_in_process(request);
         }
@@ -851,6 +874,12 @@ fn execute_menu_on_sta(request: Request) -> Result<String> {
     // trailing newline must not be part of the result.
     Ok(output.trim_end().to_string())
 }
+/// Run one request in a short-lived helper process.
+///
+/// ⚠️ 警告（WARNING）：**不要把右键菜单带进这里**。每次调用都会创建新进程并冷加载
+/// Shell 扩展，菜单从进程内的 40–80 ms 退化到 ≈250 ms（扩展多时接近 1 秒）。
+/// 菜单只在没有 owner 的旧式路径下才会经 [`execute_menu_output`] 兜底到这里；
+/// 有 owner 时必须走 [`execute_menu_in_process`]。
 fn execute_one_shot(request: Request) -> Result<String> {
     use std::{io::Write, process::Stdio};
     let pin_deadline = matches!(&request, Request::QuickAccessPin { .. });
@@ -966,6 +995,48 @@ fn execute_one_shot(request: Request) -> Result<String> {
 #[cfg(test)]
 mod protocol_tests {
     use super::*;
+
+    /// 回归测试：右键菜单必须留在应用进程内（见 `execute_controlled` 的警告）。
+    ///
+    /// 菜单一旦变成"一次性 helper + 可取消"请求，每次右键都要新起进程并冷加载
+    /// Shell 扩展，实测 ≈250 ms 起、扩展多时接近 1 秒；进程内热路径是 40–80 ms。
+    #[test]
+    fn context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper() {
+        let path = PathBuf::from("C:\\Windows\\notepad.exe");
+        let folder = PathBuf::from("C:\\Windows");
+        let themed = Request::ThemedMenu {
+            paths: vec![path.clone()],
+            folder: folder.clone(),
+            x: 0,
+            y: 0,
+            dark: false,
+            view: 5,
+            sort: "name".into(),
+            descending: false,
+            group: String::new(),
+            undo: false,
+            redo: false,
+            can_paste: false,
+            quick_access_pinned: false,
+            owner: 0x1234,
+        };
+        assert!(is_menu_request(&themed), "ThemedMenu 必须被识别为菜单请求");
+        assert!(
+            menu_owner(&themed).is_some(),
+            "菜单请求必须携带 owner；owner 丢失会让菜单退回一次性 helper（右键菜单 ≈1s）"
+        );
+        let computer = Request::ComputerMenu {
+            x: 0,
+            y: 0,
+            dark: false,
+            expanded: false,
+            owner: 0x1234,
+        };
+        assert!(is_menu_request(&computer));
+        assert!(menu_owner(&computer).is_some());
+        // 非菜单请求没有 owner，仍走一次性 helper（可取消）。
+        assert!(menu_owner(&Request::Open { path }).is_none());
+    }
     #[test]
     fn format_targets_are_exact_drive_roots_and_failures_are_not_success() {
         for value in ["c", "C:", "c:\\", "C:/"] {
