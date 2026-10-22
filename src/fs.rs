@@ -281,15 +281,39 @@ pub fn size_label(bytes: u64) -> String {
     format!("{value:.1} {}", units[index])
 }
 
+/// The folder on the way to `dir` that sits directly under `target`. Going to an
+/// ancestor (`↑`, breadcrumb click) re-selects it, matching Explorer.
+pub fn child_towards(dir: &Path, target: &Path) -> Option<PathBuf> {
+    if dir == target {
+        return None;
+    }
+    let rest = dir.strip_prefix(target).ok()?;
+    let first = rest.components().next()?;
+    Some(target.join(first))
+}
+
+/// View state remembered for one history entry, so going back returns to the
+/// same scroll position with the same item selected (like Explorer).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct HistoryState {
+    /// First visible row (fractional) used when no item was selected.
+    pub row: f32,
+    /// The item the user was acting on.
+    pub focus: Option<PathBuf>,
+    pub selection: Vec<PathBuf>,
+}
+
 #[derive(Clone)]
 pub struct History {
     paths: Vec<PathBuf>,
+    states: Vec<Option<HistoryState>>,
     index: usize,
 }
 impl History {
     pub fn new(path: PathBuf) -> Self {
         Self {
             paths: vec![path],
+            states: vec![None],
             index: 0,
         }
     }
@@ -301,11 +325,19 @@ impl History {
             return;
         }
         self.paths.truncate(self.index + 1);
+        self.states.truncate(self.index + 1);
         self.paths.push(path);
+        self.states.push(None);
         self.index += 1;
     }
+    pub fn can_back(&self) -> bool {
+        self.index > 0
+    }
+    pub fn can_forward(&self) -> bool {
+        self.index + 1 < self.paths.len()
+    }
     pub fn back(&mut self) -> bool {
-        if self.index > 0 {
+        if self.can_back() {
             self.index -= 1;
             true
         } else {
@@ -313,12 +345,22 @@ impl History {
         }
     }
     pub fn forward(&mut self) -> bool {
-        if self.index + 1 < self.paths.len() {
+        if self.can_forward() {
             self.index += 1;
             true
         } else {
             false
         }
+    }
+    /// Remember how the current entry was left (scroll position and selection).
+    pub fn remember(&mut self, state: HistoryState) {
+        if let Some(slot) = self.states.get_mut(self.index) {
+            *slot = Some(state);
+        }
+    }
+    /// State saved when this entry was left, if any.
+    pub fn state(&self) -> Option<HistoryState> {
+        self.states.get(self.index).cloned().flatten()
     }
 }
 
@@ -407,13 +449,77 @@ mod tests {
         assert!(valid_name("报告 2026.pdf").is_ok());
     }
     #[test]
+    fn child_towards_selects_the_folder_on_the_way_to_the_ancestor() {
+        assert_eq!(
+            child_towards(
+                Path::new("C:\\Windows\\system32\\drivers"),
+                Path::new("C:\\Windows")
+            ),
+            Some(PathBuf::from("C:\\Windows\\system32"))
+        );
+        assert_eq!(
+            child_towards(Path::new("C:\\Windows\\system32"), Path::new("C:\\")),
+            Some(PathBuf::from("C:\\Windows"))
+        );
+        // The current folder itself and unrelated paths have no child.
+        assert_eq!(
+            child_towards(Path::new("C:\\Windows"), Path::new("C:\\Windows")),
+            None
+        );
+        assert_eq!(
+            child_towards(Path::new("C:\\Windows"), Path::new("D:\\work")),
+            None
+        );
+        assert_eq!(
+            child_towards(Path::new("C:\\Windows"), Path::new("D:\\")),
+            None
+        );
+    }
+    #[test]
     fn history_discards_forward_branch() {
         let mut h = History::new("C:\\a".into());
         h.push("C:\\b".into());
+        assert!(h.can_back() && !h.can_forward());
         assert!(h.back());
+        assert!(h.can_forward() && !h.can_back());
         h.push("C:\\c".into());
         assert!(!h.forward());
         assert_eq!(h.current(), Path::new("C:\\c"));
+    }
+    #[test]
+    fn history_keeps_the_view_state_of_each_entry() {
+        let mut h = History::new("C:\\a".into());
+        h.push("C:\\b".into());
+        let state = HistoryState {
+            row: 12.5,
+            focus: Some(PathBuf::from("C:\\a\\报告.pdf")),
+            selection: vec![PathBuf::from("C:\\a\\报告.pdf")],
+        };
+        h.remember(state.clone());
+        assert!(h.back());
+        assert_eq!(h.state(), None);
+        h.remember(HistoryState {
+            row: 3.,
+            ..Default::default()
+        });
+        assert!(h.forward());
+        assert_eq!(h.state(), Some(state));
+        assert!(h.back());
+        assert_eq!(h.state().unwrap().row, 3.);
+    }
+    #[test]
+    fn pushing_a_new_path_after_going_back_drops_the_old_state() {
+        let mut h = History::new("C:\\a".into());
+        h.push("C:\\b".into());
+        h.remember(HistoryState {
+            row: 7.,
+            focus: None,
+            selection: vec![],
+        });
+        assert!(h.back());
+        h.push("C:\\c".into());
+        assert!(!h.can_forward());
+        assert_eq!(h.state(), None);
     }
     #[test]
     fn numbered_folder_skips_existing_files_and_reuses_gaps() {

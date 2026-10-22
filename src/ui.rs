@@ -303,6 +303,10 @@ struct Explorer {
     focus_item: Option<PathBuf>,
     pending_selection_click: Option<usize>,
     ctrl_open_selection: Option<(BTreeSet<usize>, Instant)>,
+    /// View state to apply once the listing of a back/forward/up target loads.
+    pending_restore: Option<rust_explorer::fs::HistoryState>,
+    /// Scroll row to restore when nothing was selected in the target folder.
+    pending_scroll_row: Option<f32>,
     file_drag: Option<FileDragState>,
     right_file_drag: Option<RightFileDrag>,
     pending_right_drop: Option<(Vec<PathBuf>, PathBuf)>,
@@ -856,6 +860,8 @@ impl Explorer {
             focus_item: None,
             pending_selection_click: None,
             ctrl_open_selection: None,
+            pending_restore: None,
+            pending_scroll_row: None,
             file_drag: None,
             right_file_drag: None,
             pending_right_drop: None,
@@ -1170,6 +1176,11 @@ impl Explorer {
             self.view = ViewMode::Tiles;
             self.group.clear();
         }
+        // Remember where the folder we are leaving was scrolled to and what was
+        // selected there; going back restores both, like Explorer.
+        self.remember_history_state();
+        self.pending_restore = None;
+        self.pending_scroll_row = None;
         self.tabs[self.active].history.push(path);
         if self.settings.expand_current {
             self.expand_to_current(cx);
@@ -1248,6 +1259,11 @@ impl Explorer {
         self.clear_preview();
         let query = self.tabs[self.active].query.clone();
         if navigation::is_app_virtual(&path) && query.trim().is_empty() {
+            // The virtual pages are built synchronously and have no listing to
+            // restore into; drop any pending history state so a later refresh
+            // cannot apply it to the wrong folder.
+            self.pending_restore = None;
+            self.pending_scroll_row = None;
             self.loading = false;
             self.watcher = None;
             self.sync_computer_entries();
@@ -1443,6 +1459,29 @@ impl Explorer {
                             {
                                 this.selected.insert(index);
                                 this.pending_rename = true;
+                            }
+                        }
+                        // Back/forward/up: reselect what was selected here and
+                        // scroll back to it (or to the remembered row).
+                        if let Some(restore) = this.pending_restore.take() {
+                            for path in &restore.selection {
+                                if let Some(index) =
+                                    this.entries.iter().position(|entry| &entry.path == path)
+                                {
+                                    this.selected.insert(index);
+                                }
+                            }
+                            let focus = restore.focus.as_ref().and_then(|path| {
+                                this.entries.iter().position(|entry| &entry.path == path)
+                            });
+                            if let Some(index) = focus {
+                                this.selected.insert(index);
+                                this.anchor = index;
+                                this.focus_item = Some(this.entries[index].path.clone());
+                                this.keyboard_cursor = this.focus_item.clone();
+                                this.reveal_scroll = this.focus_item.clone();
+                            } else if restore.row > 0. {
+                                this.pending_scroll_row = Some(restore.row);
                             }
                         }
                         this.status = status;
@@ -2967,6 +3006,89 @@ impl Explorer {
         }
         cx.notify();
     }
+    /// First visible row, in row units, for the current view.
+    fn scroll_row(&self) -> f32 {
+        if self.high_performance_active() {
+            self.high_performance_row.get()
+        } else {
+            let offset = self.list_scroll.logical_scroll_top();
+            let height = (self.estimated_row_height() * self.zoom).max(1.);
+            offset.item_ix as f32 + f32::from(offset.offset_in_item) / height
+        }
+    }
+    fn history_state(&self) -> rust_explorer::fs::HistoryState {
+        let focus = self.focus_item.clone().or_else(|| {
+            self.selected
+                .iter()
+                .next()
+                .and_then(|index| self.entries.get(*index))
+                .map(|entry| entry.path.clone())
+        });
+        rust_explorer::fs::HistoryState {
+            row: self.scroll_row(),
+            focus,
+            selection: self.paths(),
+        }
+    }
+    /// Store the current scroll position and selection on the entry being left.
+    fn remember_history_state(&mut self) {
+        let state = self.history_state();
+        self.tabs[self.active].history.remember(state);
+    }
+    fn apply_remembered_state(&mut self) {
+        self.pending_restore = self.tabs[self.active].history.state();
+        self.pending_scroll_row = None;
+    }
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.remember_history_state();
+        if self.tabs[self.active].history.back() {
+            self.apply_remembered_state();
+            self.reload(cx);
+        }
+    }
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        self.remember_history_state();
+        if self.tabs[self.active].history.forward() {
+            self.apply_remembered_state();
+            self.reload(cx);
+        }
+    }
+    fn can_go_up(&self) -> bool {
+        !navigation::is_app_virtual(&self.dir())
+    }
+    /// Selecting the folder that was just left, the way Explorer does after `↑`.
+    fn focus_after_load(&mut self, path: PathBuf) {
+        if navigation::is_app_virtual(&self.dir()) {
+            return;
+        }
+        self.pending_restore = Some(rust_explorer::fs::HistoryState {
+            row: 0.,
+            focus: Some(path.clone()),
+            selection: vec![path],
+        });
+        self.pending_scroll_row = None;
+    }
+    /// The folder on the way to the current directory that sits directly under
+    /// `target`. Navigating to an ancestor (breadcrumb click, `↑`) selects it,
+    /// matching Explorer.
+    fn child_towards_current(&self, target: &std::path::Path) -> Option<PathBuf> {
+        let dir = self.dir();
+        if navigation::is_shell_folder(&dir) {
+            let index = self
+                .shell_chain
+                .iter()
+                .position(|(_, path)| path == target)?;
+            return self
+                .shell_chain
+                .get(index + 1)
+                .map(|(_, path)| path.clone());
+        }
+        if volumes::is_computer(target) {
+            let root = dir.ancestors().last().map(PathBuf::from)?;
+            return (root != dir).then_some(root);
+        }
+        fs::child_towards(&dir, target)
+    }
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let path = self.dir();
         if navigation::is_app_virtual(&path) {
@@ -2977,9 +3099,11 @@ impl Explorer {
                 rust_explorer::shell_folder::parent_from_chain(&path, &self.shell_chain)
             {
                 self.navigate(parent, cx);
+                self.focus_after_load(path);
                 return;
             }
             let generation = self.generation;
+            let child = path.clone();
             let task = cx.background_executor().spawn(async move {
                 let request = serde_json::to_string(&path)?;
                 volumes::bounded::<PathBuf>("--shell-parent", &request, Duration::from_secs(5))
@@ -2991,7 +3115,10 @@ impl Explorer {
                         return;
                     }
                     match result {
-                        Ok(parent) => v.navigate(parent, cx),
+                        Ok(parent) => {
+                            v.navigate(parent, cx);
+                            v.focus_after_load(child);
+                        }
                         Err(error) => {
                             v.error = Some(error.to_string());
                             cx.notify();
@@ -3007,6 +3134,7 @@ impl Explorer {
                     .unwrap_or_else(volumes::computer),
                 cx,
             );
+            self.focus_after_load(path);
         }
     }
 
@@ -3285,6 +3413,14 @@ impl Render for Explorer {
                 }
             }
         }
+        if let Some(row) = self.pending_scroll_row.take() {
+            // Nothing was selected in the folder we came back to: restore only the
+            // scroll position.
+            let max = self.rows.len().saturating_sub(1) as f32;
+            let row = row.clamp(0., max);
+            self.high_performance_row.set(row);
+            self.set_list_scroll_row(row);
+        }
         self.sync_thumbnails();
         let recycle = self.settings.high_performance
             && !matches!(
@@ -3371,6 +3507,24 @@ impl Render for Explorer {
             .on_action(cx.listener(|v, action: &NavigateFiles, w, cx| {
                 v.key_navigate(action.step.clone(), action.extend, action.focus_only, w, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|v, _, _, cx| {
+                    if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                        return;
+                    }
+                    v.go_back(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|v, _, _, cx| {
+                    if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                        return;
+                    }
+                    v.go_forward(cx);
+                }),
+            )
             .on_action(cx.listener(|v, action: &ActivateNumberedTab, _, cx| {
                 if v.options.is_none() && v.dialog.is_none() && !v.tabs.is_empty() {
                     let index = action.index;
@@ -3511,17 +3665,13 @@ impl Render for Explorer {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                if v.tabs[v.active].history.back() {
-                    v.reload(cx);
-                }
+                v.go_back(cx);
             }))
             .on_action(cx.listener(|v, _: &Forward, _, cx| {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                if v.tabs[v.active].history.forward() {
-                    v.reload(cx);
-                }
+                v.go_forward(cx);
             }))
             .on_action(cx.listener(|v, _: &Up, _, cx| {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
@@ -3967,17 +4117,16 @@ impl Render for Explorer {
             ("up", "↑"),
             ("refresh", "⟳"),
         ] {
+            // Unavailable navigation is greyed out and does nothing when clicked.
+            let enabled = match id {
+                "back" => self.tabs[self.active].history.can_back(),
+                "forward" => self.tabs[self.active].history.can_forward(),
+                "up" => self.can_go_up(),
+                _ => true,
+            };
             let click = cx.listener(move |v, _, _, cx| match id {
-                "back" => {
-                    if v.tabs[v.active].history.back() {
-                        v.reload(cx);
-                    }
-                }
-                "forward" => {
-                    if v.tabs[v.active].history.forward() {
-                        v.reload(cx);
-                    }
-                }
+                "back" => v.go_back(cx),
+                "forward" => v.go_forward(cx),
                 "up" => v.go_up(cx),
                 _ => v.reload(cx),
             });
@@ -3997,7 +4146,9 @@ impl Render for Explorer {
                     .child(visual::icon_sized("refresh", t.text, 16.))
                     .on_click(click)
             } else {
-                button(id, label, t).on_click(click)
+                button(id, label, t)
+                    .when(!enabled, |d| d.opacity(0.35))
+                    .on_click(click)
             });
         }
         let address_width = (logical_width - 492.).max(80.);

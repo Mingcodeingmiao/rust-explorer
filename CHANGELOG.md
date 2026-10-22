@@ -21,11 +21,13 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 - Thumbnail cache is content-addressed: every PNG is stored once under the SHA-256 of its bytes (`<sha256>.png`), so identical thumbnails (stock folder art, the same picture copied around, generic file icons) share a single file. A small per-item index keeps the key-to-image mapping plus the link/photo decorations, the previous per-item PNG cache is removed on upgrade, and cache clearing covers both layouts.
 - Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings. The "清空缓存" entry in the `…` selection menu was removed; the Advanced tab is the only place to clear caches now.
 - The three "open at startup" choices on the General tab are laid out in one row instead of three.
+- Back/forward/up are greyed out when they cannot navigate. Going back, forward or up restores the scroll position and re-selects the item that was being worked on (↑ selects the folder just left), per tab, like Explorer; if that item is gone, only the scroll position is restored. Clicking an ancestor in the address bar selects the folder you came from.
+- The mouse side buttons (XBUTTON1/XBUTTON2) navigate back and forward, same as the toolbar buttons and Alt+←/→.
 
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
-- Local checks: 111 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed. Preview workers run one per core beyond the two kept free, and each concurrent worker uses its own isolated helper process.
+- Local checks: 114 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed. Preview workers run one per core beyond the two kept free, and each concurrent worker uses its own isolated helper process.
 
 ## [0.7.6] - 2026-10-20
 

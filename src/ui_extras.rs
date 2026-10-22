@@ -1277,7 +1277,13 @@ impl Explorer {
                     )
                     .on_click(cx.listener(move |v, _, _, cx| {
                         cx.stop_propagation();
+                        // Clicking an ancestor selects the folder we came from,
+                        // like the ↑ button and Explorer's breadcrumbs.
+                        let child = v.child_towards_current(&path);
                         v.navigate(path.clone(), cx);
+                        if let Some(child) = child {
+                            v.focus_after_load(child);
+                        }
                     })),
             );
             crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
@@ -4306,7 +4312,11 @@ impl Explorer {
             self.submenu = None;
             self.nested_submenu = None;
             if let Some(path) = path {
+                let child = self.child_towards_current(&path);
                 self.navigate(path, cx);
+                if let Some(child) = child {
+                    self.focus_after_load(child);
+                }
             }
             return;
         }
@@ -4326,7 +4336,11 @@ impl Explorer {
             self.submenu = None;
             self.nested_submenu = None;
             if let Some(path) = path {
+                let child = self.child_towards_current(&path);
                 self.navigate(path, cx);
+                if let Some(child) = child {
+                    self.focus_after_load(child);
+                }
             }
             return;
         }
