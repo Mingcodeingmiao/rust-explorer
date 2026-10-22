@@ -167,6 +167,10 @@ enum Dialog {
         path: PathBuf,
         initial: String,
     },
+    /// Renaming "This PC": the inline editor sits on the navigation label.
+    RenameComputer {
+        initial: String,
+    },
     Delete(Vec<PathBuf>),
     PermanentDelete(Vec<PathBuf>),
     Transfer {
@@ -261,6 +265,8 @@ struct Explorer {
     reveal_pending: bool,
     reveal_scroll: Option<PathBuf>,
     pending_rename: bool,
+    /// Explicit rename target coming from a context-menu command.
+    pending_rename_path: Option<PathBuf>,
     rename_token: u64,
     selected_at: Instant,
     templates: Vec<new_file::Template>,
@@ -810,6 +816,7 @@ impl Explorer {
                 .unwrap_or_default(),
             reveal_scroll: None,
             pending_rename: false,
+            pending_rename_path: None,
             rename_token: 0,
             selected_at: Instant::now(),
             templates: vec![],
@@ -1717,6 +1724,9 @@ impl Explorer {
     /// Ctrl+double-click opens every selected file and opens every selected
     /// folder in its own window. Ctrl+single-click keeps toggling selection.
     fn open_tab_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.focus_existing_tab(&path, cx) {
+            return;
+        }
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
@@ -1725,6 +1735,24 @@ impl Explorer {
             reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
+    }
+    /// When enabled, opening a folder in a new tab goes to a tab that already
+    /// shows it instead of duplicating the folder.
+    fn focus_existing_tab(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        if !self.settings.focus_existing_tab {
+            return false;
+        }
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.history.current() == path)
+        else {
+            return false;
+        };
+        if index != self.active {
+            self.switch_tab(index, cx);
+        }
+        true
     }
     fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
         let disposition = rust_explorer::open_target::folder_disposition(
@@ -1752,6 +1780,9 @@ impl Explorer {
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
             OpenDisposition::Tab => {
+                if self.focus_existing_tab(&path, cx) {
+                    return;
+                }
                 self.tabs.push(tab);
                 self.switch_tab(self.tabs.len() - 1, cx);
             }
@@ -2169,12 +2200,14 @@ impl Explorer {
                 }
                 if result.as_ref().is_ok_and(|s| s == "rename") {
                     if let Some(path) = menu_paths.first() {
+                        this.pending_rename_path = Some(path.clone());
                         if let Some(index) = this.entries.iter().position(|e| &e.path == path) {
                             this.selected.clear();
                             this.selected.insert(index);
-                        } else if let Some(parent) = path.parent() {
+                        } else if path.parent().is_some_and(|parent| parent != path) {
+                            // Reveal the item where it lives, then rename it there.
                             this.pending_select = Some(path.clone());
-                            this.navigate(parent.to_path_buf(), cx);
+                            this.navigate(path.parent().unwrap_or(path).to_path_buf(), cx);
                             return;
                         }
                     }
@@ -2502,6 +2535,7 @@ impl Explorer {
         }
         let name = match &dialog {
             Dialog::RenameVolume { initial, .. } => initial.clone(),
+            Dialog::RenameComputer { initial } => initial.clone(),
             Dialog::Rename(path) => {
                 if rust_explorer::shell_folder::is_shell_path(path) {
                     self.selected
@@ -2528,8 +2562,13 @@ impl Explorer {
                 String::new()
             }
         };
-        if let Dialog::Rename(path) = &dialog {
-            self.inline_rename = Some(path.clone());
+        match &dialog {
+            Dialog::Rename(path) => self.inline_rename = Some(path.clone()),
+            Dialog::RenameVolume { path, .. } => self.inline_rename = Some(path.clone()),
+            Dialog::RenameComputer { .. } => {
+                self.inline_rename = Some(rust_explorer::volumes::computer())
+            }
+            _ => {}
         }
         self.dialog = Some(dialog);
         let directory = if let Some(Dialog::Rename(path)) = &self.dialog {
@@ -2544,7 +2583,9 @@ impl Explorer {
             v.compact = matches!(&self.dialog, Some(Dialog::Rename(_)));
             v.double_click_select_all = matches!(
                 &self.dialog,
-                Some(Dialog::Rename(_) | Dialog::RenameVolume { .. })
+                Some(
+                    Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+                )
             );
             v.set_value(name, cx);
             if matches!(&self.dialog, Some(Dialog::Rename(_))) {
@@ -2647,7 +2688,20 @@ impl Explorer {
             }
             Dialog::RenameVolume { path, initial } => {
                 if name != initial {
+                    // The volume list refreshes every few seconds, so the new label
+                    // appears once the elevated helper finishes.
                     self.run_shell(shell::Request::RenameVolume { path, label: name }, cx);
+                }
+            }
+            Dialog::RenameComputer { initial } => {
+                if name.trim() != initial {
+                    self.run_shell(
+                        shell::Request::RenameComputer {
+                            dark: self.theme.dark,
+                            name: Some(name),
+                        },
+                        cx,
+                    );
                 }
             }
             Dialog::NewFolder => {
@@ -2673,61 +2727,73 @@ impl Explorer {
             }
         }
     }
+    /// The shared dialog input, rendered in place of an item's own label while an
+    /// inline rename targets it.
+    fn inline_editor(&self) -> AnyElement {
+        div()
+            .flex_1()
+            .min_w_0()
+            .h(ui(22.))
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .child(self.dialog_input.clone())
+            .into_any_element()
+    }
     fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.len() == 1 {
-            if let Some(path) = self.paths().first().cloned() {
-                if volume_label::is_drive_root(&path) {
-                    if self.busy || self.dialog.is_some() || self.options.is_some() {
-                        return;
-                    }
-                    self.busy = true;
-                    let request = shell::Request::VolumeLabel { path: path.clone() };
-                    let task = cx.background_executor().spawn(async move {
-                        volumes::bounded::<volume_label::VolumeLabel>(
-                            "--shell",
-                            &serde_json::to_string(&request)?,
-                            Duration::from_secs(5),
-                        )
-                    });
-                    cx.spawn(async move |view, cx| {
-                        let result = task.await;
-                        let _ = view.update(cx, |v, cx| {
-                            v.busy = false;
-                            match result {
-                                Ok(label) if !label.read_only => {
-                                    let entity = cx.entity().downgrade();
-                                    let own = v.own_window;
-                                    cx.defer(move |cx| {
-                                        if let Some(own) = own {
-                                            let _ = own.update(cx, |_, w, cx| {
-                                                let _ = entity.update(cx, |v, cx| {
-                                                    if v.dialog.is_none() && v.options.is_none() {
-                                                        v.show_dialog(
-                                                            Dialog::RenameVolume {
-                                                                path,
-                                                                initial: label.label,
-                                                            },
-                                                            w,
-                                                            cx,
-                                                        );
-                                                    }
-                                                });
-                                            });
-                                        }
-                                    });
-                                }
-                                Ok(_) => v.error = Some("此驱动器是只读的".into()),
-                                Err(error) => v.error = Some(error.to_string()),
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                    cx.notify();
-                } else {
-                    self.show_dialog(Dialog::Rename(path), window, cx);
-                }
+        // A menu command names its target explicitly (the tree can rename a drive
+        // that is not part of the current listing).
+        if let Some(path) = self.pending_rename_path.take() {
+            self.begin_inline_rename(path, window, cx);
+            return;
+        }
+        // F2 in the navigation tree renames the focused drive or "This PC".
+        if self.keyboard_focus_region == 3 {
+            let target = self
+                .nav_rows()
+                .get(self.nav_keyboard_index)
+                .map(|row| row.path.clone())
+                .filter(|path| {
+                    rust_explorer::volumes::is_computer(path) || volume_label::is_drive_root(path)
+                });
+            if let Some(path) = target {
+                self.begin_inline_rename(path, window, cx);
+                return;
             }
+        }
+        if self.selected.len() != 1 {
+            return;
+        }
+        let Some(entry) = self
+            .selected
+            .first()
+            .and_then(|index| self.entries.get(*index))
+            .cloned()
+        else {
+            return;
+        };
+        self.begin_inline_rename(entry.path, window, cx);
+    }
+    /// Start an in-place rename: the editor appears at the item's own label (file
+    /// rows, drive tiles and navigation rows all render `inline_rename`).
+    fn begin_inline_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+        if self.busy || self.options.is_some() || self.dialog.is_some() {
+            return;
+        }
+        if rust_explorer::volumes::is_computer(&path) {
+            let initial = self.computer_name.clone();
+            self.show_dialog(Dialog::RenameComputer { initial }, window, cx);
+        } else if volume_label::is_drive_root(&path) {
+            let volume = self.volumes.iter().find(|volume| volume.path == path);
+            if volume.is_some_and(|volume| volume.read_only) {
+                self.error = Some("此驱动器是只读的".into());
+                cx.notify();
+                return;
+            }
+            let initial = volume
+                .map(|volume| volume.label.clone())
+                .unwrap_or_default();
+            self.show_dialog(Dialog::RenameVolume { path, initial }, window, cx);
+        } else {
+            self.show_dialog(Dialog::Rename(path), window, cx);
         }
     }
     fn delete_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4266,9 +4332,13 @@ impl Render for Explorer {
                 "new-folder" => !navigation::is_virtual(&self.dir()),
                 "paste" => self.can_paste(),
                 "rename" => {
+                    let drive = self
+                        .selected
+                        .first()
+                        .and_then(|index| self.entries.get(*index))
+                        .is_some_and(|entry| volume_label::is_drive_root(&entry.path));
                     self.selected.len() == 1
-                        && !self.is_home()
-                        && !navigation::is_shell_folder(&self.dir())
+                        && (drive || (!self.is_home() && !navigation::is_shell_folder(&self.dir())))
                 }
                 "share" => {
                     self.selected.len() == 1
@@ -4619,6 +4689,14 @@ impl Render for Explorer {
                                 if v.inline_rename.is_some() {
                                     return;
                                 }
+                            }
+                            // Double-clicking the empty area goes to the parent
+                            // folder. Item clicks stop propagation, so reaching this
+                            // handler means the pointer is not on an item.
+                            if e.click_count >= 2 {
+                                v.marquee = None;
+                                v.go_up(cx);
+                                return;
                             }
                             v.begin_marquee(e, w, cx);
                         }),
@@ -5148,6 +5226,9 @@ impl Render for Explorer {
                         false,
                     ),
                     Dialog::Rename(_) => ("重命名", "输入新的名称".to_owned(), false),
+                    Dialog::RenameComputer { .. } => {
+                        ("重命名此电脑", "输入新的名称".to_owned(), false)
+                    }
                     Dialog::RenameVolume { path, .. } => (
                         "重命名驱动器",
                         format!(

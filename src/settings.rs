@@ -52,6 +52,8 @@ pub struct Settings {
     pub shift_open_tab: bool,
     pub quick_access_new_tab: bool,
     pub new_tab_this_pc: bool,
+    /// Opening a folder in a new tab jumps to a tab that already shows it.
+    pub focus_existing_tab: bool,
     pub startup_page: String,
     pub separate_process: bool,
     pub full_path: bool,
@@ -96,6 +98,7 @@ impl Default for Settings {
             shift_open_tab: false,
             quick_access_new_tab: true,
             new_tab_this_pc: false,
+            focus_existing_tab: true,
             startup_page: "home".into(),
             separate_process: false,
             full_path: false,
@@ -317,6 +320,20 @@ mod volume_column_tests {
         let loaded: super::Settings = serde_json::from_str(&saved).unwrap();
         assert_eq!(loaded.recycle_columns, settings.recycle_columns);
         assert_eq!(loaded.columns, ordinary);
+    }
+    #[test]
+    fn reuse_existing_tab_is_on_by_default_and_persisted() {
+        // Older settings files predate the option: the default must turn it on.
+        let missing: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(missing.focus_existing_tab);
+        let saved = serde_json::to_string(&missing).unwrap();
+        let mut changed = missing.clone();
+        changed.focus_existing_tab = false;
+        let reloaded: super::Settings = serde_json::from_str(&saved).unwrap();
+        assert!(reloaded.focus_existing_tab);
+        let reloaded: super::Settings =
+            serde_json::from_str(&serde_json::to_string(&changed).unwrap()).unwrap();
+        assert!(!reloaded.focus_existing_tab);
     }
     #[test]
     fn contributor_and_local_shift_settings_share_one_state() {

@@ -24,7 +24,11 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 - Portable-device (MTP) photos and folders are cached like local items, so re-opening a window or refreshing the listing no longer fetches them from the device again.
 - The last portable-device enumeration is kept for a minute and a `--shell-devices` timeout keeps the previous list instead of dropping it, so a connected phone no longer disappears and reappears when another window opens.
 - Thumbnail cache is content-addressed: every PNG is stored once under the SHA-256 of its bytes (`<sha256>.png`), so identical thumbnails (stock folder art, the same picture copied around, generic file icons) share a single file. A small per-item index keeps the key-to-image mapping plus the link/photo decorations, the previous per-item PNG cache is removed on upgrade, and cache clearing covers both layouts.
+- The application icon no longer carries transparent margins: the master artwork is hand-cropped, and the export scales the whole square canvas straight to every size (no trimming, recentring, padding or 94% inset), so the artwork looks larger in the taskbar and window. The checked-in PNGs and `rust-explorer.ico` were regenerated and the GIMP source `resources/app-icon/rust-explorer-master.xcf` is now part of the repository.
 - Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings. The "清空缓存" entry in the `…` selection menu was removed; the Advanced tab is the only place to clear caches now.
+- Folder options also gained a **Details** tab that holds the tab and sorting preferences (Quick Access in a new tab, new tabs open This PC, Shift opens a new tab, folders first) plus a new option, on by default: opening a folder in a new tab switches to an existing tab on the same folder instead of duplicating it.
+- Double-clicking the empty list area goes up one level, like the ↑ button.
+- Renaming a drive or "This PC" edits the name in place (the drive card or its navigation row) instead of opening a separate dialog; Enter applies it. A drive label is written directly when allowed and otherwise through a `runas` restart of the application (UAC), while "This PC" is renamed in a helper process through the Shell namespace, so the navigation label refreshes immediately. Read-only drives are rejected up front.
 - The three "open at startup" choices on the General tab are laid out in one row instead of three.
 - Back/forward/up are greyed out when they cannot navigate. Going back, forward or up restores the scroll position and re-selects the item that was being worked on (↑ selects the folder just left), per tab, like Explorer; if that item is gone, only the scroll position is restored. Clicking an ancestor in the address bar selects the folder you came from.
 - The mouse side buttons (XBUTTON1/XBUTTON2) navigate back and forward, same as the toolbar buttons and Alt+←/→.
@@ -32,7 +36,7 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
-- Local checks: 122 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed. Preview workers are capped at four (each owns an isolated helper process).
+- Local checks: 124 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed. Preview workers are capped at four (each owns an isolated helper process).
 
 ## [0.7.6] - 2026-10-20
 

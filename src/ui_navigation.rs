@@ -7,9 +7,9 @@ pub(super) fn computer_name() -> String {
     computer_name_cache().read().unwrap().clone()
 }
 #[derive(Clone)]
-struct NavRow {
+pub(super) struct NavRow {
     label: String,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     depth: usize,
     expandable: bool,
     pinned: bool,
@@ -727,7 +727,7 @@ impl Explorer {
             });
         }
     }
-    fn nav_rows(&self) -> Vec<NavRow> {
+    pub(super) fn nav_rows(&self) -> Vec<NavRow> {
         let mut rows = vec![];
         let mut add = |label: &str, path: PathBuf, icon: &str| {
             rows.push(NavRow {
@@ -1039,15 +1039,23 @@ impl Explorer {
                                             t.text,
                                         )
                                     })
-                                    .child(
+                                    .child(if this.inline_rename.as_ref() == Some(&row.path) {
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                                            .child(this.dialog_input.clone())
+                                            .into_any_element()
+                                    } else {
                                         div()
                                             .flex_1()
                                             .min_w_0()
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
-                                            .child(row.label.clone()),
-                                    )
+                                            .child(row.label.clone())
+                                            .into_any_element()
+                                    })
                                     .when(pinned, |d| {
                                         d.child(
                                             div()
@@ -1132,6 +1140,7 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
+        let editing = self.inline_rename.as_ref() == Some(&volume.path);
         let mode = self.view;
         let grid = matches!(
             mode,
@@ -1378,7 +1387,11 @@ impl Explorer {
                 if key == "total" || key == "free" {
                     field = field.justify_end();
                 }
-                row = row.child(field.child(label(value).min_w_0()));
+                row = row.child(if key == "name" && editing {
+                    field.child(self.inline_editor())
+                } else {
+                    field.child(label(value).min_w_0())
+                });
             }
         } else {
             row = row.child(if volume.kind == 8 {
@@ -1394,7 +1407,13 @@ impl Explorer {
                 .when(tiles, |d| d.gap(ui(1.)).line_height(ui(16.)))
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
-                .child(if grid {
+                .child(if editing {
+                    div()
+                        .w_full()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(self.dialog_input.clone())
+                        .into_any_element()
+                } else if grid {
                     icon_label(
                         &volume.label,
                         (width - 16.).max(24.),

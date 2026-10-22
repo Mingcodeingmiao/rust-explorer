@@ -3759,8 +3759,15 @@ impl Explorer {
                             .enable(!navigation::is_app_virtual(&self.dir())),
                         "rename" => MenuItem::new("file-rename", "重命名").enable(
                             self.selected.len() == 1
-                                && !self.is_home()
-                                && !navigation::is_shell_folder(&self.dir()),
+                                && (self
+                                    .selected
+                                    .first()
+                                    .and_then(|index| self.entries.get(*index))
+                                    .is_some_and(|entry| {
+                                        rust_explorer::volume_label::is_drive_root(&entry.path)
+                                    })
+                                    || (!self.is_home()
+                                        && !navigation::is_shell_folder(&self.dir()))),
                         ),
                         "share" => MenuItem::new("file-share", "共享").enable(
                             self.selected.len() == 1
@@ -4643,6 +4650,10 @@ impl Explorer {
                 );
             }
             "computer-properties" => self.run_shell(shell::Request::SystemProperties, cx),
+            "computer-rename" => {
+                self.context_target = Some(volumes::computer());
+                self.begin_inline_rename(volumes::computer(), w, cx);
+            }
             "new-folder" => self.show_dialog(Dialog::NewFolder, w, cx),
             "new-shortcut" => self.show_dialog(Dialog::Shortcut, w, cx),
             "checkboxes" => self.settings.checkboxes = !self.settings.checkboxes,
@@ -4967,7 +4978,8 @@ impl Explorer {
             .gap_1()
             .border_b_1()
             .border_color(rgb(t.border));
-        for (index, label) in ["常规", "查看", "搜索", "高级"].iter().enumerate() {
+        for (index, label) in ["常规", "查看", "细节", "搜索", "高级"].iter().enumerate()
+        {
             tabs = tabs.child(
                 button(("option-tab", index), *label, t)
                     .when(self.options_page == index, |d| d.bg(rgb(t.selection)))
@@ -5026,16 +5038,6 @@ impl Explorer {
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
                 (
-                    "quick-access-new-tab",
-                    "默认在新标签页中打开快速访问的文件夹",
-                    settings.quick_access_new_tab,
-                ),
-                (
-                    "new-tab-this-pc",
-                    "新标签页打开此电脑（关闭时打开当前目录）",
-                    settings.new_tab_this_pc,
-                ),
-                (
                     "single",
                     "通过单击打开项目（指向时选定请使用复选框）",
                     settings.single_click,
@@ -5046,19 +5048,9 @@ impl Explorer {
                     settings.separate_process,
                 ),
                 (
-                    "shift-open-tab",
-                    "按住 Shift 打开文件夹时在新标签页中打开",
-                    settings.shift_open_tab,
-                ),
-                (
                     "remember",
                     "记住每个文件夹的查看方式",
                     settings.remember_views,
-                ),
-                (
-                    "folders-first",
-                    "始终将文件夹排列在文件前面",
-                    settings.folders_first,
                 ),
             ],
             1 => vec![
@@ -5096,6 +5088,33 @@ impl Explorer {
                     settings.preview,
                 ),
             ],
+            2 => vec![
+                (
+                    "quick-access-new-tab",
+                    "默认在新标签页中打开快速访问的文件夹",
+                    settings.quick_access_new_tab,
+                ),
+                (
+                    "new-tab-this-pc",
+                    "新标签页打开此电脑（关闭时打开当前目录）",
+                    settings.new_tab_this_pc,
+                ),
+                (
+                    "shift-open-tab",
+                    "按住 Shift 打开文件夹时在新标签页中打开",
+                    settings.shift_open_tab,
+                ),
+                (
+                    "folders-first",
+                    "始终将文件夹排列在文件前面",
+                    settings.folders_first,
+                ),
+                (
+                    "focus-existing-tab",
+                    "在新标签页中打开文件夹时，若已有同一目录的标签页则直接切换过去",
+                    settings.focus_existing_tab,
+                ),
+            ],
             _ => vec![],
         };
         if self.options_page == 0 {
@@ -5129,7 +5148,10 @@ impl Explorer {
             }
             body = body.child(themes);
         }
-        if self.options_page == 3 {
+        if self.options_page == 2 {
+            body = body.child(div().py_2().text_color(rgb(t.muted)).child("标签页与排序"));
+        }
+        if self.options_page == 4 {
             body = body
                 .child(
                     div()
@@ -5206,7 +5228,7 @@ impl Explorer {
                     })),
             );
         }
-        if self.options_page == 2 {
+        if self.options_page == 3 {
             body = body
                 .child(div().w_full().min_w_0().flex_shrink_0().py_2().whitespace_normal().child("搜索引擎：Everything（已安装时自动调用）"))
                 .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).line_height(ui(24.)).child("支持 Everything 查询语法。搜索框旁可切换当前文件夹 / 全盘范围。索引器不可用时，只筛选当前文件夹名称。目录内容、压缩包内容及系统索引服务集成未启用，避免后台扫描。"));
@@ -5341,6 +5363,7 @@ fn toggle_option(settings: &mut Settings, id: &str) {
         "separate" => settings.separate_process = !settings.separate_process,
         "remember" => settings.remember_views = !settings.remember_views,
         "folders-first" => settings.folders_first = !settings.folders_first,
+        "focus-existing-tab" => settings.focus_existing_tab = !settings.focus_existing_tab,
         "extensions" => settings.extensions = !settings.extensions,
         "hidden" => settings.hidden = !settings.hidden,
         "protected" => settings.protected = !settings.protected,
