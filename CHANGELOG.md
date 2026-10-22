@@ -15,6 +15,9 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 
 ### Changed
 
+- Preview generation is parallel: one worker per core beyond the two kept free (cores − 2), each with its own isolated helper process, and the queue is rebuilt from the visible rows on every scroll so on-screen thumbnails come first (work for rows that scrolled away is cancelled). Portable-device items are handed out one at a time because a phone rejects concurrent thumbnail sessions.
+- Portable-device (MTP) photos and folders are cached like local items, so re-opening a window or refreshing the listing no longer fetches them from the device again.
+- The last portable-device enumeration is kept for a minute and a `--shell-devices` timeout keeps the previous list instead of dropping it, so a connected phone no longer disappears and reappears when another window opens.
 - Thumbnail cache is content-addressed: every PNG is stored once under the SHA-256 of its bytes (`<sha256>.png`), so identical thumbnails (stock folder art, the same picture copied around, generic file icons) share a single file. A small per-item index keeps the key-to-image mapping plus the link/photo decorations, the previous per-item PNG cache is removed on upgrade, and cache clearing covers both layouts.
 - Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings. The "清空缓存" entry in the `…` selection menu was removed; the Advanced tab is the only place to clear caches now.
 - The three "open at startup" choices on the General tab are laid out in one row instead of three.
@@ -22,7 +25,7 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
-- Local checks: 109 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed.
+- Local checks: 111 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed. Preview workers run one per core beyond the two kept free, and each concurrent worker uses its own isolated helper process.
 
 ## [0.7.6] - 2026-10-20
 

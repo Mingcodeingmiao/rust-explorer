@@ -706,14 +706,19 @@ pub fn device_paths() -> Result<Vec<(String, PathBuf)>> {
 
 /// Shell parsing names used by portable devices are not filesystem paths.
 pub fn is_shell_path(path: &Path) -> bool {
+    is_namespace_item(path) || {
+        let value = path.to_string_lossy();
+        value.starts_with("\\\\?\\") || value.starts_with("\\\\.\\")
+    }
+}
+/// Shell namespace items that are cached like files but have no path to stat.
+pub fn is_namespace_item(path: &Path) -> bool {
     let value = path.to_string_lossy();
     value.starts_with("mtp:")
         || value.starts_with("recycle:")
         || value.starts_with("mtp-root:")
         || value.starts_with("::{")
         || value.starts_with("shell:")
-        || value.starts_with("\\\\?\\")
-        || value.starts_with("\\\\.\\")
 }
 pub fn is_recycle_bin_path(path: &Path) -> bool {
     let value = path.to_string_lossy();

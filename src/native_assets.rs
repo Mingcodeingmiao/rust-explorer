@@ -450,83 +450,91 @@ pub fn serve(json: &str) -> Result<()> {
         Request::Thumbnail { item } => {
             use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
             use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
-            anyhow::ensure!(
-                item.path.is_absolute() && !item.path.to_string_lossy().starts_with("\\\\"),
-                "不自动读取网络缩略图"
-            );
-            let root: Vec<u16> = item
-                .path
-                .ancestors()
-                .last()
-                .unwrap()
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            anyhow::ensure!(
-                unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 4,
-                "不自动读取网络驱动器缩略图"
-            );
-            // `item` is built from `symlink_metadata`; keep the identity check on the
-            // same source. Following a reparse point here reports the junction
-            // target's mtime, which never matches the link's own metadata.
-            let metadata = std::fs::symlink_metadata(&item.path)?;
-            anyhow::ensure!(
-                metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
-                "不自动下载脱机或云占位文件"
-            );
-            let directory = metadata.file_attributes() & 0x10 != 0;
-            anyhow::ensure!(
-                directory == item.directory
-                    && (if directory { 0 } else { metadata.len() }) == item.size
-                    && metadata.modified().ok() == item.modified,
-                "文件已变化"
-            );
-            let extension = item
-                .path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let shortcut = !directory && matches!(extension.as_str(), "lnk" | "url");
-            // A `.lnk` points at a file whose own artwork is what Explorer shows. A
-            // `.url` usually points at a web page: resolving it would leave us with a
-            // URL and no icon, so the Shell is asked for the shortcut file's own icon
-            // (the site favicon) instead.
-            let target = if extension == "lnk" {
-                crate::native_preview::shortcut_target(&item.path)?
-            } else {
-                item.path.clone()
-            };
-            let target_root: Vec<u16> = target
-                .ancestors()
-                .last()
-                .unwrap()
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            anyhow::ensure!(
-                unsafe { GetDriveTypeW(PCWSTR(target_root.as_ptr())) } != 4,
-                "Do not thumbnail mapped network shortcut targets"
-            );
-            let target_metadata = std::fs::metadata(&target)?;
-            anyhow::ensure!(
-                target_metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
-                "Do not hydrate offline shortcut targets"
-            );
-            let resolved = crate::thumbnails::Key {
-                path: target,
-                size: if target_metadata.is_dir() {
-                    0
+            // Portable-device and recycled items have no filesystem path to stat;
+            // their listing already carries the size and mtime used as the cache
+            // identity, so they are cached exactly like local files.
+            let namespace = crate::shell_folder::is_namespace_item(&item.path);
+            let mut shortcut = false;
+            let mut resolved = item.clone();
+            if !namespace {
+                anyhow::ensure!(
+                    item.path.is_absolute() && !item.path.to_string_lossy().starts_with("\\\\"),
+                    "不自动读取网络缩略图"
+                );
+                let root: Vec<u16> = item
+                    .path
+                    .ancestors()
+                    .last()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                anyhow::ensure!(
+                    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 4,
+                    "不自动读取网络驱动器缩略图"
+                );
+                // `item` is built from `symlink_metadata`; keep the identity check on the
+                // same source. Following a reparse point here reports the junction
+                // target's mtime, which never matches the link's own metadata.
+                let metadata = std::fs::symlink_metadata(&item.path)?;
+                anyhow::ensure!(
+                    metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
+                    "不自动下载脱机或云占位文件"
+                );
+                let directory = metadata.file_attributes() & 0x10 != 0;
+                anyhow::ensure!(
+                    directory == item.directory
+                        && (if directory { 0 } else { metadata.len() }) == item.size
+                        && metadata.modified().ok() == item.modified,
+                    "文件已变化"
+                );
+                let extension = item
+                    .path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                shortcut = !directory && matches!(extension.as_str(), "lnk" | "url");
+                // A `.lnk` points at a file whose own artwork is what Explorer shows. A
+                // `.url` usually points at a web page: resolving it would leave us with a
+                // URL and no icon, so the Shell is asked for the shortcut file's own icon
+                // (the site favicon) instead.
+                let target = if extension == "lnk" {
+                    crate::native_preview::shortcut_target(&item.path)?
                 } else {
-                    target_metadata.len()
-                },
-                directory: target_metadata.is_dir(),
-                modified: target_metadata.modified().ok(),
-                pixels: item.pixels,
-                shortcut_epoch: item.shortcut_epoch,
-            };
+                    item.path.clone()
+                };
+                let target_root: Vec<u16> = target
+                    .ancestors()
+                    .last()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                anyhow::ensure!(
+                    unsafe { GetDriveTypeW(PCWSTR(target_root.as_ptr())) } != 4,
+                    "Do not thumbnail mapped network shortcut targets"
+                );
+                let target_metadata = std::fs::metadata(&target)?;
+                anyhow::ensure!(
+                    target_metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
+                    "Do not hydrate offline shortcut targets"
+                );
+                resolved = crate::thumbnails::Key {
+                    path: target,
+                    size: if target_metadata.is_dir() {
+                        0
+                    } else {
+                        target_metadata.len()
+                    },
+                    directory: target_metadata.is_dir(),
+                    modified: target_metadata.modified().ok(),
+                    pixels: item.pixels,
+                    shortcut_epoch: item.shortcut_epoch,
+                };
+            }
             let index = thumbnail_index_path(&item)?;
             if let Some(asset) = load_thumbnail(&index) {
                 Response::Thumbnail(asset)
@@ -539,7 +547,15 @@ pub fn serve(json: &str) -> Result<()> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_ascii_lowercase();
-                let bitmap = if resolved.directory {
+                let bitmap = if namespace {
+                    // A portable device or recycled item: ask the Shell for the
+                    // item's own artwork through its ID list.
+                    crate::native_preview::shell_item_thumbnail(
+                        &item.path,
+                        pixels,
+                        resolved.directory,
+                    )?
+                } else if resolved.directory {
                     // Let Windows compose the folder's registered thumbnail. Do not
                     // enumerate children or extract a representative file ourselves.
                     crate::native_preview::folder_thumbnail(&resolved.path, pixels)?
@@ -588,7 +604,8 @@ pub fn serve(json: &str) -> Result<()> {
                 // arrow per tile, so baking a second one here produced two arrows.
                 let image = store_image(&image_root, bitmap.width, bitmap.height, &bitmap.rgba)?;
                 prune_thumbnail_cache(&image_root);
-                let (source_width, source_height) = if !resolved.directory
+                let (source_width, source_height) = if !namespace
+                    && !resolved.directory
                     && matches!(
                         extension.as_str(),
                         "jpg"
