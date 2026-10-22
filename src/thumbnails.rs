@@ -253,14 +253,10 @@ impl Loader {
                         }
                     };
                     // A slow codec/provider is killed with the helper, never joined by the UI.
-                    let image = session.get(&key, &cancel).ok();
-                    let presentation = image
+                    let asset = session.get(&key, &cancel).ok();
+                    let presentation = asset
                         .as_ref()
-                        .and_then(|path| {
-                            std::fs::read(path.with_extension("json"))
-                                .ok()
-                                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                        })
+                        .map(|asset| asset.presentation)
                         .unwrap_or_else(|| {
                             let extension = key
                                 .path
@@ -281,6 +277,7 @@ impl Loader {
                                 ),
                             }
                         });
+                    let image = asset.map(|asset| asset.image);
                     let mut state = worker.state.lock().unwrap();
                     state.active = None;
                     if !cancel.load(Ordering::Relaxed) {

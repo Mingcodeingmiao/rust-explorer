@@ -115,14 +115,28 @@ pub struct PreviewAsset {
     pub pages: u32,
     pub elapsed_ms: u128,
 }
+/// One cached thumbnail: the content-addressed PNG plus the decorations that
+/// belong to this *item*. A link badge or a photo resolution is not part of the
+/// image, so entries sharing one PNG still keep their own presentation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThumbnailAsset {
+    pub image: PathBuf,
+    pub presentation: crate::thumbnails::Presentation,
+}
 #[derive(Serialize, Deserialize)]
 enum Response {
     ShortcutTarget(PathBuf),
-    Thumbnail(PathBuf),
+    Thumbnail(ThumbnailAsset),
     ThumbnailError(String),
     Preview(PreviewAsset),
     Icons(Vec<Option<PathBuf>>),
 }
+
+/// Thumbnails are stored under the SHA-256 of their PNG bytes, so every item
+/// that renders the same image shares one file. The per-item index keeps the
+/// mapping and is what a cache hit reads.
+const THUMBNAIL_DIR: &str = "thumbnails-v7";
+const LEGACY_THUMBNAIL_DIR: &str = "thumbnails-v6";
 
 fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -147,7 +161,11 @@ fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
     );
     let mut removed = 0;
     let mut failed = 0;
-    for folder in [root.to_path_buf(), root.join("thumbnails-v6")] {
+    for folder in [
+        root.to_path_buf(),
+        root.join(THUMBNAIL_DIR),
+        root.join(LEGACY_THUMBNAIL_DIR),
+    ] {
         let Ok(metadata) = std::fs::symlink_metadata(&folder) else {
             continue;
         };
@@ -168,7 +186,7 @@ fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
             }
             if !matches!(
                 entry.path().extension().and_then(|s| s.to_str()),
-                Some("png" | "tmp")
+                Some("png" | "json" | "tmp")
             ) {
                 continue;
             }
@@ -188,34 +206,50 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
     Ok(root.join(format!("{:016x}.png", hash.finish())))
 }
 
-fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v6");
+fn thumbnail_root() -> PathBuf {
+    cache_root().join(THUMBNAIL_DIR)
+}
+
+/// Stable per-item name for the index, derived from the thumbnail key only.
+fn thumbnail_index_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
+    let root = thumbnail_root();
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
-    Ok(root.join(format!("{:016x}.png", hash.finish())))
+    Ok(root.join(format!("{:016x}.json", hash.finish())))
 }
 
-fn png_dimensions(path: &Path) -> Result<(u32, u32)> {
-    use std::io::Read;
-    let mut header = [0u8; 24];
-    std::fs::File::open(path)?.read_exact(&mut header)?;
-    anyhow::ensure!(
-        &header[..8] == b"\x89PNG\r\n\x1a\n" && &header[12..16] == b"IHDR",
-        "Invalid thumbnail PNG header"
-    );
-    let width = u32::from_be_bytes(header[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    anyhow::ensure!(
-        width > 0 && height > 0 && width <= 4096 && height <= 4096,
-        "Invalid thumbnail dimensions"
-    );
-    Ok((width, height))
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut text = String::with_capacity(64);
+    for byte in digest {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    text
+}
+
+fn load_thumbnail(index: &Path) -> Option<ThumbnailAsset> {
+    let bytes = std::fs::read(index).ok()?;
+    let asset: ThumbnailAsset = serde_json::from_slice(&bytes).ok()?;
+    asset.image.is_file().then_some(asset)
+}
+
+fn save_thumbnail_index(index: &Path, asset: &ThumbnailAsset) -> Result<()> {
+    let temporary = index.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(asset)?)?;
+    if std::fs::rename(&temporary, index).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    Ok(())
 }
 
 fn prune_thumbnail_cache(root: &Path) {
-    // Only helpers touch disk. At most once per five minutes, cap this cache
-    // at 4096 PNGs / 128 MiB. Killing a slow helper also bounds this maintenance.
+    // Only helpers touch disk. At most once per five minutes, cap the shared
+    // images at 4096 PNGs / 128 MiB and the per-item indexes at 8192. Dropping an
+    // image only costs a regeneration: the same bytes map back to the same name.
     let marker = root.join("last-maintenance");
     if std::fs::metadata(&marker)
         .and_then(|m| m.modified())
@@ -229,30 +263,65 @@ fn prune_thumbnail_cache(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let mut files: Vec<_> = entries
-        .flatten()
-        .take(8192)
-        .filter_map(|entry| {
-            if entry.path().extension().is_none_or(|e| e != "png") {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            Some((metadata.modified().ok(), metadata.len(), entry.path()))
-        })
-        .collect();
-    files.sort_unstable_by_key(|(modified, _, _)| *modified);
-    let mut bytes: u64 = files.iter().map(|(_, size, _)| *size).sum();
-    let mut count = files.len();
-    for (_, size, path) in files {
+    let mut images = Vec::new();
+    let mut indexes = Vec::new();
+    for entry in entries.flatten().take(16384) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let record = (metadata.modified().ok(), metadata.len(), entry.path());
+        match entry.path().extension().and_then(|e| e.to_str()) {
+            Some("png") => images.push(record),
+            Some("json") => indexes.push(record),
+            _ => {}
+        }
+    }
+    images.sort_unstable_by_key(|(modified, _, _)| *modified);
+    let mut bytes: u64 = images.iter().map(|(_, size, _)| *size).sum();
+    let mut count = images.len();
+    for (_, size, path) in images {
         if bytes <= 128 * 1024 * 1024 && count <= 4096 {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
-            let _ = std::fs::remove_file(path.with_extension("json"));
             bytes = bytes.saturating_sub(size);
             count -= 1;
         }
     }
+    if indexes.len() > 8192 {
+        indexes.sort_unstable_by_key(|(modified, _, _)| *modified);
+        for (_, _, path) in indexes.drain(..indexes.len() - 8192) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    remove_legacy_thumbnail_cache(root);
+}
+
+/// The previous cache stored one PNG per item. Drop it once the new directory
+/// exists so an upgrade does not keep the duplicates around.
+fn remove_legacy_thumbnail_cache(root: &Path) {
+    let Some(parent) = root.parent() else {
+        return;
+    };
+    let legacy = parent.join(LEGACY_THUMBNAIL_DIR);
+    let Ok(entries) = std::fs::read_dir(&legacy) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("png" | "json" | "tmp")
+            )
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(&legacy);
 }
 
 fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
@@ -282,6 +351,37 @@ fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
                     }
                 }
             }
+        }
+    }
+    Ok(output)
+}
+/// Encode `rgba` and store it under the SHA-256 of the encoded PNG bytes.
+/// Identical thumbnails (stock folder art, the same document copied around, a
+/// generic file icon) therefore occupy one file.
+fn store_image(dir: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<PathBuf> {
+    anyhow::ensure!(
+        width > 0 && height > 0 && width <= 4096 && height <= 4096,
+        "原生图像尺寸无效"
+    );
+    let temporary = dir.join(format!("thumb-{}.tmp", std::process::id()));
+    image::save_buffer_with_format(
+        &temporary,
+        rgba,
+        width,
+        height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )?;
+    let bytes = std::fs::read(&temporary)?;
+    let output = dir.join(format!("{}.png", sha256_hex(&bytes)));
+    if output.is_file() {
+        let _ = std::fs::remove_file(&temporary);
+        return Ok(output);
+    }
+    if let Err(error) = std::fs::rename(&temporary, &output) {
+        let _ = std::fs::remove_file(&temporary);
+        if !output.is_file() {
+            return Err(error.into());
         }
     }
     Ok(output)
@@ -427,16 +527,11 @@ pub fn serve(json: &str) -> Result<()> {
                 pixels: item.pixels,
                 shortcut_epoch: item.shortcut_epoch,
             };
-            let output = if shortcut {
-                let root = cache_root().join("thumbnails-v6");
-                std::fs::create_dir_all(&root)?;
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                (&item, &resolved).hash(&mut hash);
-                root.join(format!("{:016x}.png", hash.finish()))
+            let index = thumbnail_index_path(&item)?;
+            if let Some(asset) = load_thumbnail(&index) {
+                Response::Thumbnail(asset)
             } else {
-                thumbnail_cache_path(&item)?
-            };
-            if !output.is_file() {
+                let image_root = thumbnail_root();
                 let pixels = item.pixels.clamp(32, 256);
                 let extension = resolved
                     .path
@@ -491,55 +586,46 @@ pub fn serve(json: &str) -> Result<()> {
                 };
                 // No badge is painted into the bitmap: the view draws one link
                 // arrow per tile, so baking a second one here produced two arrows.
-                save_png(&output, bitmap.width, bitmap.height, &bitmap.rgba)?;
-                if let Some(root) = output.parent() {
-                    prune_thumbnail_cache(root);
-                }
-            }
-            let extension = resolved
-                .path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let (width, height) = png_dimensions(&output)?;
-            let (source_width, source_height) = if !resolved.directory
-                && matches!(
-                    extension.as_str(),
-                    "jpg"
-                        | "jpeg"
-                        | "png"
-                        | "gif"
-                        | "bmp"
-                        | "tif"
-                        | "tiff"
-                        | "webp"
-                        | "heic"
-                        | "heif"
-                        | "avif"
-                ) {
-                crate::native_preview::photo_dimensions(&resolved.path).unwrap_or_default()
-            } else {
-                (0, 0)
-            };
-            let presentation = crate::thumbnails::Presentation {
-                directory: resolved.directory,
-                shortcut,
-                source_width,
-                source_height,
-                width,
-                height,
-                video: !resolved.directory
+                let image = store_image(&image_root, bitmap.width, bitmap.height, &bitmap.rgba)?;
+                prune_thumbnail_cache(&image_root);
+                let (source_width, source_height) = if !resolved.directory
                     && matches!(
                         extension.as_str(),
-                        "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
-                    ),
-            };
-            std::fs::write(
-                output.with_extension("json"),
-                serde_json::to_vec(&presentation)?,
-            )?;
-            Response::Thumbnail(output)
+                        "jpg"
+                            | "jpeg"
+                            | "png"
+                            | "gif"
+                            | "bmp"
+                            | "tif"
+                            | "tiff"
+                            | "webp"
+                            | "heic"
+                            | "heif"
+                            | "avif"
+                    ) {
+                    crate::native_preview::photo_dimensions(&resolved.path).unwrap_or_default()
+                } else {
+                    (0, 0)
+                };
+                let asset = ThumbnailAsset {
+                    image,
+                    presentation: crate::thumbnails::Presentation {
+                        directory: resolved.directory,
+                        shortcut,
+                        source_width,
+                        source_height,
+                        width: bitmap.width,
+                        height: bitmap.height,
+                        video: !resolved.directory
+                            && matches!(
+                                extension.as_str(),
+                                "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
+                            ),
+                    },
+                };
+                save_thumbnail_index(&index, &asset)?;
+                Response::Thumbnail(asset)
+            }
         }
         Request::Preview {
             path,
@@ -735,20 +821,22 @@ pub fn icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
     }
 }
 
-pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Result<PathBuf> {
-    let output = thumbnail_cache_path(key)?;
+pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Result<ThumbnailAsset> {
+    let index = thumbnail_index_path(key)?;
     if cancel.load(Ordering::Relaxed) {
         bail!("缩略图已取消");
     }
-    if key.shortcut_epoch == 0 && output.is_file() {
-        return Ok(output);
+    if key.shortcut_epoch == 0
+        && let Some(asset) = load_thumbnail(&index)
+    {
+        return Ok(asset);
     }
     match call(
         Request::Thumbnail { item: key.clone() },
         Duration::from_millis(800),
         cancel,
     )? {
-        Response::Thumbnail(path) => Ok(path),
+        Response::Thumbnail(asset) => Ok(asset),
         _ => bail!("无效缩略图响应"),
     }
 }
@@ -797,17 +885,19 @@ impl ThumbnailSession {
         &mut self,
         key: &crate::thumbnails::Key,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<PathBuf> {
+    ) -> Result<ThumbnailAsset> {
         use std::{
             io::{BufRead, Write},
             os::windows::process::CommandExt,
         };
-        let output = thumbnail_cache_path(key)?;
+        let index = thumbnail_index_path(key)?;
         if cancel.load(Ordering::Relaxed) {
             bail!("缩略图已取消");
         }
-        if key.shortcut_epoch == 0 && output.is_file() {
-            return Ok(output);
+        if key.shortcut_epoch == 0
+            && let Some(asset) = load_thumbnail(&index)
+        {
+            return Ok(asset);
         }
         if self.process.is_none() {
             let mut child = Command::new(std::env::current_exe()?)
@@ -844,7 +934,7 @@ impl ThumbnailSession {
                 replies,
             });
         }
-        let result = (|| -> Result<PathBuf> {
+        let result = (|| -> Result<ThumbnailAsset> {
             let process = self.process.as_mut().unwrap();
             let start = Instant::now();
             let mut bytes = serde_json::to_vec(&Request::Thumbnail { item: key.clone() })?;
@@ -859,7 +949,7 @@ impl ThumbnailSession {
                 }
                 match process.replies.recv_timeout(Duration::from_millis(10)) {
                     Ok(line) => match serde_json::from_str::<Response>(&line) {
-                        Ok(Response::Thumbnail(path)) => return Ok(path),
+                        Ok(Response::Thumbnail(asset)) => return Ok(asset),
                         Ok(Response::ThumbnailError(_)) => {
                             return Err(anyhow::anyhow!("文件不支持缩略图"));
                         }
@@ -891,35 +981,101 @@ impl Drop for ThumbnailSession {
 
 #[cfg(test)]
 mod cache_tests {
-    #[test]
-    fn clearing_generated_cache_preserves_other_files_and_directories() {
+    use super::*;
+    fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "re-cache-test-{}-{}",
+            "re-cache-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(root.join("thumbnails-v6")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[test]
+    fn cache_images_are_named_by_the_sha256_of_their_bytes() {
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let root = temp_root("sha");
+        let rgba = vec![128u8; 4 * 4 * 4];
+        let image = super::store_image(&root, 4, 4, &rgba).unwrap();
+        let bytes = std::fs::read(&image).unwrap();
+        let name = image.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("{}.png", super::sha256_hex(&bytes)));
+        assert_eq!(name.len(), 64 + 4);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn identical_thumbnails_share_one_file_and_the_index_keeps_their_presentation() {
+        let root = temp_root("dedupe");
+        let rgba = vec![90u8; 4 * 4 * 4];
+        let first = super::store_image(&root, 4, 4, &rgba).unwrap();
+        let second = super::store_image(&root, 4, 4, &rgba).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_dir(&root).unwrap().flatten().count(), 1);
+        // One different pixel is a different image and gets its own file.
+        let mut other = rgba.clone();
+        other[0] = 255;
+        let third = super::store_image(&root, 4, 4, &other).unwrap();
+        assert_ne!(first, third);
+        assert_eq!(std::fs::read_dir(&root).unwrap().flatten().count(), 2);
+        let index = root.join("0000000000000001.json");
+        let asset = ThumbnailAsset {
+            image: first.clone(),
+            presentation: crate::thumbnails::Presentation {
+                directory: true,
+                width: 4,
+                height: 4,
+                ..Default::default()
+            },
+        };
+        super::save_thumbnail_index(&index, &asset).unwrap();
+        let loaded = super::load_thumbnail(&index).unwrap();
+        assert_eq!(loaded.image, first);
+        assert!(loaded.presentation.directory);
+        assert!(!loaded.presentation.shortcut);
+        assert_eq!(loaded.presentation.width, 4);
+        // A pruned image turns the entry into a miss instead of a broken path.
+        std::fs::remove_file(&first).unwrap();
+        assert!(super::load_thumbnail(&index).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn clearing_generated_cache_preserves_other_files_and_directories() {
+        let root = temp_root("clear");
+        std::fs::create_dir_all(root.join(super::THUMBNAIL_DIR)).unwrap();
+        std::fs::create_dir_all(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
         std::fs::create_dir(root.join("other")).unwrap();
         for file in [
             "icon.png",
             "keep.txt",
-            "thumbnails-v6/thumb.png",
-            "thumbnails-v6/keep.txt",
+            "thumbnails-v7/thumb.png",
+            "thumbnails-v7/index.json",
+            "thumbnails-v7/keep.txt",
+            "thumbnails-v6/old.png",
             "other/untouched.png",
         ] {
             std::fs::write(root.join(file), b"fixture").unwrap();
         }
-        assert_eq!(super::clear_cache_at(&root).unwrap(), (2, 0));
-        assert!(!root.join("icon.png").exists());
-        assert!(!root.join("thumbnails-v6/thumb.png").exists());
-        for file in ["keep.txt", "thumbnails-v6/keep.txt", "other/untouched.png"] {
-            assert!(root.join(file).exists());
-            std::fs::remove_file(root.join(file)).unwrap();
+        assert_eq!(super::clear_cache_at(&root).unwrap(), (4, 0));
+        for gone in [
+            "icon.png",
+            "thumbnails-v7/thumb.png",
+            "thumbnails-v7/index.json",
+            "thumbnails-v6/old.png",
+        ] {
+            assert!(!root.join(gone).exists(), "{gone} should be cleared");
         }
-        std::fs::remove_dir(root.join("thumbnails-v6")).unwrap();
+        for kept in ["keep.txt", "thumbnails-v7/keep.txt", "other/untouched.png"] {
+            assert!(root.join(kept).exists(), "{kept} should be kept");
+            std::fs::remove_file(root.join(kept)).unwrap();
+        }
+        std::fs::remove_dir(root.join(super::THUMBNAIL_DIR)).unwrap();
+        std::fs::remove_dir(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
         std::fs::remove_dir(root.join("other")).unwrap();
         std::fs::remove_dir(&root).unwrap();
         assert_eq!(super::clear_cache_at(&root).unwrap(), (0, 0));

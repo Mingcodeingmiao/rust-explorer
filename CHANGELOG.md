@@ -15,13 +15,14 @@ See [complete release notes](docs/v0.7.7.md) and the [roadmap](ROADMAP.md). Coll
 
 ### Changed
 
-- Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings.
+- Thumbnail cache is content-addressed: every PNG is stored once under the SHA-256 of its bytes (`<sha256>.png`), so identical thumbnails (stock folder art, the same picture copied around, generic file icons) share a single file. A small per-item index keeps the key-to-image mapping plus the link/photo decorations, the previous per-item PNG cache is removed on upgrade, and cache clearing covers both layouts.
+- Folder options gained an **Advanced** tab that collects cache clearing, the experimental default-folder association, the high-performance toggle and the UI resource source, so the General and View tabs only keep everyday settings. The "清空缓存" entry in the `…` selection menu was removed; the Advanced tab is the only place to clear caches now.
 - The three "open at startup" choices on the General tab are laid out in one row instead of three.
 
 ### Maintenance
 
 - A warning comment, a `debug_assert` in `execute_controlled`, the regression test `context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper` and a `CONTRIBUTING.md` rule keep menu requests out of the one-shot helper.
-- Local checks: 107 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed.
+- Local checks: 109 core tests and one shortcut integration test passed, one interactive test skipped; all-target check passed.
 
 ## [0.7.6] - 2026-10-20
 

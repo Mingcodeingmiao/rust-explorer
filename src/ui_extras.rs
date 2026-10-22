@@ -3802,7 +3802,6 @@ impl Explorer {
                     MenuItem::new("select-all", "全部选择"),
                     MenuItem::new("select-none", "全部取消").enable(any),
                     MenuItem::new("select-invert", "反向选择"),
-                    MenuItem::new("clear-cache", "清空缓存"),
                     MenuItem::separator(),
                     MenuItem::new("properties", "属性"),
                     MenuItem::new("options", "选项"),
@@ -4146,10 +4145,6 @@ impl Explorer {
         cx.notify();
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
-        if id == "clear-cache" {
-            self.clear_caches(cx);
-            return;
-        }
         if let Some((force, number)) = id
             .strip_prefix("operation-stop:")
             .map(|id| (false, id))

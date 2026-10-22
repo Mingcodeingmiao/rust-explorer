@@ -22,6 +22,7 @@ encoding_rs = "0.8"
 pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
 libloading = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
 gpui = { version = "=0.2.2", default-features = false, optional = true }
 unicode-segmentation = { version = "1", optional = true }
 notify = { version = "8", optional = true }
