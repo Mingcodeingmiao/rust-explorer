@@ -93,7 +93,9 @@ impl Icons {
             .spawn(move || {
                 while let Ok(first) = urgent.recv() {
                     let mut batch = vec![first];
-                    batch.extend(urgent.try_iter().take(7));
+                    // Larger batches mean fewer helper starts while scrolling a big
+                    // folder; the helper deadline scales with the batch.
+                    batch.extend(urgent.try_iter().take(31));
                     let paths = native_assets::icons(batch.clone());
                     for (key, path) in batch.into_iter().zip(paths) {
                         if urgent_results.send((key, path)).is_err() {
@@ -108,8 +110,9 @@ impl Icons {
             .spawn(move || {
                 while let Ok(first) = rx.recv() {
                     let mut batch = vec![first];
-                    // Keep cold-start Shell work inside the helper deadline.
-                    batch.extend(rx.try_iter().take(7));
+                    // Larger batches keep cold-start Shell work in one helper call
+                    // instead of one process start per eight icons.
+                    batch.extend(rx.try_iter().take(31));
                     let paths = native_assets::icons(batch.clone());
                     for (key, path) in batch.into_iter().zip(paths) {
                         if results_tx.send((key, path)).is_err() {

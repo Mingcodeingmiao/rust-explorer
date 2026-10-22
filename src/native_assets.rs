@@ -37,12 +37,15 @@ impl IconRequest {
         // handlers. Portable-device child folders/files use generic stock icons
         // so a phone folder does not issue one slow Shell icon request each.
         let shell_root = path.to_string_lossy().starts_with("mtp-root:");
-        // This constructor runs during GUI layout. Even probing desktop.ini can
-        // block on disconnected drives, so folder customization is resolved only
-        // by the bounded provider helper, using the actual path as its key.
+        let drive_root = directory && path.has_root() && path.parent().is_none();
+        // Folders whose desktop.ini declares its own artwork (`C:\Windows\Offline
+        // Web Pages` and other shell folders) need their own path so the helper can
+        // resolve it. Ordinary folders are normalized to one shared entry there;
+        // this constructor runs during layout and must not touch the disk.
         let custom_folder = directory && path.is_absolute();
         let per_item = shell_root
             || custom_folder
+            || drive_root
             || (path.is_absolute()
                 && matches!(
                     path.extension()
@@ -52,7 +55,7 @@ impl IconRequest {
                         .as_str(),
                     "exe" | "lnk" | "url" | "ico" | "cur"
                 ));
-        let key = if per_item || (directory && path.has_root() && path.parent().is_none()) {
+        let key = if per_item {
             path.to_path_buf()
         } else if directory {
             PathBuf::from("folder")
@@ -70,10 +73,7 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            epoch: if shell_root
-                || custom_folder
-                || (directory && path.has_root() && path.parent().is_none())
-            {
+            epoch: if shell_root || custom_folder || drive_root {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -137,6 +137,7 @@ enum Response {
 /// mapping and is what a cache hit reads.
 const THUMBNAIL_DIR: &str = "thumbnails-v7";
 const LEGACY_THUMBNAIL_DIR: &str = "thumbnails-v6";
+const ICON_DIR: &str = "icons-v2";
 
 fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -165,6 +166,7 @@ fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
         root.to_path_buf(),
         root.join(THUMBNAIL_DIR),
         root.join(LEGACY_THUMBNAIL_DIR),
+        root.join(ICON_DIR),
     ] {
         let Ok(metadata) = std::fs::symlink_metadata(&folder) else {
             continue;
@@ -203,6 +205,21 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
     key.hash(&mut hash);
+    Ok(root.join(format!("{:016x}.png", hash.finish())))
+}
+
+/// Icons live in their own revision directory: the resolution rules changed (real
+/// per-file icons for `.url`/`.lnk`/`.ico`), so older cached bitmaps must not be
+/// reused after an upgrade.
+fn icon_root() -> PathBuf {
+    cache_root().join(ICON_DIR)
+}
+
+fn icon_hash_path(item: &IconRequest) -> Result<PathBuf> {
+    let root = icon_root();
+    std::fs::create_dir_all(&root)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    item.hash(&mut hash);
     Ok(root.join(format!("{:016x}.png", hash.finish())))
 }
 
@@ -324,13 +341,34 @@ fn remove_legacy_thumbnail_cache(root: &Path) {
     let _ = std::fs::remove_dir(&legacy);
 }
 
+/// Folders with their own `desktop.ini` artwork need a per-path icon (7-Zip shows
+/// those too, e.g. `C:\Windows\Offline Web Pages`); every other folder shares the
+/// one attribute-based folder icon instead of caching a PNG per folder.
+///
+/// Drive roots (and UNC share roots) are never shared: their icon carries the
+/// drive type, BitLocker/optical/network overlays and the drive letter label.
+fn share_plain_folder_icon(mut item: IconRequest) -> IconRequest {
+    let root = item.path.has_root() && item.path.parent().is_none();
+    if item.name == "file"
+        && item.directory
+        && item.path.is_absolute()
+        && !root
+        && !crate::shell_folder::is_shell_path(&item.path)
+        && !crate::system_icons::folder_has_custom_icon(&item.path)
+    {
+        item.path = PathBuf::from("folder");
+        item.epoch = 0;
+    }
+    item
+}
+
 fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
     if item.epoch == 0 {
-        return cache_path(item);
+        return icon_hash_path(item);
     }
     let mut stable = item.clone();
     stable.epoch = 0;
-    let base = cache_path(&stable)?;
+    let base = icon_hash_path(&stable)?;
     let prefix = format!(
         "{}-drive-",
         base.file_stem().unwrap_or_default().to_string_lossy()
@@ -692,6 +730,7 @@ pub fn serve(json: &str) -> Result<()> {
         Request::Icons { items } => {
             let mut paths = Vec::with_capacity(items.len());
             for item in items {
+                let item = share_plain_folder_icon(item);
                 let result = (|| -> Result<PathBuf> {
                     let output = icon_cache_path(&item)?;
                     if !output.is_file() {
@@ -828,11 +867,10 @@ pub fn icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
     }
     let count = items.len();
     let cancel = Arc::new(AtomicBool::new(false));
-    match call(
-        Request::Icons { items },
-        Duration::from_millis(1800),
-        &cancel,
-    ) {
+    // Bigger batches mean fewer helper starts while scrolling a large folder; the
+    // deadline grows with the batch so a slow Shell provider is not cut off.
+    let deadline = Duration::from_millis(1200 + 60 * count.min(64) as u64);
+    match call(Request::Icons { items }, deadline, &cancel) {
         Ok(Response::Icons(paths)) => paths,
         _ => vec![None; count],
     }
@@ -843,18 +881,31 @@ pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Resu
     if cancel.load(Ordering::Relaxed) {
         bail!("缩略图已取消");
     }
-    if key.shortcut_epoch == 0
-        && let Some(asset) = load_thumbnail(&index)
-    {
+    // The index name already contains the whole key (including the shortcut
+    // epoch), so reading it cannot return artwork for a different key.
+    if let Some(asset) = load_thumbnail(&index) {
         return Ok(asset);
     }
     match call(
         Request::Thumbnail { item: key.clone() },
-        Duration::from_millis(800),
+        preview_deadline(key),
         cancel,
     )? {
         Response::Thumbnail(asset) => Ok(asset),
         _ => bail!("无效缩略图响应"),
+    }
+}
+
+/// How long one preview may take. Folder composition and portable devices are much
+/// slower than a file thumbnail, and killing the helper mid-work costs another
+/// process start plus a repeat of that work.
+pub(crate) fn preview_deadline(key: &crate::thumbnails::Key) -> Duration {
+    if crate::shell_folder::is_namespace_item(&key.path) {
+        Duration::from_millis(4000)
+    } else if key.directory {
+        Duration::from_millis(3000)
+    } else {
+        Duration::from_millis(800)
     }
 }
 
@@ -911,9 +962,9 @@ impl ThumbnailSession {
         if cancel.load(Ordering::Relaxed) {
             bail!("缩略图已取消");
         }
-        if key.shortcut_epoch == 0
-            && let Some(asset) = load_thumbnail(&index)
-        {
+        // The index name contains the whole key (epoch included), so a hit always
+        // belongs to this key: no helper round trip for cached folders.
+        if let Some(asset) = load_thumbnail(&index) {
             return Ok(asset);
         }
         if self.process.is_none() {
@@ -954,6 +1005,7 @@ impl ThumbnailSession {
         let result = (|| -> Result<ThumbnailAsset> {
             let process = self.process.as_mut().unwrap();
             let start = Instant::now();
+            let deadline = preview_deadline(key);
             let mut bytes = serde_json::to_vec(&Request::Thumbnail { item: key.clone() })?;
             bytes.push(b'\n');
             process
@@ -961,7 +1013,7 @@ impl ThumbnailSession {
                 .try_send(bytes)
                 .context("缩略图服务请求未接收")?;
             loop {
-                if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_millis(800) {
+                if cancel.load(Ordering::Relaxed) || start.elapsed() > deadline {
                     bail!("缩略图取消或超时");
                 }
                 match process.replies.recv_timeout(Duration::from_millis(10)) {
@@ -1010,6 +1062,55 @@ mod cache_tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         root
+    }
+    #[test]
+    fn plain_folders_share_an_icon_while_desktop_ini_folders_keep_their_own() {
+        let a = IconRequest::file(std::path::Path::new("C:\\Windows\\System32"), true, 96);
+        let b = IconRequest::file(std::path::Path::new("D:\\Games"), true, 96);
+        // The request keeps its path (the helper checks desktop.ini), but an
+        // ordinary folder is cached under the one shared folder entry.
+        assert_ne!(a.path, b.path);
+        assert_eq!(
+            share_plain_folder_icon(a.clone()).path,
+            PathBuf::from("folder")
+        );
+        assert_eq!(
+            share_plain_folder_icon(b.clone()).path,
+            PathBuf::from("folder")
+        );
+        assert_eq!(share_plain_folder_icon(a).epoch, 0);
+
+        // A folder with its own artwork keeps its path so the Shell can resolve it.
+        let custom = temp_root("custom-folder");
+        std::fs::write(
+            custom.join("desktop.ini"),
+            b"[.ShellClassInfo]\r\nIconResource=C:\\x.ico,0\r\n",
+        )
+        .unwrap();
+        let request = IconRequest::file(&custom, true, 96);
+        assert_eq!(share_plain_folder_icon(request.clone()).path, request.path);
+        std::fs::remove_dir_all(&custom).unwrap();
+
+        // Executables keep a per-path icon and are never shared or normalized.
+        let exe = IconRequest::file(std::path::Path::new("C:\\a\\app.exe"), false, 96);
+        let other = IconRequest::file(std::path::Path::new("C:\\b\\other.exe"), false, 96);
+        assert_ne!(exe.path, other.path);
+        assert_eq!(share_plain_folder_icon(exe.clone()).path, exe.path);
+
+        let drive = IconRequest::file(std::path::Path::new("C:\\"), true, 96);
+        assert_eq!(drive.path, PathBuf::from("C:\\"));
+        assert!(drive.epoch > 0);
+        // Drive roots keep their own icon: it carries the drive type and overlays,
+        // so it must never be replaced by the generic folder icon.
+        assert_eq!(share_plain_folder_icon(drive.clone()).path, drive.path);
+        assert!(share_plain_folder_icon(drive).epoch > 0);
+        let unc = IconRequest::file(std::path::Path::new("\\\\server\\share"), true, 96);
+        assert_eq!(share_plain_folder_icon(unc.clone()).path, unc.path);
+
+        let text = IconRequest::file(std::path::Path::new("C:\\a\\x.txt"), false, 96);
+        let upper = IconRequest::file(std::path::Path::new("D:\\b\\y.TXT"), false, 96);
+        assert_eq!(text.path, PathBuf::from("file.txt"));
+        assert_eq!(text.path, upper.path);
     }
     #[test]
     fn cache_images_are_named_by_the_sha256_of_their_bytes() {
@@ -1066,6 +1167,7 @@ mod cache_tests {
         let root = temp_root("clear");
         std::fs::create_dir_all(root.join(super::THUMBNAIL_DIR)).unwrap();
         std::fs::create_dir_all(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
+        std::fs::create_dir_all(root.join(super::ICON_DIR)).unwrap();
         std::fs::create_dir(root.join("other")).unwrap();
         for file in [
             "icon.png",
@@ -1074,16 +1176,18 @@ mod cache_tests {
             "thumbnails-v7/index.json",
             "thumbnails-v7/keep.txt",
             "thumbnails-v6/old.png",
+            "icons-v2/glyph.png",
             "other/untouched.png",
         ] {
             std::fs::write(root.join(file), b"fixture").unwrap();
         }
-        assert_eq!(super::clear_cache_at(&root).unwrap(), (4, 0));
+        assert_eq!(super::clear_cache_at(&root).unwrap(), (5, 0));
         for gone in [
             "icon.png",
             "thumbnails-v7/thumb.png",
             "thumbnails-v7/index.json",
             "thumbnails-v6/old.png",
+            "icons-v2/glyph.png",
         ] {
             assert!(!root.join(gone).exists(), "{gone} should be cleared");
         }
@@ -1093,6 +1197,7 @@ mod cache_tests {
         }
         std::fs::remove_dir(root.join(super::THUMBNAIL_DIR)).unwrap();
         std::fs::remove_dir(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
+        std::fs::remove_dir(root.join(super::ICON_DIR)).unwrap();
         std::fs::remove_dir(root.join("other")).unwrap();
         std::fs::remove_dir(&root).unwrap();
         assert_eq!(super::clear_cache_at(&root).unwrap(), (0, 0));

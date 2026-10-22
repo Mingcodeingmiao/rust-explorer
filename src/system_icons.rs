@@ -78,6 +78,22 @@ fn pixels(value: u32) -> Result<u32> {
     Ok(value)
 }
 
+/// STA apartment for Shell icon handlers that are COM servers. Returns `None`
+/// when the thread already lives in an apartment (MTA or STA), so the caller
+/// never changes an existing COM configuration.
+fn sta_apartment() -> Option<Apartment> {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .is_ok()
+        .then_some(Apartment)
+}
+struct Apartment;
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
+}
+
 struct Icon(HICON);
 impl Drop for Icon {
     fn drop(&mut self) {
@@ -125,6 +141,11 @@ pub fn folder_has_custom_icon(path: &Path) -> bool {
 /// Obtain Explorer's associated file-type icon without reading normal files.
 /// Executables, shortcuts and .ico files retain their per-item Shell icon.
 pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> {
+    // Internet shortcuts (`.url` with `IconFile=`) and several shell handlers are
+    // COM servers. Without an apartment the Shell silently returns the generic
+    // page for them, so ask for one STA apartment when this thread has none. A
+    // thread already in an MTA keeps working as before.
+    let _apartment = sta_apartment();
     let size = pixels(size)?;
     let shell_root = path.to_string_lossy().starts_with("mtp-root:");
     if directory {
@@ -143,6 +164,8 @@ pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> 
             return stock_icon(SIID_DRIVEFIXED, size);
         }
         if path.is_absolute() && folder_has_custom_icon(path) {
+            // Only reached for a folder requested by its real path (drive roots and
+            // other per-item callers); ordinary folders share one attribute icon.
             if let Ok(icon) = shell_image(path, true, size, false) {
                 return Ok(icon);
             }
@@ -360,7 +383,26 @@ fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Res
     };
     anyhow::ensure!(result != 0, "Shell icon unavailable");
     let small = Icon(info.hIcon);
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    // An internet shortcut's icon comes from the file itself (`IconFile=`) and only
+    // exists as an icon handle: its image-list index points at a *different* icon in
+    // the extra-large list, which is why `.url` files used to appear as blank pages.
+    // `.ico` and `.cur` are their own artwork for the same reason.
+    let file_icon = path.is_absolute() && matches!(extension.as_str(), "url" | "ico" | "cur");
+    if file_icon && !small.0.is_invalid() {
+        return bitmap(small.0, size);
+    }
     if size <= 32 && !small.0.is_invalid() {
+        return bitmap(small.0, size);
+    }
+    let index = info.iIcon & 0x00ffffff;
+    // A shortcut whose target icon cannot be placed in the image lists comes back
+    // with index 0 (the generic page), so keep its handle instead.
+    let self_icon = path.is_absolute() && extension == "lnk";
+    if index == 0 && self_icon && !small.0.is_invalid() {
         return bitmap(small.0, size);
     }
     let list: IImageList = unsafe {
@@ -370,9 +412,14 @@ fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Res
             SHIL_EXTRALARGE
         } as i32)?
     };
-    let index = info.iIcon & 0x00ffffff;
     let overlay = ((info.iIcon as u32 >> 24) & 0xff) << 8;
-    let icon = Icon(unsafe { list.GetIcon(index, ILD_TRANSPARENT.0 | overlay)? });
+    let drawn = unsafe { list.GetIcon(index, ILD_TRANSPARENT.0 | overlay) };
+    let icon = match drawn {
+        Ok(icon) => Icon(icon),
+        // The list has no such entry: fall back to the icon handle we received.
+        Err(_) if !small.0.is_invalid() => small,
+        Err(error) => return Err(error.into()),
+    };
     bitmap(icon.0, size)
 }
 
