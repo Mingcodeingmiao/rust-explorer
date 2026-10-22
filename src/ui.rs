@@ -159,6 +159,13 @@ enum Preview {
     },
     Message(String),
 }
+/// Which area owns the current inline rename editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenameSite {
+    #[default]
+    List,
+    Tree,
+}
 enum Dialog {
     NewFolder,
     Shortcut,
@@ -243,6 +250,10 @@ struct Explorer {
     thumbnails: rust_explorer::thumbnails::Loader,
     thumbnail_images: Entity<visual::ThumbnailImages>,
     thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
+    /// (listing generation, pixels) whose full-folder prefetch was already queued.
+    thumbnail_prefetch: std::cell::Cell<Option<(u64, u32)>>,
+    /// (listing generation, pixels) whose real per-item icons were already queued.
+    icon_prefetch: std::cell::Cell<Option<(u64, u32)>>,
     thumbnail_sync_queued: std::cell::Cell<bool>,
     hidden_breadcrumbs: std::cell::RefCell<Vec<(String, PathBuf)>>,
     view: ViewMode,
@@ -265,6 +276,11 @@ struct Explorer {
     reveal_pending: bool,
     reveal_scroll: Option<PathBuf>,
     pending_rename: bool,
+    /// Where the rename was started, so only that place shows the editor.
+    rename_site: RenameSite,
+    pending_rename_site: Option<RenameSite>,
+    /// Last area the user right-clicked in; a menu command renames there.
+    context_origin: RenameSite,
     /// Explicit rename target coming from a context-menu command.
     pending_rename_path: Option<PathBuf>,
     rename_token: u64,
@@ -786,6 +802,8 @@ impl Explorer {
             thumbnails: rust_explorer::thumbnails::Loader::new(),
             thumbnail_images: visual::ThumbnailImages::new(cx),
             thumbnail_viewport: std::cell::Cell::new(None),
+            thumbnail_prefetch: std::cell::Cell::new(None),
+            icon_prefetch: std::cell::Cell::new(None),
             thumbnail_sync_queued: std::cell::Cell::new(false),
             hidden_breadcrumbs: std::cell::RefCell::new(Vec::new()),
             rows: vec![],
@@ -816,6 +834,9 @@ impl Explorer {
                 .unwrap_or_default(),
             reveal_scroll: None,
             pending_rename: false,
+            rename_site: RenameSite::List,
+            pending_rename_site: None,
+            context_origin: RenameSite::List,
             pending_rename_path: None,
             rename_token: 0,
             selected_at: Instant::now(),
@@ -1424,6 +1445,7 @@ impl Explorer {
                                     this.storage_volumes.push(Volume {
                                         path: entry.path.clone(),
                                         label: entry.name.clone(),
+                                        name: entry.name.clone(),
                                         kind: 8,
                                         total: Some(total),
                                         free: Some(free),
@@ -2201,6 +2223,7 @@ impl Explorer {
                 if result.as_ref().is_ok_and(|s| s == "rename") {
                     if let Some(path) = menu_paths.first() {
                         this.pending_rename_path = Some(path.clone());
+                        this.pending_rename_site = Some(this.context_origin);
                         if let Some(index) = this.entries.iter().position(|e| &e.path == path) {
                             this.selected.clear();
                             this.selected.insert(index);
@@ -2255,6 +2278,7 @@ impl Explorer {
         if self.busy {
             return;
         }
+        self.context_origin = RenameSite::List;
         rust_explorer::shell::menu_trace(format!(
             "app: menu() rb_down={}",
             (unsafe {
@@ -2496,8 +2520,15 @@ impl Explorer {
         }
     }
     fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        // Renaming a drive or "This PC" is valid on the virtual pages too (that is
+        // where those names live); creating items is not.
+        let rename = matches!(
+            dialog,
+            Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+        );
         if navigation::is_virtual(&self.dir())
             && (self.is_home() || matches!(dialog, Dialog::NewFolder | Dialog::Shortcut))
+            && !rename
         {
             return;
         }
@@ -2580,7 +2611,14 @@ impl Explorer {
             false
         };
         self.dialog_input.update(cx, |v, cx| {
-            v.compact = matches!(&self.dialog, Some(Dialog::Rename(_)));
+            // Inline editors all use the compact input: it fills the overlay box and
+            // keeps the text vertically centred instead of overflowing downwards.
+            v.compact = matches!(
+                &self.dialog,
+                Some(
+                    Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+                )
+            );
             v.double_click_select_all = matches!(
                 &self.dialog,
                 Some(
@@ -2727,26 +2765,44 @@ impl Explorer {
             }
         }
     }
-    /// The shared dialog input, rendered in place of an item's own label while an
-    /// inline rename targets it.
-    fn inline_editor(&self) -> AnyElement {
+    /// Anchored inline editor for labels outside the file list (navigation rows and
+    /// drive tiles). It mirrors the list's rename overlay: an accent-bordered box
+    /// drawn over the label, so a long name cannot relayout the row or the tile.
+    fn inline_rename_overlay(&self, id: (&'static str, usize), width: f32) -> AnyElement {
         div()
-            .flex_1()
-            .min_w_0()
+            .relative()
+            .w(ui(width.max(24.)))
             .h(ui(22.))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-            .child(self.dialog_input.clone())
+            .flex_shrink_0()
+            .child(
+                gpui::deferred(
+                    gpui::anchored().snap_to_window().child(
+                        div()
+                            .id(id)
+                            .w(ui(width.clamp(80., 360.)))
+                            .h(ui(24.))
+                            .bg(rgb(self.theme.input))
+                            .border_1()
+                            .border_color(rgb(self.theme.accent))
+                            .child(self.dialog_input.clone())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                    ),
+                )
+                .with_priority(1),
+            )
             .into_any_element()
     }
     fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let site = self.pending_rename_site.take().unwrap_or(RenameSite::List);
         // A menu command names its target explicitly (the tree can rename a drive
         // that is not part of the current listing).
         if let Some(path) = self.pending_rename_path.take() {
-            self.begin_inline_rename(path, window, cx);
+            self.begin_inline_rename(path, site, window, cx);
             return;
         }
-        // F2 in the navigation tree renames the focused drive or "This PC".
-        if self.keyboard_focus_region == 3 {
+        // F2 with the navigation tree focused renames the focused drive or "This PC";
+        // with the list focused the selected drive/item is renamed instead.
+        if self.keyboard_focus_region == 3 && self.nav_focus.is_focused(window) {
             let target = self
                 .nav_rows()
                 .get(self.nav_keyboard_index)
@@ -2755,7 +2811,7 @@ impl Explorer {
                     rust_explorer::volumes::is_computer(path) || volume_label::is_drive_root(path)
                 });
             if let Some(path) = target {
-                self.begin_inline_rename(path, window, cx);
+                self.begin_inline_rename(path, RenameSite::Tree, window, cx);
                 return;
             }
         }
@@ -2770,14 +2826,22 @@ impl Explorer {
         else {
             return;
         };
-        self.begin_inline_rename(entry.path, window, cx);
+        self.begin_inline_rename(entry.path, RenameSite::List, window, cx);
     }
     /// Start an in-place rename: the editor appears at the item's own label (file
-    /// rows, drive tiles and navigation rows all render `inline_rename`).
-    fn begin_inline_rename(&mut self, path: PathBuf, window: &mut Window, cx: &mut Context<Self>) {
+    /// rows, drive tiles and navigation rows all render `inline_rename`), but only
+    /// in the area the rename was started from.
+    fn begin_inline_rename(
+        &mut self,
+        path: PathBuf,
+        site: RenameSite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.busy || self.options.is_some() || self.dialog.is_some() {
             return;
         }
+        self.rename_site = site;
         if rust_explorer::volumes::is_computer(&path) {
             let initial = self.computer_name.clone();
             self.show_dialog(Dialog::RenameComputer { initial }, window, cx);
@@ -2789,7 +2853,7 @@ impl Explorer {
                 return;
             }
             let initial = volume
-                .map(|volume| volume.label.clone())
+                .map(rust_explorer::volumes::rename_initial)
                 .unwrap_or_default();
             self.show_dialog(Dialog::RenameVolume { path, initial }, window, cx);
         } else {
@@ -3488,6 +3552,7 @@ impl Render for Explorer {
             self.set_list_scroll_row(row);
         }
         self.sync_thumbnails();
+        self.prefetch_entry_icons();
         let recycle = self.settings.high_performance
             && !matches!(
                 self.view,

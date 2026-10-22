@@ -73,6 +73,10 @@ impl ImageCache for ThumbnailImages {
 }
 struct Icons {
     images: HashMap<IconRequest, Option<PathBuf>>,
+    /// Last resolved picture per (path, directory, pixels). A volume refresh bumps
+    /// the drive-key epoch, and without this the item would fall back to the drawn
+    /// folder glyph for a frame or two until the refreshed icon arrives.
+    last: HashMap<(PathBuf, bool, u32), PathBuf>,
     failures: HashMap<IconRequest, (std::time::Instant, u8)>,
     retrying: std::collections::HashSet<IconRequest>,
     requests: mpsc::Sender<IconRequest>,
@@ -124,6 +128,7 @@ impl Icons {
             .expect("system icon worker");
         Self {
             images: HashMap::new(),
+            last: HashMap::new(),
             failures: HashMap::new(),
             retrying: Default::default(),
             requests: tx,
@@ -152,6 +157,13 @@ impl Icons {
         } else {
             None
         };
+        // A refreshed (new-epoch) request must not drop the icon that is already on
+        // screen; keep the last resolved picture for this path and size.
+        let previous = previous.or_else(|| {
+            self.last
+                .get(&(key.path.clone(), key.directory, key.pixels))
+                .cloned()
+        });
         if key.epoch != 0 {
             self.images.retain(|old, _| {
                 old.path != key.path
@@ -163,9 +175,39 @@ impl Icons {
         if let Some(path) = self.images.get(&key) {
             return path.clone();
         }
+        // The icon may already be on disk from an earlier session. Reading the small
+        // PNG path here (hash + existence check, ~10 µs) paints it on the first frame
+        // instead of waiting for a helper round trip.
+        if let Some(path) = native_assets::cached_icon_path(&key) {
+            self.images.insert(key, Some(path.clone()));
+            return Some(path);
+        }
         self.images.insert(key.clone(), previous.clone());
         self.request(key);
         previous
+    }
+    /// Queue icons for the whole folder without blocking: used to have every
+    /// executable/shortcut icon ready before the user scrolls to it.
+    fn prefetch(&mut self, keys: Vec<IconRequest>) {
+        let mut pending = Vec::new();
+        for key in keys {
+            if self.images.contains_key(&key) || self.failures.contains_key(&key) {
+                continue;
+            }
+            // Revisits are already on disk: take them without spawning a helper.
+            if let Some(path) = native_assets::cached_icon_path(&key) {
+                self.images.insert(key, Some(path));
+            } else {
+                pending.push(key);
+            }
+        }
+        for key in pending {
+            if self.images.contains_key(&key) {
+                continue;
+            }
+            self.images.insert(key.clone(), None);
+            self.request(key);
+        }
     }
     fn request(&self, key: IconRequest) {
         let priority = key.name != "file"
@@ -201,13 +243,23 @@ pub fn clear_cache() {
     ICONS.with(|icons| {
         let mut icons = icons.borrow_mut();
         icons.images.clear();
+        icons.last.clear();
         icons.failures.clear();
         icons.retrying.clear();
         icons.generation = icons.generation.wrapping_add(1);
     });
 }
+/// Resolve these icons in the background. Visible rows still jump the queue, but a
+/// folder's executables and shortcuts are ready before they are scrolled to.
+pub fn prefetch_icons(keys: Vec<IconRequest>) {
+    ICONS.with(|icons| icons.borrow_mut().prefetch(keys));
+}
 pub fn set_pixels(pixels: u32) {
     ICONS.with(|v| v.borrow_mut().pixels = pixels.clamp(16, 96));
+}
+/// Current icon pixel size (zoom/view dependent).
+pub fn icon_pixels() -> u32 {
+    ICONS.with(|v| v.borrow().pixels)
 }
 pub fn set_theme(dark: bool) {
     ICONS.with(|v| v.borrow_mut().dark = dark);
@@ -238,6 +290,13 @@ pub fn drain() -> bool {
                     .insert(k.clone(), (std::time::Instant::now(), count));
             } else {
                 v.failures.remove(&k);
+            }
+            if let Some(path) = &p {
+                v.last
+                    .insert((k.path.clone(), k.directory, k.pixels), path.clone());
+                if v.last.len() > 4096 {
+                    v.last.clear();
+                }
             }
             v.images.insert(k, p);
         }

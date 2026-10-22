@@ -9,7 +9,12 @@ use windows::{Win32::Storage::FileSystem::*, core::PCWSTR};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Volume {
     pub path: PathBuf,
+    /// Display name, including the drive letter suffix (`Data (D:)`).
     pub label: String,
+    /// Raw kernel volume label (`Data`), empty when the volume has none. Renaming
+    /// must start from this value, never from [`Volume::label`].
+    #[serde(default)]
+    pub name: String,
     pub kind: u32,
     pub total: Option<u64>,
     pub free: Option<u64>,
@@ -17,6 +22,14 @@ pub struct Volume {
     pub remote: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+}
+/// The kernel volume label of a drive, for the inline rename editor.
+pub fn rename_initial(volume: &Volume) -> String {
+    if volume.kind == 4 {
+        // Mapped network drives are renamed by display name; keep the suffix off.
+        return volume.label.clone();
+    }
+    volume.name.clone()
 }
 pub fn computer() -> PathBuf {
     PathBuf::from("::ThisPC")
@@ -70,6 +83,7 @@ pub fn basic(path: &Path) -> Volume {
     Volume {
         path: path.to_path_buf(),
         label: format!("{} ({letter}:)", remote.as_deref().unwrap_or(name)),
+        name: String::new(),
         kind,
         total: None,
         free: None,
@@ -172,6 +186,7 @@ pub fn info(path: &Path) -> Volume {
             if !label.is_empty() {
                 let letter = volume.path.to_string_lossy().chars().next().unwrap_or('?');
                 volume.label = format!("{label} ({letter}:)");
+                volume.name = label;
             }
             volume.filesystem = String::from_utf16_lossy(
                 &filesystem[..filesystem
@@ -295,6 +310,7 @@ fn append_devices(result: &mut Vec<Volume>, devices: &[(String, PathBuf)]) {
         result.push(Volume {
             path: path.clone(),
             label: label.clone(),
+            name: label.clone(),
             kind: 7,
             total: None,
             free: None,
@@ -412,6 +428,7 @@ mod ordering_tests {
         Volume {
             path: letter.into(),
             label: label.into(),
+            name: label.into(),
             kind: 3,
             total,
             free,

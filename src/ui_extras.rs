@@ -539,6 +539,38 @@ impl Explorer {
         })
         .detach();
     }
+    /// Queue the folder's per-item icons (executables, shortcuts, drives) once, so a
+    /// scroll does not have to wait for each real icon.
+    pub(super) fn prefetch_entry_icons(&self) {
+        if self.is_home() && self.volumes.is_empty() {
+            return;
+        }
+        let stamp = (self.generation, visual::icon_pixels());
+        if self.icon_prefetch.get() == Some(stamp) {
+            return;
+        }
+        self.icon_prefetch.set(Some(stamp));
+        let pixels = visual::icon_pixels();
+        let keys: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                rust_explorer::native_assets::IconRequest::needs_own_icon(
+                    &entry.path,
+                    entry.directory,
+                )
+            })
+            .map(|entry| {
+                rust_explorer::native_assets::IconRequest::file(
+                    &entry.path,
+                    entry.directory,
+                    pixels,
+                )
+            })
+            .take(rust_explorer::native_assets::ICON_PREFETCH_LIMIT)
+            .collect();
+        visual::prefetch_icons(keys);
+    }
     pub(super) fn sync_thumbnails(&self) {
         let enabled = matches!(
             self.view,
@@ -551,6 +583,26 @@ impl Explorer {
         } else {
             0
         };
+        // Eager whole-folder prefetch. It must not sit behind the viewport stamp:
+        // the first render of a folder usually hits that early return, which used to
+        // leave the queue with only the visible rows ("a page per scroll").
+        let prefetch_stamp = (self.generation, pixels);
+        if enabled {
+            if !self.entries.is_empty() && self.thumbnail_prefetch.get() != Some(prefetch_stamp) {
+                self.thumbnail_prefetch.set(Some(prefetch_stamp));
+                let all: Vec<_> = self
+                    .entries
+                    .iter()
+                    .filter_map(|entry| rust_explorer::thumbnails::Key::from_entry(entry, pixels))
+                    .take(rust_explorer::thumbnails::MAX_PREFETCH)
+                    .collect();
+                self.thumbnails.set_all(all);
+            }
+        } else if self.thumbnail_prefetch.get().is_some() {
+            // No previews are shown: drop the queue and stop generating.
+            self.thumbnail_prefetch.set(None);
+            self.thumbnails.set_all(Vec::new());
+        }
         let first = if enabled {
             self.list_scroll
                 .logical_scroll_top()
@@ -3538,8 +3590,17 @@ impl Explorer {
                     MenuItem::separator(),
                     MenuItem::new("file-cut", "剪切"),
                     MenuItem::new("file-copy", "复制"),
-                    MenuItem::new("file-rename", "重命名")
-                        .enable(self.selected.len() == 1 && !navigation::is_virtual(&self.dir())),
+                    MenuItem::new("file-rename", "重命名").enable(
+                        self.selected.len() == 1
+                            && (!navigation::is_virtual(&self.dir())
+                                || self
+                                    .selected
+                                    .first()
+                                    .and_then(|index| self.entries.get(*index))
+                                    .is_some_and(|entry| {
+                                        rust_explorer::volume_label::is_drive_root(&entry.path)
+                                    })),
+                    ),
                     MenuItem::new("file-delete", "删除")
                         .enable(!navigation::is_app_virtual(&self.dir())),
                     MenuItem::new("copy-path", "复制路径"),
@@ -4494,7 +4555,11 @@ impl Explorer {
             "file-cut" => self.copy(true, cx),
             "file-copy" => self.copy(false, cx),
             "file-paste" | "paste" => self.paste(cx),
-            "file-rename" => self.rename_dialog(w, cx),
+            "file-rename" => {
+                // The app popup is only used by the list (and the context menu).
+                self.pending_rename_site = Some(RenameSite::List);
+                self.rename_dialog(w, cx)
+            }
             "file-delete" => {
                 if w.modifiers().shift {
                     let paths = self.paths();
@@ -4652,7 +4717,7 @@ impl Explorer {
             "computer-properties" => self.run_shell(shell::Request::SystemProperties, cx),
             "computer-rename" => {
                 self.context_target = Some(volumes::computer());
-                self.begin_inline_rename(volumes::computer(), w, cx);
+                self.begin_inline_rename(volumes::computer(), RenameSite::Tree, w, cx);
             }
             "new-folder" => self.show_dialog(Dialog::NewFolder, w, cx),
             "new-shortcut" => self.show_dialog(Dialog::Shortcut, w, cx),

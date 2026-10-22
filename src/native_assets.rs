@@ -22,7 +22,30 @@ pub struct IconRequest {
     #[serde(default)]
     pub epoch: u64,
 }
+/// Upper bound for the background icon queue of one folder. Every entry still gets
+/// its icon when it becomes visible; this only pre-resolves the first N real icons.
+pub const ICON_PREFETCH_LIMIT: usize = 3000;
 impl IconRequest {
+    /// Whether this item resolves an icon of its own (an executable, a shortcut, a
+    /// drive root) instead of a shared type icon. Used to queue a folder's real icons
+    /// ahead of scrolling.
+    pub fn needs_own_icon(path: &Path, directory: bool) -> bool {
+        if path.to_string_lossy().starts_with("mtp-root:") {
+            return true;
+        }
+        if directory {
+            return path.has_root() && path.parent().is_none();
+        }
+        path.is_absolute()
+            && matches!(
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "exe" | "lnk" | "url" | "ico" | "cur"
+            )
+    }
     pub fn ui(name: &str, pixels: u32) -> Self {
         Self {
             name: name.into(),
@@ -38,11 +61,12 @@ impl IconRequest {
         // so a phone folder does not issue one slow Shell icon request each.
         let shell_root = path.to_string_lossy().starts_with("mtp-root:");
         let drive_root = directory && path.has_root() && path.parent().is_none();
-        // Folders whose desktop.ini declares its own artwork (`C:\Windows\Offline
-        // Web Pages` and other shell folders) need their own path so the helper can
-        // resolve it. Ordinary folders are normalized to one shared entry there;
-        // this constructor runs during layout and must not touch the disk.
-        let custom_folder = directory && path.is_absolute();
+        // Only folders that declare their own artwork (`C:\Windows\Offline Web
+        // Pages` and other shell folders) need a per-path Shell lookup. Every other
+        // folder shares one cached stock icon, so dragging through a folder such as
+        // WinSxS never waits for the icon helper. The check runs once per folder and
+        // is remembered for this process.
+        let custom_folder = directory && path.is_absolute() && folder_has_own_artwork(path);
         let per_item = shell_root
             || custom_folder
             || drive_root
@@ -73,7 +97,11 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            epoch: if shell_root || custom_folder || drive_root {
+            // A drive icon is cached under a stable key so a new process can paint it
+            // from disk on the first frame (an outdated badge is better than a blank
+            // square; "clear cache" refreshes it). Artwork folders and portable-device
+            // roots keep the time bucket because their icon can change on its own.
+            epoch: if shell_root || custom_folder {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -84,6 +112,34 @@ impl IconRequest {
             },
         }
     }
+}
+/// The already generated icon for this request, if any. Read from disk without a
+/// helper round trip so a restarted application paints cached icons immediately.
+pub fn cached_icon_path(key: &IconRequest) -> Option<PathBuf> {
+    icon_cache_path(key).ok().filter(|path| path.is_file())
+}
+/// Whether a folder declares its own icon/class in `desktop.ini`. Memoized for the
+/// process: the answer only changes when the folder changes, and a long listing asks
+/// once per folder. Cheap enough to run while laying out a row (~10 µs), and it keeps
+/// the common case on the shared cached folder icon.
+fn folder_has_own_artwork(path: &Path) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<std::collections::HashMap<PathBuf, bool>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(found) = cache.get(path) {
+            return *found;
+        }
+        if cache.len() >= 32768 {
+            cache.clear();
+        }
+        let found = crate::system_icons::folder_has_custom_icon(path);
+        cache.insert(path.to_path_buf(), found);
+        found
+    })
 }
 #[derive(Clone, Copy, Serialize, Deserialize, Hash)]
 pub enum PreviewKind {
@@ -254,6 +310,37 @@ fn load_thumbnail(index: &Path) -> Option<ThumbnailAsset> {
     asset.image.is_file().then_some(asset)
 }
 
+/// A provider that reported "no thumbnail" for this exact key is remembered next
+/// to the index, so reopening the folder (or restarting the application) does not
+/// pay the same Shell round trip again. The key already contains size and mtime.
+const MISS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+fn miss_path(index: &Path) -> PathBuf {
+    index.with_extension("miss")
+}
+fn missing_thumbnail(index: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(miss_path(index)) else {
+        return false;
+    };
+    let Ok(seconds) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(seconds) < MISS_TTL.as_secs() && seconds <= now
+}
+pub fn remember_missing_thumbnail(key: &crate::thumbnails::Key) {
+    let Ok(index) = thumbnail_index_path(key) else {
+        return;
+    };
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(miss_path(&index), seconds.to_string());
+}
+
 fn save_thumbnail_index(index: &Path, asset: &ThumbnailAsset) -> Result<()> {
     let temporary = index.with_extension(format!("{}.tmp", std::process::id()));
     std::fs::write(&temporary, serde_json::to_vec(asset)?)?;
@@ -292,7 +379,7 @@ fn prune_thumbnail_cache(root: &Path) {
         let record = (metadata.modified().ok(), metadata.len(), entry.path());
         match entry.path().extension().and_then(|e| e.to_str()) {
             Some("png") => images.push(record),
-            Some("json") => indexes.push(record),
+            Some("json" | "miss") => indexes.push(record),
             _ => {}
         }
     }
@@ -949,15 +1036,57 @@ impl ThumbnailSession {
             let _ = running.child.wait();
         }
     }
+    /// Start the codec helper before the first preview is needed. Process start
+    /// costs ~80 ms, which otherwise lands on the first visible thumbnail.
+    pub fn warm(&mut self) {
+        let _ = self.ensure_process();
+    }
+    fn ensure_process(&mut self) -> Result<()> {
+        use std::{io::BufRead, os::windows::process::CommandExt};
+        if self.process.is_some() {
+            return Ok(());
+        }
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--thumbnail-server")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut input = child.stdin.take().context("缩略图服务输入不可用")?;
+        let stdout = child.stdout.take().context("缩略图服务输出不可用")?;
+        let (tx, replies) = std::sync::mpsc::sync_channel(1);
+        let (requests, incoming) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while let Ok(bytes) = incoming.recv() {
+                if input.write_all(&bytes).and_then(|_| input.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        self.process = Some(ThumbnailProcess {
+            child,
+            requests,
+            replies,
+        });
+        Ok(())
+    }
     pub fn get(
         &mut self,
         key: &crate::thumbnails::Key,
         cancel: &Arc<AtomicBool>,
     ) -> Result<ThumbnailAsset> {
-        use std::{
-            io::{BufRead, Write},
-            os::windows::process::CommandExt,
-        };
         let index = thumbnail_index_path(key)?;
         if cancel.load(Ordering::Relaxed) {
             bail!("缩略图已取消");
@@ -965,43 +1094,15 @@ impl ThumbnailSession {
         // The index name contains the whole key (epoch included), so a hit always
         // belongs to this key: no helper round trip for cached folders.
         if let Some(asset) = load_thumbnail(&index) {
+            crate::shell::menu_trace("thumbnail: disk hit");
             return Ok(asset);
         }
-        if self.process.is_none() {
-            let mut child = Command::new(std::env::current_exe()?)
-                .arg("--thumbnail-server")
-                .creation_flags(0x08000000)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
-            let mut input = child.stdin.take().context("缩略图服务输入不可用")?;
-            let stdout = child.stdout.take().context("缩略图服务输出不可用")?;
-            let (tx, replies) = std::sync::mpsc::sync_channel(1);
-            let (requests, incoming) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-            std::thread::spawn(move || {
-                while let Ok(bytes) = incoming.recv() {
-                    if input.write_all(&bytes).and_then(|_| input.flush()).is_err() {
-                        break;
-                    }
-                }
-            });
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stdout).lines() {
-                    let Ok(line) = line else {
-                        break;
-                    };
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            self.process = Some(ThumbnailProcess {
-                child,
-                requests,
-                replies,
-            });
+        if missing_thumbnail(&index) {
+            crate::shell::menu_trace("thumbnail: cached miss");
+            bail!("文件不支持缩略图");
         }
+        crate::shell::menu_trace("thumbnail: generate");
+        self.ensure_process()?;
         let result = (|| -> Result<ThumbnailAsset> {
             let process = self.process.as_mut().unwrap();
             let start = Instant::now();
@@ -1067,18 +1168,11 @@ mod cache_tests {
     fn plain_folders_share_an_icon_while_desktop_ini_folders_keep_their_own() {
         let a = IconRequest::file(std::path::Path::new("C:\\Windows\\System32"), true, 96);
         let b = IconRequest::file(std::path::Path::new("D:\\Games"), true, 96);
-        // The request keeps its path (the helper checks desktop.ini), but an
-        // ordinary folder is cached under the one shared folder entry.
-        assert_ne!(a.path, b.path);
-        assert_eq!(
-            share_plain_folder_icon(a.clone()).path,
-            PathBuf::from("folder")
-        );
-        assert_eq!(
-            share_plain_folder_icon(b.clone()).path,
-            PathBuf::from("folder")
-        );
-        assert_eq!(share_plain_folder_icon(a).epoch, 0);
+        // Ordinary folders share one cached stock icon without asking the helper, so
+        // dragging through a 16k-folder directory never waits for an icon round trip.
+        assert_eq!(a.path, PathBuf::from("folder"));
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.epoch, 0);
 
         // A folder with its own artwork keeps its path so the Shell can resolve it.
         let custom = temp_root("custom-folder");
@@ -1088,6 +1182,8 @@ mod cache_tests {
         )
         .unwrap();
         let request = IconRequest::file(&custom, true, 96);
+        assert_eq!(request.path, custom);
+        assert!(request.epoch > 0);
         assert_eq!(share_plain_folder_icon(request.clone()).path, request.path);
         std::fs::remove_dir_all(&custom).unwrap();
 
@@ -1099,11 +1195,13 @@ mod cache_tests {
 
         let drive = IconRequest::file(std::path::Path::new("C:\\"), true, 96);
         assert_eq!(drive.path, PathBuf::from("C:\\"));
-        assert!(drive.epoch > 0);
+        // A drive icon uses a stable key: a fresh process paints the cached bitmap
+        // immediately instead of waiting for the Shell (an outdated badge is fine).
+        assert_eq!(drive.epoch, 0);
         // Drive roots keep their own icon: it carries the drive type and overlays,
         // so it must never be replaced by the generic folder icon.
         assert_eq!(share_plain_folder_icon(drive.clone()).path, drive.path);
-        assert!(share_plain_folder_icon(drive).epoch > 0);
+        assert_eq!(share_plain_folder_icon(drive).epoch, 0);
         let unc = IconRequest::file(std::path::Path::new("\\\\server\\share"), true, 96);
         assert_eq!(share_plain_folder_icon(unc.clone()).path, unc.path);
 
@@ -1111,6 +1209,28 @@ mod cache_tests {
         let upper = IconRequest::file(std::path::Path::new("D:\\b\\y.TXT"), false, 96);
         assert_eq!(text.path, PathBuf::from("file.txt"));
         assert_eq!(text.path, upper.path);
+    }
+    #[test]
+    fn provider_negative_results_expire_instead_of_being_retried_every_session() {
+        let root = temp_root("miss");
+        let index = root.join("0123456789abcdef.json");
+        assert!(!super::missing_thumbnail(&index));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(super::miss_path(&index), now.to_string()).unwrap();
+        assert!(super::missing_thumbnail(&index));
+        // A stale marker is ignored so a newly installed codec gets a chance.
+        let stale = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64
+            - super::MISS_TTL.as_secs() as f64
+            - 60.) as u64;
+        std::fs::write(super::miss_path(&index), stale.to_string()).unwrap();
+        assert!(!super::missing_thumbnail(&index));
+        std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]
     fn cache_images_are_named_by_the_sha256_of_their_bytes() {

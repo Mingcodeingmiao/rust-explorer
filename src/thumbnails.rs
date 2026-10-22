@@ -135,6 +135,10 @@ struct State {
     visible: Vec<Key>,
     visible_set: HashSet<Key>,
     pending: VecDeque<Key>,
+    /// The rest of the current folder: every previewable item, generated eagerly so
+    /// scrolling does not wait for a Shell round trip per row. Visible items are
+    /// served from `pending` first and are excluded here.
+    prefetch: VecDeque<Key>,
     cache: HashMap<Key, Cached>,
     /// One slot per worker thread: the key it is generating and its cancel flag.
     active: Vec<Option<(Key, Arc<AtomicBool>)>>,
@@ -151,7 +155,19 @@ struct State {
 /// adds nothing, so the pool is capped instead of spawning one helper per core
 /// (`cores - 2`, at least one).
 const MAX_WORKERS: usize = 4;
+/// Eager prefetch bound for one folder. Files are cheap; folder previews are
+/// composed by the Shell and cost 7–125 ms each, so only a bounded number of them
+/// is prefetched (folders such as `C:\Windows\WinSxS` hold 16k of them).
+pub const MAX_PREFETCH: usize = 8000;
+const MAX_PREFETCH_DIRS: usize = 3000;
 fn worker_count() -> usize {
+    // Diagnostics knob for measuring throughput on a specific machine.
+    if let Some(count) = std::env::var("RUST_EXPLORER_THUMBNAIL_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+    {
+        return count.clamp(1, 16);
+    }
     let cores = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(4)
@@ -183,12 +199,9 @@ impl State {
         self.visible_set = keys.iter().cloned().collect();
         self.visible = keys;
         self.updated = Some(Instant::now());
-        // Drop work that scrolled away; another worker picks up what is visible.
-        for (key, cancel) in self.active.iter_mut().flatten() {
-            if !self.visible_set.contains(key) {
-                cancel.store(true, Ordering::Relaxed);
-            }
-        }
+        // Scrolling only reorders work: rows that left the viewport stay in the
+        // eager prefetch queue instead of being cancelled, so scrolling back is
+        // instant once they finish.
         self.pending = self
             .visible
             .iter()
@@ -202,16 +215,80 @@ impl State {
             })
             .cloned()
             .collect();
+        // A key that became visible is generated from `pending`, not twice.
+        self.prefetch.retain(|key| !self.visible_set.contains(key));
+    }
+    /// Replace the eager queue with a new folder listing. Work for the previous
+    /// listing is cancelled: those items are no longer on screen.
+    fn set_all(&mut self, keys: Vec<Key>) {
+        let mut seen = HashSet::new();
+        let mut directories = 0;
+        // The queue itself is cheap (keys only); the in-memory image cache prunes
+        // later, and a pruned preview is still a fast disk hit when scrolled into
+        // view. So the queue is bounded by count and by folder previews only.
+        let keys: Vec<_> = keys
+            .into_iter()
+            .filter(|key| {
+                if !seen.insert(key.clone()) {
+                    return false;
+                }
+                if key.directory {
+                    if directories >= MAX_PREFETCH_DIRS {
+                        return false;
+                    }
+                    directories += 1;
+                }
+                true
+            })
+            .take(MAX_PREFETCH)
+            .collect();
+        let wanted: HashSet<Key> = keys.iter().cloned().collect();
+        for (key, cancel) in self.active.iter_mut().flatten() {
+            if !wanted.contains(key) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
+        self.prefetch = keys
+            .into_iter()
+            .filter(|key| {
+                !self.cache.contains_key(key)
+                    && !self.visible_set.contains(key)
+                    && !self
+                        .active
+                        .iter()
+                        .flatten()
+                        .any(|(active, _)| active == key)
+            })
+            .collect();
+        self.updated = Some(Instant::now());
     }
     /// Next job in visibility order. A Shell namespace item is only handed out
     /// when the device is idle, so local thumbnails keep flowing in parallel.
     fn take_job(&mut self) -> Option<Key> {
         let shell_busy = self.shell_busy;
-        let position = self
+        let busy = |key: &Key| {
+            self.active
+                .iter()
+                .flatten()
+                .any(|(active, cancel)| active == key && !cancel.load(Ordering::Relaxed))
+        };
+        let found = self
             .pending
             .iter()
-            .position(|key| !is_shell(key) || !shell_busy)?;
-        let key = self.pending.remove(position)?;
+            .position(|key| (!is_shell(key) || !shell_busy) && !busy(key))
+            .map(|position| (true, position))
+            .or_else(|| {
+                self.prefetch
+                    .iter()
+                    .position(|key| (!is_shell(key) || !shell_busy) && !busy(key))
+                    .map(|position| (false, position))
+            });
+        let (priority, position) = found?;
+        let key = if priority {
+            self.pending.remove(position)?
+        } else {
+            self.prefetch.remove(position)?
+        };
         if is_shell(&key) {
             self.shell_busy = true;
         }
@@ -259,6 +336,9 @@ struct Shared {
 }
 fn run_worker(shared: Arc<Shared>, index: usize) {
     let mut session = crate::native_assets::ThumbnailSession::default();
+    // Spawn the codec helper while the window is still laying out instead of on the
+    // first visible thumbnail (~80 ms measured on this machine).
+    session.warm();
     loop {
         let (key, cancel) = {
             let mut state = shared.state.lock().unwrap();
@@ -266,7 +346,7 @@ fn run_worker(shared: Arc<Shared>, index: usize) {
                 if state.stopped {
                     return;
                 }
-                if state.pending.is_empty() {
+                if state.pending.is_empty() && state.prefetch.is_empty() {
                     if state.visible.is_empty() {
                         drop(state);
                         session.stop();
@@ -274,7 +354,7 @@ fn run_worker(shared: Arc<Shared>, index: usize) {
                         if state.stopped {
                             return;
                         }
-                        if !state.pending.is_empty() {
+                        if !state.pending.is_empty() || !state.prefetch.is_empty() {
                             continue;
                         }
                     }
@@ -315,7 +395,19 @@ fn run_worker(shared: Arc<Shared>, index: usize) {
             }
         };
         // A slow codec/provider is killed with the helper, never joined by the UI.
-        let asset = session.get(&key, &cancel).ok();
+        let outcome = session.get(&key, &cancel);
+        // The provider itself reported "no thumbnail": remember that for this exact
+        // key so the next session does not ask the Shell again. Timeouts and helper
+        // failures are not remembered — they may succeed next time.
+        if !cancel.load(Ordering::Relaxed)
+            && !is_shell(&key)
+            && outcome
+                .as_ref()
+                .is_err_and(|error| error.to_string() == "文件不支持缩略图")
+        {
+            crate::native_assets::remember_missing_thumbnail(&key);
+        }
+        let asset = outcome.ok();
         let presentation = asset
             .as_ref()
             .map(|asset| asset.presentation)
@@ -398,6 +490,15 @@ impl Loader {
         self.shared.state.lock().unwrap().set_visible(keys);
         // Every worker must re-read the queue: waking one would leave the others
         // asleep while the new viewport waits for previews.
+        self.shared.wake.notify_all();
+    }
+    /// Queue every previewable item of the folder that was just opened. Visible
+    /// rows keep priority; the rest is generated in listing order so scrolling
+    /// reveals finished previews instead of starting new work per row.
+    pub fn set_all(&self, keys: Vec<Key>) {
+        let count = keys.len();
+        self.shared.state.lock().unwrap().set_all(keys);
+        crate::shell::menu_trace(format!("thumbnails: queued {count} folder previews"));
         self.shared.wake.notify_all();
     }
     pub fn image(&self, key: &Key) -> Option<PathBuf> {
@@ -583,15 +684,51 @@ mod tests {
         );
     }
     #[test]
-    fn viewport_replaces_stale_queue_and_cancels_offscreen_provider() {
+    fn viewport_queues_visible_items_first_without_cancelling_the_folder() {
         let mut state = State::default();
         state.active = vec![None, None];
-        state.set_visible(vec![key(1), key(2), key(2)]);
+        state.set_all(vec![key(1), key(2), key(3), key(4)]);
+        assert_eq!(state.prefetch.len(), 4);
+        state.set_visible(vec![key(3)]);
+        // Scrolling re-orders work but keeps the eager queue alive.
+        assert_eq!(state.take_job(), Some(key(3)));
+        assert_eq!(state.take_job(), Some(key(1)));
+        assert_eq!(state.take_job(), Some(key(2)));
+        assert_eq!(state.take_job(), Some(key(4)));
+        assert!(state.take_job().is_none());
+    }
+    #[test]
+    fn a_new_folder_cancels_work_for_the_previous_one() {
+        let mut state = State::default();
+        state.active = vec![None, None];
+        state.set_all(vec![key(1), key(2)]);
         let cancel = Arc::new(AtomicBool::new(false));
         state.active[0] = Some((key(1), cancel.clone()));
-        state.set_visible(vec![key(3)]);
+        state.set_all(vec![key(9)]);
         assert!(cancel.load(Ordering::Relaxed));
-        assert_eq!(state.pending.into_iter().collect::<Vec<_>>(), vec![key(3)]);
+        assert_eq!(state.take_job(), Some(key(9)));
+    }
+    #[test]
+    fn prefetch_is_bounded_for_huge_folders() {
+        let mut state = State::default();
+        state.active = vec![None];
+        // A folder of folders (System32, WinSxS) queues all of them up to the folder
+        // cap instead of stopping after the first page.
+        let folders: Vec<_> = (0..MAX_PREFETCH_DIRS + 500)
+            .map(|index| Key {
+                path: PathBuf::from(format!("C:\\dir{index}")),
+                directory: true,
+                ..key(index)
+            })
+            .collect();
+        state.set_all(folders);
+        assert_eq!(state.prefetch.len(), MAX_PREFETCH_DIRS);
+        let files: Vec<_> = (0..MAX_PREFETCH + 2000).map(key).collect();
+        state.set_all(files);
+        assert_eq!(state.prefetch.len(), MAX_PREFETCH);
+        // Duplicate keys are queued once.
+        state.set_all(vec![key(1), key(2), key(1)]);
+        assert_eq!(state.prefetch.len(), 2);
     }
     #[test]
     fn cache_revision_and_resolution_do_not_alias() {
