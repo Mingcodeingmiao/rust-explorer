@@ -4,9 +4,9 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.6**, revised and republished on 2026-10-21 with PR #30, restores owner-backed context menus to an in-process STA instead of spawning a helper per click. Re-download older 0.7.6 packages and verify the new checksum. It combines PR #27 with Recycle Bin, selection contrast, Quick Access, native-operation stop/history, address/rename editing, and startup icon/drive-information fixes. It adds cache clearing and improves COM initialization and new-folder/format-dialog handling. See the [release notes](docs/v0.7.6.md) and [known limitations](KNOWN_ISSUES.md). Experimental folder associations remain opt-in with backups, a trial guard and recovery. MTP same-device copy/move remains device-dependent.
+Version **0.7.7** merges PR #33: navigation state restoration, mouse side buttons, blank-area double-click-up, reusable folder tabs, Details/Advanced options, inline drive/This PC rename, and directory/icon/thumbnail cache improvements. Native menus retain their in-process independent STA and window owner. See the [release notes](docs/v0.7.7.md) and [known limitations](KNOWN_ISSUES.md).
 
-Latest published download: [Rust Explorer 0.7.6](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.6). Fully unzip the Windows x64 archive and verify `SHA256SUMS.txt`. Exit the old application first; if folder associations are enabled, restore the system default before moving to the new executable and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
+Latest published download: [Rust Explorer 0.7.7](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
 
 ## Features
 

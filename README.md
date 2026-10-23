@@ -9,9 +9,9 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.7.6（2026-10-21 修订重发，已合并 PR #30）。** 右键菜单恢复进程内独立 STA 路径，修复原包每次新建 helper 导致的延迟；下载过旧包请重新下载并核对新校验值。 整合 PR #27 及后续修复：回收站列设置和删除确认、深色选中颜色、快速访问、系统操作停止/详情、地址栏及重命名编辑、启动图标和磁盘信息加载。支持清空缓存，改善系统菜单 COM 初始化与新建/格式化窗口行为。详见 [0.7.6 更新说明](docs/v0.7.6.md) 和 [已知边界](KNOWN_ISSUES.md)。实验性默认文件夹关联保留备份、限时试用和恢复机制，默认不启用；MTP 同设备内复制/移动仍受设备能力限制。
+**当前版本为 0.7.7。** 合并 PR #33：导航时恢复滚动位置和选中项，支持鼠标侧键、空白双击向上及标签页去重；整理“细节/高级”设置页、原地重命名驱动器和此电脑，优化大目录列举、图标及缩略图缓存。右键菜单继续保留进程内独立 STA 和 owner 约束。详见 [0.7.7 更新说明](docs/v0.7.7.md)及[已知边界](KNOWN_ISSUES.md)。
 
-最新已发布下载：[Rust Explorer 0.7.6](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.6)。请完整解压 Windows x64 ZIP，并核对同页的 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时请先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
+最新已发布下载：[Rust Explorer 0.7.7](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -65,7 +65,7 @@ Debug 构建省略 `-Release`。MSYS2 UCRT64 用户安装 `stable-x86_64-pc-wind
 - [贡献指南](CONTRIBUTING.md)、[行为准则](CODE_OF_CONDUCT.md)、[安全报告](SECURITY.md)
 - [快捷键](docs/explorer-shortcuts.md)、[架构](docs/architecture.md)、[撤销/重做](docs/file-history-062.md)
 - [原生预览](docs/native-previews.md)、[系统图标](docs/system-icons.md)、[运行时资源](docs/fluent-icons.md)
-- [0.7.6 更新说明](docs/v0.7.6.md)、[0.7.5 更新说明](docs/v0.7.5.md)、[0.7.4 更新说明](docs/v0.7.4.md)、[0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
+- [0.7.7 更新说明](docs/v0.7.7.md)、[0.7.6 更新说明](docs/v0.7.6.md)、[0.7.5 更新说明](docs/v0.7.5.md)、[0.7.4 更新说明](docs/v0.7.4.md)、[0.7.3 更新说明](docs/v0.7.3.md)、[后续计划](ROADMAP.md)、[0.6.2 验证记录](docs/audit-0.6.2.md)
 
 欢迎通过 Issue 模板报告可复现问题，提供版本、Windows build、DPI/缩放、主题和查看模式；上传前移除个人路径及敏感内容。
 

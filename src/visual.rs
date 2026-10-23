@@ -175,13 +175,7 @@ impl Icons {
         if let Some(path) = self.images.get(&key) {
             return path.clone();
         }
-        // The icon may already be on disk from an earlier session. Reading the small
-        // PNG path here (hash + existence check, ~10 µs) paints it on the first frame
-        // instead of waiting for a helper round trip.
-        if let Some(path) = native_assets::cached_icon_path(&key) {
-            self.images.insert(key, Some(path.clone()));
-            return Some(path);
-        }
+        // Disk cache lookup is performed by the icon worker, not during layout.
         self.images.insert(key.clone(), previous.clone());
         self.request(key);
         previous
@@ -194,12 +188,7 @@ impl Icons {
             if self.images.contains_key(&key) || self.failures.contains_key(&key) {
                 continue;
             }
-            // Revisits are already on disk: take them without spawning a helper.
-            if let Some(path) = native_assets::cached_icon_path(&key) {
-                self.images.insert(key, Some(path));
-            } else {
-                pending.push(key);
-            }
+            pending.push(key);
         }
         for key in pending {
             if self.images.contains_key(&key) {
@@ -240,6 +229,7 @@ fn icon_image(path: PathBuf) -> Img {
     }
 }
 pub fn clear_cache() {
+    native_assets::clear_folder_artwork();
     ICONS.with(|icons| {
         let mut icons = icons.borrow_mut();
         icons.images.clear();
@@ -275,6 +265,7 @@ pub fn checkbox(checked: bool, color: u32) -> AnyElement {
         .into_any_element()
 }
 pub fn drain() -> bool {
+    let artwork_changed = native_assets::poll_folder_artwork();
     ICONS.with(|v| {
         let mut v = v.borrow_mut();
         let results: Vec<_> = v.results.try_iter().collect();
@@ -315,7 +306,7 @@ pub fn drain() -> bool {
             v.retrying.insert(key.clone());
             v.request(key);
         }
-        changed
+        changed || artwork_changed
     })
 }
 pub fn icon_at(name: &str, color: u32, logical: f32) -> AnyElement {

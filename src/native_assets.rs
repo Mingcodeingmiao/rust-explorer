@@ -65,8 +65,9 @@ impl IconRequest {
         // Pages` and other shell folders) need a per-path Shell lookup. Every other
         // folder shares one cached stock icon, so dragging through a folder such as
         // WinSxS never waits for the icon helper. The check runs once per folder and
-        // is remembered for this process.
-        let custom_folder = directory && path.is_absolute() && folder_has_own_artwork(path);
+        // is queued to bounded background workers and remembered for this process.
+        let custom_folder =
+            directory && !drive_root && path.is_absolute() && folder_has_own_artwork(path);
         let per_item = shell_root
             || custom_folder
             || drive_root
@@ -118,28 +119,96 @@ impl IconRequest {
 pub fn cached_icon_path(key: &IconRequest) -> Option<PathBuf> {
     icon_cache_path(key).ok().filter(|path| path.is_file())
 }
-/// Whether a folder declares its own icon/class in `desktop.ini`. Memoized for the
-/// process: the answer only changes when the folder changes, and a long listing asks
-/// once per folder. Cheap enough to run while laying out a row (~10 µs), and it keeps
-/// the common case on the shared cached folder icon.
+/// Rendering only consults memory and queues a bounded background probe. A slow
+/// disk/network provider must never turn a desktop.ini lookup into a GUI stall.
 fn folder_has_own_artwork(path: &Path) -> bool {
-    use std::cell::RefCell;
-    thread_local! {
-        static CACHE: RefCell<std::collections::HashMap<PathBuf, bool>> =
-            RefCell::new(std::collections::HashMap::new());
+    FOLDER_ARTWORK.with(|cache| cache.borrow_mut().get(path))
+}
+thread_local! {
+    static FOLDER_ARTWORK: std::cell::RefCell<FolderArtwork> =
+        std::cell::RefCell::new(FolderArtwork::new(crate::system_icons::folder_has_custom_icon));
+}
+struct FolderArtwork {
+    cache: std::collections::HashMap<PathBuf, bool>,
+    pending: std::collections::HashSet<PathBuf>,
+    requests: std::sync::mpsc::SyncSender<(u64, PathBuf)>,
+    replies: std::sync::mpsc::Receiver<(u64, PathBuf, bool)>,
+    generation: u64,
+}
+impl FolderArtwork {
+    fn new(probe: fn(&Path) -> bool) -> Self {
+        use std::sync::{Mutex, mpsc};
+        let (requests, rx) = mpsc::sync_channel::<(u64, PathBuf)>(256);
+        let (tx, replies) = mpsc::channel();
+        let rx = Arc::new(Mutex::new(rx));
+        for index in 0..2 {
+            let rx = rx.clone();
+            let tx = tx.clone();
+            std::thread::Builder::new()
+                .name(format!("folder-artwork-{index}"))
+                .spawn(move || {
+                    loop {
+                        let request = rx.lock().unwrap().recv();
+                        let Ok((generation, path)) = request else {
+                            break;
+                        };
+                        let found = probe(&path);
+                        if tx.send((generation, path, found)).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("folder artwork worker");
+        }
+        Self {
+            cache: Default::default(),
+            pending: Default::default(),
+            requests,
+            replies,
+            generation: 0,
+        }
     }
-    CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(found) = cache.get(path) {
+    fn get(&mut self, path: &Path) -> bool {
+        if let Some(found) = self.cache.get(path) {
             return *found;
         }
-        if cache.len() >= 32768 {
-            cache.clear();
+        if self.pending.len() < 256
+            && !self.pending.contains(path)
+            && self
+                .requests
+                .try_send((self.generation, path.to_path_buf()))
+                .is_ok()
+        {
+            self.pending.insert(path.to_path_buf());
         }
-        let found = crate::system_icons::folder_has_custom_icon(path);
-        cache.insert(path.to_path_buf(), found);
-        found
-    })
+        false
+    }
+    fn drain(&mut self) -> bool {
+        let mut changed = false;
+        for (generation, path, found) in self.replies.try_iter() {
+            if generation != self.generation {
+                continue;
+            }
+            self.pending.remove(&path);
+            if self.cache.len() >= 32768 {
+                self.cache.clear();
+            }
+            self.cache.insert(path, found);
+            changed |= found;
+        }
+        changed
+    }
+    fn clear(&mut self) {
+        self.generation = self.generation.wrapping_add(1);
+        self.cache.clear();
+        self.pending.clear();
+    }
+}
+pub fn poll_folder_artwork() -> bool {
+    FOLDER_ARTWORK.with(|cache| cache.borrow_mut().drain())
+}
+pub fn clear_folder_artwork() {
+    FOLDER_ARTWORK.with(|cache| cache.borrow_mut().clear());
 }
 #[derive(Clone, Copy, Serialize, Deserialize, Hash)]
 pub enum PreviewKind {
@@ -934,6 +1003,27 @@ pub fn resolve_shortcut(path: &Path, cancel: &Arc<AtomicBool>) -> Result<PathBuf
     }
 }
 pub fn icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
+    // Called by icon workers, never by rendering: cached icons avoid a helper
+    // round trip while filesystem existence checks remain off the GUI thread.
+    let mut result = vec![None; items.len()];
+    let mut pending = Vec::new();
+    let mut positions = Vec::new();
+    for (index, item) in items.into_iter().enumerate() {
+        if let Some(path) = cached_icon_path(&item) {
+            result[index] = Some(path);
+        } else {
+            positions.push(index);
+            pending.push(item);
+        }
+    }
+    if !pending.is_empty() {
+        for (index, path) in positions.into_iter().zip(load_icons(pending)) {
+            result[index] = path;
+        }
+    }
+    result
+}
+fn load_icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
     if items.len() > 1
         && items
             .iter()
@@ -1181,7 +1271,21 @@ mod cache_tests {
             b"[.ShellClassInfo]\r\nIconResource=C:\\x.ico,0\r\n",
         )
         .unwrap();
-        let request = IconRequest::file(&custom, true, 96);
+        // The render-side constructor first returns a shared fallback. Background
+        // classification later promotes a customized folder to its per-path icon.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let request = loop {
+            poll_folder_artwork();
+            let request = IconRequest::file(&custom, true, 96);
+            if request.path == custom {
+                break request;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "custom icon probe did not complete"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        };
         assert_eq!(request.path, custom);
         assert!(request.epoch > 0);
         assert_eq!(share_plain_folder_icon(request.clone()).path, request.path);
@@ -1209,6 +1313,46 @@ mod cache_tests {
         let upper = IconRequest::file(std::path::Path::new("D:\\b\\y.TXT"), false, 96);
         assert_eq!(text.path, PathBuf::from("file.txt"));
         assert_eq!(text.path, upper.path);
+    }
+    #[test]
+    fn slow_folder_artwork_probe_does_not_block_request_construction() {
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        fn blocked_probe(_: &Path) -> bool {
+            STARTED.store(true, Ordering::SeqCst);
+            while !RELEASE.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            true
+        }
+        struct Release;
+        impl Drop for Release {
+            fn drop(&mut self) {
+                RELEASE.store(true, Ordering::SeqCst);
+            }
+        }
+        RELEASE.store(false, Ordering::SeqCst);
+        STARTED.store(false, Ordering::SeqCst);
+        let _release = Release;
+        let mut cache = super::FolderArtwork::new(blocked_probe);
+        let path = Path::new("C:\\blocked-artwork-fixture");
+        assert!(!cache.get(path));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !STARTED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!cache.get(path));
+        assert_eq!(cache.pending.len(), 1);
+        RELEASE.store(true, Ordering::SeqCst);
+        while !cache.cache.contains_key(path) {
+            cache.drain();
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(cache.get(path));
+        cache.clear();
+        assert!(cache.cache.is_empty());
     }
     #[test]
     fn provider_negative_results_expire_instead_of_being_retried_every_session() {
