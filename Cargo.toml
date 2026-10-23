@@ -27,7 +27,7 @@ sha2 = "0.10"
 gpui = { version = "=0.2.2", default-features = false, optional = true }
 unicode-segmentation = { version = "1", optional = true }
 notify = { version = "8", optional = true }
-windows-registry = "0.5"
+windows-registry = "0.100"
 windows-core = "0.61"
 raw-window-handle = "0.6"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
