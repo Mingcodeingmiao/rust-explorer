@@ -82,7 +82,10 @@ pub fn basic(path: &Path) -> Volume {
     };
     Volume {
         path: path.to_path_buf(),
-        label: format!("{} ({letter}:)", remote.as_deref().unwrap_or(name)),
+        label: format!(
+            "{} ({letter}:)",
+            remote.as_deref().unwrap_or(crate::i18n::text(name))
+        ),
         name: String::new(),
         kind,
         total: None,

@@ -691,6 +691,7 @@ fn system_glyph(name: &str) -> Option<(&'static str, char)> {
 }
 
 pub fn button_name(label: &str) -> Option<&'static str> {
+    let label = rust_explorer::i18n::source(label);
     if label.starts_with("本地磁盘") {
         return Some("drive");
     }

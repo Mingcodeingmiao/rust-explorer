@@ -1,5 +1,10 @@
 # Known limitations / 已知边界
 
+> [!WARNING]
+> **0.7.7 part1：Windows 原生右键菜单仍有问题，尚未完全修复。** Windows 10 下文件菜单可能仍有深浅色或样式不一致；不同系统和 Shell 扩展的行为仍需继续排查。本轮主要在 Windows 11 验证，不能据此宣称 Windows 10 菜单已经修复。
+>
+> **Windows native context menus remain a known issue.** Inconsistent styling may persist on Windows 10; broader OS and Shell-extension validation is still needed.
+
 - Windows 10/11 x64 only. Current validation is primarily on Windows 11 with the GNU toolchain; hosted MSVC CI provides additional build coverage. There is no claim of full Explorer parity.
 - Undo/redo covers operations successfully recorded by this application. Overwrite, directory merge, permanent deletion or operations without safe receipts create a history barrier. External changes and destination conflicts may prevent replay. See [file history](docs/file-history-062.md).
 - USB eject, BitLocker, formatting, network disconnect, volume-label changes and sharing permission changes are delegated to the OS. Hardware/permission combinations have not all been tested. Automated tests do not perform destructive device operations.

@@ -1,6 +1,40 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+#[cfg(test)]
+mod interaction_defaults_tests {
+    #[test]
+    fn language_defaults_to_english_and_round_trips() {
+        let settings: super::Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.language, "en-US");
+        for tag in ["en-US", "zh-CN", "ja-JP", "ko-KR"] {
+            let settings = super::Settings {
+                language: tag.into(),
+                ..Default::default()
+            };
+            let decoded: super::Settings =
+                serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+            assert_eq!(decoded.language, tag);
+        }
+    }
+    #[test]
+    fn old_settings_do_not_enable_blank_double_click_navigation() {
+        let settings: super::Settings = serde_json::from_str("{}").unwrap();
+        assert!(!settings.blank_double_click_up);
+        assert!(settings.thumbnail_cache_directory.is_none());
+        let mut settings = settings;
+        settings.blank_double_click_up = true;
+        settings.thumbnail_cache_directory = Some("D:\\RE thumbnails".into());
+        let decoded: super::Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert!(decoded.blank_double_click_up);
+        assert_eq!(
+            settings.thumbnail_cache_directory,
+            decoded.thumbnail_cache_directory
+        );
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ViewMode {
     ExtraLarge,
@@ -38,6 +72,7 @@ impl ViewMode {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    pub language: String,
     pub view: ViewMode,
     pub extensions: bool,
     pub hidden: bool,
@@ -46,6 +81,8 @@ pub struct Settings {
     pub compact: bool,
     pub high_performance: bool,
     pub thumbnails: bool,
+    pub blank_double_click_up: bool,
+    pub thumbnail_cache_directory: Option<PathBuf>,
     pub wrap_names: bool,
     pub single_click: bool,
     #[serde(alias = "shift_new_tab")]
@@ -63,6 +100,7 @@ pub struct Settings {
     pub remember_views: bool,
     pub columns: Vec<(String, f32)>,
     pub recycle_columns: Vec<(String, f32)>,
+    pub search_columns: Vec<(String, f32)>,
     pub volume_columns: Vec<(String, f32)>,
     pub volume_sort: String,
     pub volume_descending: bool,
@@ -85,6 +123,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            language: "en-US".into(),
             view: ViewMode::Details,
             extensions: true,
             hidden: false,
@@ -93,6 +132,8 @@ impl Default for Settings {
             compact: false,
             high_performance: false,
             thumbnails: true,
+            blank_double_click_up: false,
+            thumbnail_cache_directory: None,
             wrap_names: true,
             single_click: false,
             shift_open_tab: false,
@@ -106,6 +147,13 @@ impl Default for Settings {
             details_pane: false,
             folders_first: true,
             remember_views: true,
+            search_columns: vec![
+                ("name".into(), 280.),
+                ("location".into(), 320.),
+                ("modified".into(), 156.),
+                ("kind".into(), 112.),
+                ("size".into(), 100.),
+            ],
             columns: vec![
                 ("name".into(), 300.),
                 ("modified".into(), 156.),
@@ -157,6 +205,22 @@ impl Settings {
         });
         if !s.columns.iter().any(|(id, _)| id == "name") {
             s.columns.insert(0, ("name".into(), 300.));
+        }
+        let mut search_seen = std::collections::HashSet::new();
+        s.search_columns.retain_mut(|(id, w)| {
+            *w = if w.is_finite() {
+                w.clamp(64., 1200.)
+            } else {
+                160.
+            };
+            ["name", "location", "modified", "kind", "size", "created"].contains(&id.as_str())
+                && search_seen.insert(id.clone())
+        });
+        if !s.search_columns.iter().any(|(id, _)| id == "name") {
+            s.search_columns.insert(0, ("name".into(), 280.));
+        }
+        if !s.search_columns.iter().any(|(id, _)| id == "location") {
+            s.search_columns.push(("location".into(), 320.));
         }
         normalize_volume_columns(&mut s.volume_columns);
         normalize_recycle_columns(&mut s.recycle_columns);

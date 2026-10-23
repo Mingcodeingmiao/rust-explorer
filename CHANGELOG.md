@@ -1,5 +1,17 @@
 # Changelog
 
+## [0.7.7-part1] - 2026-10-24
+
+> **Known issue: Windows native context menus are not fully fixed.** Inconsistent file-menu styling can still occur on Windows 10. See [release notes](docs/v0.7.7-part1.md).
+
+- Add an opt-in blank-space double-click Up setting, fix repeated stationary double-click navigation, and move tab close buttons slightly right.
+- Store thumbnails in a bounded, deduplicated SQLite cache with a configurable local directory; preserve background-only I/O and codec isolation.
+- Bridge native sharing submenu commands to Windows sharing workflows; preserve in-process STA/owner menu boundaries.
+- Root sharing menus offer Advanced Sharing; child folders offer Remove Access and Specific Users. Improve Windows 10 theme API version selection and reapply menu themes after extension initialization, without claiming all menu issues resolved.
+- Gate Everything by filesystem and provide filesystem fallback; show search paths with independent search column layout. See [implementation and validation notes](docs/ui-cache-search.md).
+
+- Add embedded Simplified Chinese, English, Japanese and Korean interface packs. Default to English; manually select and persist English, Chinese, Japanese or Korean in the General options language dropdown, applying changes immediately. Localize application controls, options, status text and application-added menus while preserving filenames, paths, command IDs and native Shell behavior. See [language pack documentation](resources/locales/README.md).
+
 Notable changes are recorded here. Versions before 1.0 may change behavior and configuration formats.
 
 ## [0.7.7] - 2026-10-23

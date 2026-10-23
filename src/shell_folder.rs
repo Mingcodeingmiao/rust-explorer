@@ -384,6 +384,8 @@ fn is_computer_label(part: &str, computer: &str) -> bool {
     part.eq_ignore_ascii_case(computer)
         || part.eq_ignore_ascii_case("此电脑")
         || part.eq_ignore_ascii_case("this pc")
+        || part.eq_ignore_ascii_case("PC")
+        || part.eq_ignore_ascii_case("내 PC")
 }
 
 /// Whether a name is the Recycle Bin in any of its addresses.
@@ -392,6 +394,8 @@ fn is_recycle_bin_name(name: &str) -> bool {
         || name.eq_ignore_ascii_case(RECYCLE_BIN_PARSING)
         || name.eq_ignore_ascii_case("回收站")
         || name.eq_ignore_ascii_case("recycle bin")
+        || name.eq_ignore_ascii_case("ごみ箱")
+        || name.eq_ignore_ascii_case("휴지통")
 }
 
 /// A breadcrumb segment that is not a drive letter or a UNC share.
@@ -428,6 +432,8 @@ fn named_location(name: &str) -> Option<PathBuf> {
     if name.eq_ignore_ascii_case("::QuickAccess")
         || name.eq_ignore_ascii_case("快速访问")
         || name.eq_ignore_ascii_case("quick access")
+        || name.eq_ignore_ascii_case("クイックアクセス")
+        || name.eq_ignore_ascii_case("빠른 실행")
     {
         return Some(PathBuf::from("::QuickAccess"));
     }
@@ -437,6 +443,8 @@ fn named_location(name: &str) -> Option<PathBuf> {
     if name.eq_ignore_ascii_case("::ThisPC")
         || name.eq_ignore_ascii_case("此电脑")
         || name.eq_ignore_ascii_case("this pc")
+        || name.eq_ignore_ascii_case("PC")
+        || name.eq_ignore_ascii_case("내 PC")
     {
         return Some(crate::volumes::computer());
     }

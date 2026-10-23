@@ -22,3 +22,6 @@ The original application icon is AI-assisted artwork created for this project, n
 Toolbar fallback SVGs use unmodified Microsoft Fluent UI System Icons artwork (MIT). Source commit and per-file URLs are recorded in `resources/fluent-icons/SOURCES.json`; full license is in `resources/fluent-icons/LICENSE`. The application icon uses the project’s original generated artwork.
 
 Installed Windows artwork and system icon fonts are referenced at runtime only and are not redistributed.
+## SQLite thumbnail storage
+
+Thumbnail persistence uses **rusqlite** ([full MIT license](resources/rusqlite-MIT.txt)) and bundled **SQLite** (public domain). SQLite is compiled into the application; no separate database server is installed. Upstream: https://github.com/rusqlite/rusqlite and https://www.sqlite.org/copyright.html.

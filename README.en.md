@@ -4,9 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.7** merges PR #33: navigation state restoration, mouse side buttons, blank-area double-click-up, reusable folder tabs, Details/Advanced options, inline drive/This PC rename, and directory/icon/thumbnail cache improvements. Native menus retain their in-process independent STA and window owner. See the [release notes](docs/v0.7.7.md) and [known limitations](KNOWN_ISSUES.md).
+Version **0.7.7 part1** adds a manual English/Chinese/Japanese/Korean language selector (English by default), configurable SQLite thumbnail storage, repeated double-click navigation fixes, search result paths, and root-specific sharing commands. See the [release notes](docs/v0.7.7-part1.md).
 
-Latest published download: [Rust Explorer 0.7.7](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
+> [!WARNING]
+> **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
+
+Latest published download: [Rust Explorer 0.7.7 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7-part1). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
 
 ## Features
 

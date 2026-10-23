@@ -153,6 +153,7 @@ pub fn link_from_attributes(path: &Path, attributes: u32) -> bool {
 pub enum Sort {
     Name,
     Original,
+    Location,
     Deleted,
     Modified,
     Created,
@@ -181,6 +182,7 @@ pub fn sort(entries: &mut [Entry], column: Sort, descending: bool) {
         directory_order.then_with(|| {
             let (key_a, key_b) = (&keys[left], &keys[right]);
             let value = match column {
+                Sort::Location => a.path.parent().cmp(&b.path.parent()),
                 Sort::Name => key_a.cmp(key_b),
                 Sort::Modified => a.modified.cmp(&b.modified),
                 Sort::Created => a.created.cmp(&b.created),
@@ -918,8 +920,12 @@ mod tests {
 
 /// Atomically reserve the first available numbered folder, including gaps.
 pub fn create_numbered_folder(parent: &Path) -> std::io::Result<PathBuf> {
+    create_numbered_folder_named(parent, "新建文件夹")
+}
+/// UI supplies a localized default name; existing entries are never renamed.
+pub fn create_numbered_folder_named(parent: &Path, base: &str) -> std::io::Result<PathBuf> {
     for number in 1..=u32::MAX {
-        let path = parent.join(format!("新建文件夹 {number}"));
+        let path = parent.join(format!("{base} {number}"));
         match std::fs::create_dir(&path) {
             Ok(()) => return Ok(path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
