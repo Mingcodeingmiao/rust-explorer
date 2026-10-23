@@ -159,12 +159,23 @@ enum Preview {
     },
     Message(String),
 }
+/// Which area owns the current inline rename editor.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RenameSite {
+    #[default]
+    List,
+    Tree,
+}
 enum Dialog {
     NewFolder,
     Shortcut,
     Rename(PathBuf),
     RenameVolume {
         path: PathBuf,
+        initial: String,
+    },
+    /// Renaming "This PC": the inline editor sits on the navigation label.
+    RenameComputer {
         initial: String,
     },
     Delete(Vec<PathBuf>),
@@ -239,6 +250,10 @@ struct Explorer {
     thumbnails: rust_explorer::thumbnails::Loader,
     thumbnail_images: Entity<visual::ThumbnailImages>,
     thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
+    /// (listing generation, pixels) whose full-folder prefetch was already queued.
+    thumbnail_prefetch: std::cell::Cell<Option<(u64, u32)>>,
+    /// (listing generation, pixels) whose real per-item icons were already queued.
+    icon_prefetch: std::cell::Cell<Option<(u64, u32)>>,
     thumbnail_sync_queued: std::cell::Cell<bool>,
     hidden_breadcrumbs: std::cell::RefCell<Vec<(String, PathBuf)>>,
     view: ViewMode,
@@ -261,6 +276,13 @@ struct Explorer {
     reveal_pending: bool,
     reveal_scroll: Option<PathBuf>,
     pending_rename: bool,
+    /// Where the rename was started, so only that place shows the editor.
+    rename_site: RenameSite,
+    pending_rename_site: Option<RenameSite>,
+    /// Last area the user right-clicked in; a menu command renames there.
+    context_origin: RenameSite,
+    /// Explicit rename target coming from a context-menu command.
+    pending_rename_path: Option<PathBuf>,
     rename_token: u64,
     selected_at: Instant,
     templates: Vec<new_file::Template>,
@@ -303,6 +325,10 @@ struct Explorer {
     focus_item: Option<PathBuf>,
     pending_selection_click: Option<usize>,
     ctrl_open_selection: Option<(BTreeSet<usize>, Instant)>,
+    /// View state to apply once the listing of a back/forward/up target loads.
+    pending_restore: Option<rust_explorer::fs::HistoryState>,
+    /// Scroll row to restore when nothing was selected in the target folder.
+    pending_scroll_row: Option<f32>,
     file_drag: Option<FileDragState>,
     right_file_drag: Option<RightFileDrag>,
     pending_right_drop: Option<(Vec<PathBuf>, PathBuf)>,
@@ -559,9 +585,25 @@ impl Explorer {
                             this.navigate(PathBuf::from(typed), cx);
                             return;
                         }
+                        // Quick Access and the Recycle Bin have no filesystem
+                        // path: the address bar shows their display name, so
+                        // typing that name back has to return to the location
+                        // instead of probing the disk. A real relative entry
+                        // with the same name still wins.
+                        if let Some(path) =
+                            rust_explorer::shell_folder::resolve_named_location(typed)
+                            && !rust_explorer::path_completion::resolve_input(&this.dir(), typed)
+                                .is_some_and(|relative| relative.exists())
+                        {
+                            this.open_address_path(path, window, cx);
+                            return;
+                        }
                         let portable_display = typed.contains('\\')
                             && (typed.starts_with(&this.computer_name)
                                 || typed.starts_with("此电脑")
+                                // This PC's name is renamable, so a bin
+                                // breadcrumb is recognized by its second part.
+                                || rust_explorer::shell_folder::is_recycle_bin_address(typed)
                                 || this.volumes.iter().any(|volume| {
                                     volume.kind == 7 && typed.starts_with(&volume.label)
                                 }));
@@ -760,6 +802,8 @@ impl Explorer {
             thumbnails: rust_explorer::thumbnails::Loader::new(),
             thumbnail_images: visual::ThumbnailImages::new(cx),
             thumbnail_viewport: std::cell::Cell::new(None),
+            thumbnail_prefetch: std::cell::Cell::new(None),
+            icon_prefetch: std::cell::Cell::new(None),
             thumbnail_sync_queued: std::cell::Cell::new(false),
             hidden_breadcrumbs: std::cell::RefCell::new(Vec::new()),
             rows: vec![],
@@ -790,6 +834,10 @@ impl Explorer {
                 .unwrap_or_default(),
             reveal_scroll: None,
             pending_rename: false,
+            rename_site: RenameSite::List,
+            pending_rename_site: None,
+            context_origin: RenameSite::List,
+            pending_rename_path: None,
             rename_token: 0,
             selected_at: Instant::now(),
             templates: vec![],
@@ -840,6 +888,8 @@ impl Explorer {
             focus_item: None,
             pending_selection_click: None,
             ctrl_open_selection: None,
+            pending_restore: None,
+            pending_scroll_row: None,
             file_drag: None,
             right_file_drag: None,
             pending_right_drop: None,
@@ -1154,6 +1204,11 @@ impl Explorer {
             self.view = ViewMode::Tiles;
             self.group.clear();
         }
+        // Remember where the folder we are leaving was scrolled to and what was
+        // selected there; going back restores both, like Explorer.
+        self.remember_history_state();
+        self.pending_restore = None;
+        self.pending_scroll_row = None;
         self.tabs[self.active].history.push(path);
         if self.settings.expand_current {
             self.expand_to_current(cx);
@@ -1232,6 +1287,11 @@ impl Explorer {
         self.clear_preview();
         let query = self.tabs[self.active].query.clone();
         if navigation::is_app_virtual(&path) && query.trim().is_empty() {
+            // The virtual pages are built synchronously and have no listing to
+            // restore into; drop any pending history state so a later refresh
+            // cannot apply it to the wrong folder.
+            self.pending_restore = None;
+            self.pending_scroll_row = None;
             self.loading = false;
             self.watcher = None;
             self.sync_computer_entries();
@@ -1385,6 +1445,7 @@ impl Explorer {
                                     this.storage_volumes.push(Volume {
                                         path: entry.path.clone(),
                                         label: entry.name.clone(),
+                                        name: entry.name.clone(),
                                         kind: 8,
                                         total: Some(total),
                                         free: Some(free),
@@ -1427,6 +1488,29 @@ impl Explorer {
                             {
                                 this.selected.insert(index);
                                 this.pending_rename = true;
+                            }
+                        }
+                        // Back/forward/up: reselect what was selected here and
+                        // scroll back to it (or to the remembered row).
+                        if let Some(restore) = this.pending_restore.take() {
+                            for path in &restore.selection {
+                                if let Some(index) =
+                                    this.entries.iter().position(|entry| &entry.path == path)
+                                {
+                                    this.selected.insert(index);
+                                }
+                            }
+                            let focus = restore.focus.as_ref().and_then(|path| {
+                                this.entries.iter().position(|entry| &entry.path == path)
+                            });
+                            if let Some(index) = focus {
+                                this.selected.insert(index);
+                                this.anchor = index;
+                                this.focus_item = Some(this.entries[index].path.clone());
+                                this.keyboard_cursor = this.focus_item.clone();
+                                this.reveal_scroll = this.focus_item.clone();
+                            } else if restore.row > 0. {
+                                this.pending_scroll_row = Some(restore.row);
                             }
                         }
                         this.status = status;
@@ -1662,6 +1746,9 @@ impl Explorer {
     /// Ctrl+double-click opens every selected file and opens every selected
     /// folder in its own window. Ctrl+single-click keeps toggling selection.
     fn open_tab_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.focus_existing_tab(&path, cx) {
+            return;
+        }
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
@@ -1670,6 +1757,24 @@ impl Explorer {
             reveal_targets: Vec::new(),
         });
         self.switch_tab(self.tabs.len() - 1, cx);
+    }
+    /// When enabled, opening a folder in a new tab goes to a tab that already
+    /// shows it instead of duplicating the folder.
+    fn focus_existing_tab(&mut self, path: &std::path::Path, cx: &mut Context<Self>) -> bool {
+        if !self.settings.focus_existing_tab {
+            return false;
+        }
+        let Some(index) = self
+            .tabs
+            .iter()
+            .position(|tab| tab.history.current() == path)
+        else {
+            return false;
+        };
+        if index != self.active {
+            self.switch_tab(index, cx);
+        }
+        true
     }
     fn open_entry(&mut self, entry: Entry, cx: &mut Context<Self>) {
         let disposition = rust_explorer::open_target::folder_disposition(
@@ -1697,6 +1802,9 @@ impl Explorer {
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
             OpenDisposition::Tab => {
+                if self.focus_existing_tab(&path, cx) {
+                    return;
+                }
                 self.tabs.push(tab);
                 self.switch_tab(self.tabs.len() - 1, cx);
             }
@@ -2114,12 +2222,15 @@ impl Explorer {
                 }
                 if result.as_ref().is_ok_and(|s| s == "rename") {
                     if let Some(path) = menu_paths.first() {
+                        this.pending_rename_path = Some(path.clone());
+                        this.pending_rename_site = Some(this.context_origin);
                         if let Some(index) = this.entries.iter().position(|e| &e.path == path) {
                             this.selected.clear();
                             this.selected.insert(index);
-                        } else if let Some(parent) = path.parent() {
+                        } else if path.parent().is_some_and(|parent| parent != path) {
+                            // Reveal the item where it lives, then rename it there.
                             this.pending_select = Some(path.clone());
-                            this.navigate(parent.to_path_buf(), cx);
+                            this.navigate(path.parent().unwrap_or(path).to_path_buf(), cx);
                             return;
                         }
                     }
@@ -2167,6 +2278,7 @@ impl Explorer {
         if self.busy {
             return;
         }
+        self.context_origin = RenameSite::List;
         rust_explorer::shell::menu_trace(format!(
             "app: menu() rb_down={}",
             (unsafe {
@@ -2408,8 +2520,15 @@ impl Explorer {
         }
     }
     fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        // Renaming a drive or "This PC" is valid on the virtual pages too (that is
+        // where those names live); creating items is not.
+        let rename = matches!(
+            dialog,
+            Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+        );
         if navigation::is_virtual(&self.dir())
             && (self.is_home() || matches!(dialog, Dialog::NewFolder | Dialog::Shortcut))
+            && !rename
         {
             return;
         }
@@ -2447,6 +2566,7 @@ impl Explorer {
         }
         let name = match &dialog {
             Dialog::RenameVolume { initial, .. } => initial.clone(),
+            Dialog::RenameComputer { initial } => initial.clone(),
             Dialog::Rename(path) => {
                 if rust_explorer::shell_folder::is_shell_path(path) {
                     self.selected
@@ -2473,8 +2593,13 @@ impl Explorer {
                 String::new()
             }
         };
-        if let Dialog::Rename(path) = &dialog {
-            self.inline_rename = Some(path.clone());
+        match &dialog {
+            Dialog::Rename(path) => self.inline_rename = Some(path.clone()),
+            Dialog::RenameVolume { path, .. } => self.inline_rename = Some(path.clone()),
+            Dialog::RenameComputer { .. } => {
+                self.inline_rename = Some(rust_explorer::volumes::computer())
+            }
+            _ => {}
         }
         self.dialog = Some(dialog);
         let directory = if let Some(Dialog::Rename(path)) = &self.dialog {
@@ -2486,10 +2611,19 @@ impl Explorer {
             false
         };
         self.dialog_input.update(cx, |v, cx| {
-            v.compact = matches!(&self.dialog, Some(Dialog::Rename(_)));
+            // Inline editors all use the compact input: it fills the overlay box and
+            // keeps the text vertically centred instead of overflowing downwards.
+            v.compact = matches!(
+                &self.dialog,
+                Some(
+                    Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+                )
+            );
             v.double_click_select_all = matches!(
                 &self.dialog,
-                Some(Dialog::Rename(_) | Dialog::RenameVolume { .. })
+                Some(
+                    Dialog::Rename(_) | Dialog::RenameVolume { .. } | Dialog::RenameComputer { .. }
+                )
             );
             v.set_value(name, cx);
             if matches!(&self.dialog, Some(Dialog::Rename(_))) {
@@ -2592,7 +2726,20 @@ impl Explorer {
             }
             Dialog::RenameVolume { path, initial } => {
                 if name != initial {
+                    // The volume list refreshes every few seconds, so the new label
+                    // appears once the elevated helper finishes.
                     self.run_shell(shell::Request::RenameVolume { path, label: name }, cx);
+                }
+            }
+            Dialog::RenameComputer { initial } => {
+                if name.trim() != initial {
+                    self.run_shell(
+                        shell::Request::RenameComputer {
+                            dark: self.theme.dark,
+                            name: Some(name),
+                        },
+                        cx,
+                    );
                 }
             }
             Dialog::NewFolder => {
@@ -2618,61 +2765,99 @@ impl Explorer {
             }
         }
     }
+    /// Anchored inline editor for labels outside the file list (navigation rows and
+    /// drive tiles). It mirrors the list's rename overlay: an accent-bordered box
+    /// drawn over the label, so a long name cannot relayout the row or the tile.
+    fn inline_rename_overlay(&self, id: (&'static str, usize), width: f32) -> AnyElement {
+        div()
+            .relative()
+            .w(ui(width.max(24.)))
+            .h(ui(22.))
+            .flex_shrink_0()
+            .child(
+                gpui::deferred(
+                    gpui::anchored().snap_to_window().child(
+                        div()
+                            .id(id)
+                            .w(ui(width.clamp(80., 360.)))
+                            .h(ui(24.))
+                            .bg(rgb(self.theme.input))
+                            .border_1()
+                            .border_color(rgb(self.theme.accent))
+                            .child(self.dialog_input.clone())
+                            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
+                    ),
+                )
+                .with_priority(1),
+            )
+            .into_any_element()
+    }
     fn rename_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.selected.len() == 1 {
-            if let Some(path) = self.paths().first().cloned() {
-                if volume_label::is_drive_root(&path) {
-                    if self.busy || self.dialog.is_some() || self.options.is_some() {
-                        return;
-                    }
-                    self.busy = true;
-                    let request = shell::Request::VolumeLabel { path: path.clone() };
-                    let task = cx.background_executor().spawn(async move {
-                        volumes::bounded::<volume_label::VolumeLabel>(
-                            "--shell",
-                            &serde_json::to_string(&request)?,
-                            Duration::from_secs(5),
-                        )
-                    });
-                    cx.spawn(async move |view, cx| {
-                        let result = task.await;
-                        let _ = view.update(cx, |v, cx| {
-                            v.busy = false;
-                            match result {
-                                Ok(label) if !label.read_only => {
-                                    let entity = cx.entity().downgrade();
-                                    let own = v.own_window;
-                                    cx.defer(move |cx| {
-                                        if let Some(own) = own {
-                                            let _ = own.update(cx, |_, w, cx| {
-                                                let _ = entity.update(cx, |v, cx| {
-                                                    if v.dialog.is_none() && v.options.is_none() {
-                                                        v.show_dialog(
-                                                            Dialog::RenameVolume {
-                                                                path,
-                                                                initial: label.label,
-                                                            },
-                                                            w,
-                                                            cx,
-                                                        );
-                                                    }
-                                                });
-                                            });
-                                        }
-                                    });
-                                }
-                                Ok(_) => v.error = Some("此驱动器是只读的".into()),
-                                Err(error) => v.error = Some(error.to_string()),
-                            }
-                            cx.notify();
-                        });
-                    })
-                    .detach();
-                    cx.notify();
-                } else {
-                    self.show_dialog(Dialog::Rename(path), window, cx);
-                }
+        let site = self.pending_rename_site.take().unwrap_or(RenameSite::List);
+        // A menu command names its target explicitly (the tree can rename a drive
+        // that is not part of the current listing).
+        if let Some(path) = self.pending_rename_path.take() {
+            self.begin_inline_rename(path, site, window, cx);
+            return;
+        }
+        // F2 with the navigation tree focused renames the focused drive or "This PC";
+        // with the list focused the selected drive/item is renamed instead.
+        if self.keyboard_focus_region == 3 && self.nav_focus.is_focused(window) {
+            let target = self
+                .nav_rows()
+                .get(self.nav_keyboard_index)
+                .map(|row| row.path.clone())
+                .filter(|path| {
+                    rust_explorer::volumes::is_computer(path) || volume_label::is_drive_root(path)
+                });
+            if let Some(path) = target {
+                self.begin_inline_rename(path, RenameSite::Tree, window, cx);
+                return;
             }
+        }
+        if self.selected.len() != 1 {
+            return;
+        }
+        let Some(entry) = self
+            .selected
+            .first()
+            .and_then(|index| self.entries.get(*index))
+            .cloned()
+        else {
+            return;
+        };
+        self.begin_inline_rename(entry.path, RenameSite::List, window, cx);
+    }
+    /// Start an in-place rename: the editor appears at the item's own label (file
+    /// rows, drive tiles and navigation rows all render `inline_rename`), but only
+    /// in the area the rename was started from.
+    fn begin_inline_rename(
+        &mut self,
+        path: PathBuf,
+        site: RenameSite,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.busy || self.options.is_some() || self.dialog.is_some() {
+            return;
+        }
+        self.rename_site = site;
+        if rust_explorer::volumes::is_computer(&path) {
+            let initial = self.computer_name.clone();
+            self.show_dialog(Dialog::RenameComputer { initial }, window, cx);
+        } else if volume_label::is_drive_root(&path) {
+            let volume = self.volumes.iter().find(|volume| volume.path == path);
+            if volume.is_some_and(|volume| volume.read_only) {
+                self.error = Some("此驱动器是只读的".into());
+                cx.notify();
+                return;
+            }
+            let initial = volume
+                .map(rust_explorer::volumes::rename_initial)
+                .unwrap_or_default();
+            self.show_dialog(Dialog::RenameVolume { path, initial }, window, cx);
+        } else {
+            self.show_dialog(Dialog::Rename(path), window, cx);
         }
     }
     fn delete_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2951,6 +3136,89 @@ impl Explorer {
         }
         cx.notify();
     }
+    /// First visible row, in row units, for the current view.
+    fn scroll_row(&self) -> f32 {
+        if self.high_performance_active() {
+            self.high_performance_row.get()
+        } else {
+            let offset = self.list_scroll.logical_scroll_top();
+            let height = (self.estimated_row_height() * self.zoom).max(1.);
+            offset.item_ix as f32 + f32::from(offset.offset_in_item) / height
+        }
+    }
+    fn history_state(&self) -> rust_explorer::fs::HistoryState {
+        let focus = self.focus_item.clone().or_else(|| {
+            self.selected
+                .iter()
+                .next()
+                .and_then(|index| self.entries.get(*index))
+                .map(|entry| entry.path.clone())
+        });
+        rust_explorer::fs::HistoryState {
+            row: self.scroll_row(),
+            focus,
+            selection: self.paths(),
+        }
+    }
+    /// Store the current scroll position and selection on the entry being left.
+    fn remember_history_state(&mut self) {
+        let state = self.history_state();
+        self.tabs[self.active].history.remember(state);
+    }
+    fn apply_remembered_state(&mut self) {
+        self.pending_restore = self.tabs[self.active].history.state();
+        self.pending_scroll_row = None;
+    }
+    fn go_back(&mut self, cx: &mut Context<Self>) {
+        self.remember_history_state();
+        if self.tabs[self.active].history.back() {
+            self.apply_remembered_state();
+            self.reload(cx);
+        }
+    }
+    fn go_forward(&mut self, cx: &mut Context<Self>) {
+        self.remember_history_state();
+        if self.tabs[self.active].history.forward() {
+            self.apply_remembered_state();
+            self.reload(cx);
+        }
+    }
+    fn can_go_up(&self) -> bool {
+        !navigation::is_app_virtual(&self.dir())
+    }
+    /// Selecting the folder that was just left, the way Explorer does after `↑`.
+    fn focus_after_load(&mut self, path: PathBuf) {
+        if navigation::is_app_virtual(&self.dir()) {
+            return;
+        }
+        self.pending_restore = Some(rust_explorer::fs::HistoryState {
+            row: 0.,
+            focus: Some(path.clone()),
+            selection: vec![path],
+        });
+        self.pending_scroll_row = None;
+    }
+    /// The folder on the way to the current directory that sits directly under
+    /// `target`. Navigating to an ancestor (breadcrumb click, `↑`) selects it,
+    /// matching Explorer.
+    fn child_towards_current(&self, target: &std::path::Path) -> Option<PathBuf> {
+        let dir = self.dir();
+        if navigation::is_shell_folder(&dir) {
+            let index = self
+                .shell_chain
+                .iter()
+                .position(|(_, path)| path == target)?;
+            return self
+                .shell_chain
+                .get(index + 1)
+                .map(|(_, path)| path.clone());
+        }
+        if volumes::is_computer(target) {
+            let root = dir.ancestors().last().map(PathBuf::from)?;
+            return (root != dir).then_some(root);
+        }
+        fs::child_towards(&dir, target)
+    }
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let path = self.dir();
         if navigation::is_app_virtual(&path) {
@@ -2961,9 +3229,11 @@ impl Explorer {
                 rust_explorer::shell_folder::parent_from_chain(&path, &self.shell_chain)
             {
                 self.navigate(parent, cx);
+                self.focus_after_load(path);
                 return;
             }
             let generation = self.generation;
+            let child = path.clone();
             let task = cx.background_executor().spawn(async move {
                 let request = serde_json::to_string(&path)?;
                 volumes::bounded::<PathBuf>("--shell-parent", &request, Duration::from_secs(5))
@@ -2975,7 +3245,10 @@ impl Explorer {
                         return;
                     }
                     match result {
-                        Ok(parent) => v.navigate(parent, cx),
+                        Ok(parent) => {
+                            v.navigate(parent, cx);
+                            v.focus_after_load(child);
+                        }
                         Err(error) => {
                             v.error = Some(error.to_string());
                             cx.notify();
@@ -2991,6 +3264,7 @@ impl Explorer {
                     .unwrap_or_else(volumes::computer),
                 cx,
             );
+            self.focus_after_load(path);
         }
     }
 
@@ -3269,7 +3543,16 @@ impl Render for Explorer {
                 }
             }
         }
+        if let Some(row) = self.pending_scroll_row.take() {
+            // Nothing was selected in the folder we came back to: restore only the
+            // scroll position.
+            let max = self.rows.len().saturating_sub(1) as f32;
+            let row = row.clamp(0., max);
+            self.high_performance_row.set(row);
+            self.set_list_scroll_row(row);
+        }
         self.sync_thumbnails();
+        self.prefetch_entry_icons();
         let recycle = self.settings.high_performance
             && !matches!(
                 self.view,
@@ -3355,6 +3638,24 @@ impl Render for Explorer {
             .on_action(cx.listener(|v, action: &NavigateFiles, w, cx| {
                 v.key_navigate(action.step.clone(), action.extend, action.focus_only, w, cx);
             }))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|v, _, _, cx| {
+                    if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                        return;
+                    }
+                    v.go_back(cx);
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|v, _, _, cx| {
+                    if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
+                        return;
+                    }
+                    v.go_forward(cx);
+                }),
+            )
             .on_action(cx.listener(|v, action: &ActivateNumberedTab, _, cx| {
                 if v.options.is_none() && v.dialog.is_none() && !v.tabs.is_empty() {
                     let index = action.index;
@@ -3495,17 +3796,13 @@ impl Render for Explorer {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                if v.tabs[v.active].history.back() {
-                    v.reload(cx);
-                }
+                v.go_back(cx);
             }))
             .on_action(cx.listener(|v, _: &Forward, _, cx| {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
-                if v.tabs[v.active].history.forward() {
-                    v.reload(cx);
-                }
+                v.go_forward(cx);
             }))
             .on_action(cx.listener(|v, _: &Up, _, cx| {
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
@@ -3951,17 +4248,16 @@ impl Render for Explorer {
             ("up", "↑"),
             ("refresh", "⟳"),
         ] {
+            // Unavailable navigation is greyed out and does nothing when clicked.
+            let enabled = match id {
+                "back" => self.tabs[self.active].history.can_back(),
+                "forward" => self.tabs[self.active].history.can_forward(),
+                "up" => self.can_go_up(),
+                _ => true,
+            };
             let click = cx.listener(move |v, _, _, cx| match id {
-                "back" => {
-                    if v.tabs[v.active].history.back() {
-                        v.reload(cx);
-                    }
-                }
-                "forward" => {
-                    if v.tabs[v.active].history.forward() {
-                        v.reload(cx);
-                    }
-                }
+                "back" => v.go_back(cx),
+                "forward" => v.go_forward(cx),
                 "up" => v.go_up(cx),
                 _ => v.reload(cx),
             });
@@ -3981,7 +4277,9 @@ impl Render for Explorer {
                     .child(visual::icon_sized("refresh", t.text, 16.))
                     .on_click(click)
             } else {
-                button(id, label, t).on_click(click)
+                button(id, label, t)
+                    .when(!enabled, |d| d.opacity(0.35))
+                    .on_click(click)
             });
         }
         let address_width = (logical_width - 492.).max(80.);
@@ -4099,9 +4397,13 @@ impl Render for Explorer {
                 "new-folder" => !navigation::is_virtual(&self.dir()),
                 "paste" => self.can_paste(),
                 "rename" => {
+                    let drive = self
+                        .selected
+                        .first()
+                        .and_then(|index| self.entries.get(*index))
+                        .is_some_and(|entry| volume_label::is_drive_root(&entry.path));
                     self.selected.len() == 1
-                        && !self.is_home()
-                        && !navigation::is_shell_folder(&self.dir())
+                        && (drive || (!self.is_home() && !navigation::is_shell_folder(&self.dir())))
                 }
                 "share" => {
                     self.selected.len() == 1
@@ -4452,6 +4754,14 @@ impl Render for Explorer {
                                 if v.inline_rename.is_some() {
                                     return;
                                 }
+                            }
+                            // Double-clicking the empty area goes to the parent
+                            // folder. Item clicks stop propagation, so reaching this
+                            // handler means the pointer is not on an item.
+                            if e.click_count >= 2 {
+                                v.marquee = None;
+                                v.go_up(cx);
+                                return;
                             }
                             v.begin_marquee(e, w, cx);
                         }),
@@ -4981,6 +5291,9 @@ impl Render for Explorer {
                         false,
                     ),
                     Dialog::Rename(_) => ("重命名", "输入新的名称".to_owned(), false),
+                    Dialog::RenameComputer { .. } => {
+                        ("重命名此电脑", "输入新的名称".to_owned(), false)
+                    }
                     Dialog::RenameVolume { path, .. } => (
                         "重命名驱动器",
                         format!(

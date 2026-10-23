@@ -290,6 +290,9 @@ pub enum Request {
     },
     RenameComputer {
         dark: bool,
+        /// Collected by the inline editor; `None` falls back to the native prompt.
+        #[serde(default)]
+        name: Option<String>,
     },
     ComputerName,
     /// Read-only inventory; never display or invoke a Shell command.
@@ -1411,7 +1414,7 @@ pub fn dispatch(request: Request) -> Result<()> {
         }
         Request::AddNetworkLocation => add_network_location(),
         Request::InvokeVerb { paths, verb } => invoke_verb(&paths, &verb),
-        Request::RenameComputer { dark } => namespace_rename::computer(dark),
+        Request::RenameComputer { dark, name } => namespace_rename::computer(dark, name),
         Request::ComputerName => {
             println!("computer-name:{}", namespace_rename::computer_name()?);
             Ok(())
@@ -2702,6 +2705,19 @@ fn context_menu_options(
                     w!("固定到快速访问"),
                 )?;
             }
+            // Guarantee a rename entry: the window owns the name and shows its
+            // inline editor on the "This PC" label, whatever the Shell offers.
+            let native_rename = (0..GetMenuItemCount(Some(popup.0)))
+                .any(|index| verbs.verb(GetMenuItemID(popup.0, index)) == "rename");
+            if !native_rename {
+                InsertMenuW(
+                    popup.0,
+                    3,
+                    MF_BYPOSITION | MF_STRING,
+                    0x8005,
+                    w!("重命名(&M)"),
+                )?;
+            }
             InsertMenuW(
                 popup.0,
                 if native_quick_pin { 3 } else { 4 },
@@ -2767,6 +2783,7 @@ fn context_menu_options(
                 0x8001 => Some("computer-tab"),
                 0x8002 => Some("computer-window"),
                 0x8003 => Some("computer-pin"),
+                0x8005 => Some("computer-rename"),
                 _ => None,
             };
             if let Some(action) = action {
@@ -2800,15 +2817,16 @@ fn context_menu_options(
                 return Ok(output);
             }
             if computer && verb == "rename" {
-                namespace_rename::computer(dark.unwrap_or(false))?;
+                // The window owns the name: it shows an inline editor at the
+                // "This PC" label and sends the resulting name back.
+                emit!("command:computer-rename");
                 return Ok(output);
             }
-            if computer && matches!(verb.as_str(), "properties" | "rename" | "open" | "explore") {
+            if computer && matches!(verb.as_str(), "properties" | "open" | "explore") {
                 emit!(
                     "command:{}",
                     match verb.as_str() {
                         "properties" => "computer-properties",
-                        "rename" => "computer-rename",
                         _ => "computer-open",
                     }
                 );

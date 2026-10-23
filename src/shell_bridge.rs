@@ -187,7 +187,10 @@ mod tests {
                 observe,
                 &mut events as *mut _ as *mut c_void,
                 5,
-                40,
+                // A Shell browse session needs a moment to report "finished"; the
+                // former 40 ms budget lost the second event while the machine was
+                // still busy right after a build.
+                500,
             )
         };
         std::fs::remove_dir(folder).unwrap();

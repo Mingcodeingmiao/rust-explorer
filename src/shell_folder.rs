@@ -26,6 +26,8 @@ use windows::{
 };
 
 const THIS_PC: &str = "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}";
+const RECYCLE_BIN: &str = "shell:RecycleBinFolder";
+const RECYCLE_BIN_PARSING: &str = "::{645FF040-5081-101B-9F08-00AA002F954E}";
 const FMTID_STORAGE: GUID = GUID::from_u128(0xb725f130_47ef_101a_a5f1_02608c9eebac);
 const PKEY_SIZE: PROPERTYKEY = PROPERTYKEY {
     fmtid: FMTID_STORAGE,
@@ -377,9 +379,113 @@ fn enumerate(path: &Path) -> Result<Vec<IShellItem>> {
     enumerate_item(&item(path)?)
 }
 
+/// Whether a breadcrumb part is the display name of This PC.
+fn is_computer_label(part: &str, computer: &str) -> bool {
+    part.eq_ignore_ascii_case(computer)
+        || part.eq_ignore_ascii_case("此电脑")
+        || part.eq_ignore_ascii_case("this pc")
+}
+
+/// Whether a name is the Recycle Bin in any of its addresses.
+fn is_recycle_bin_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case(RECYCLE_BIN)
+        || name.eq_ignore_ascii_case(RECYCLE_BIN_PARSING)
+        || name.eq_ignore_ascii_case("回收站")
+        || name.eq_ignore_ascii_case("recycle bin")
+}
+
+/// A breadcrumb segment that is not a drive letter or a UNC share.
+fn is_label(part: &str) -> bool {
+    !part.ends_with(':') && !part.starts_with("\\\\")
+}
+
+/// Whether the address is a `This PC\Recycle Bin\…` breadcrumb. The leading
+/// name only ever comes from the breadcrumb, so it does not have to match the
+/// current (user-renamable) This PC name.
+pub fn is_recycle_bin_address(text: &str) -> bool {
+    let text = text.trim().trim_matches('"');
+    let mut parts = text
+        .split(['\\', '/'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty());
+    let Some(prefix) = parts.next() else {
+        return false;
+    };
+    is_label(prefix) && parts.next().is_some_and(is_recycle_bin_name)
+}
+
+/// Recycled items report their original full path as the display name while
+/// the listing shows only the last component, so both forms match.
+fn name_matches(display: &str, part: &str) -> bool {
+    display.eq_ignore_ascii_case(part)
+        || Path::new(display)
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().eq_ignore_ascii_case(part))
+}
+
+/// Locations that only ever appear as a display name, never as a path.
+fn named_location(name: &str) -> Option<PathBuf> {
+    if name.eq_ignore_ascii_case("::QuickAccess")
+        || name.eq_ignore_ascii_case("快速访问")
+        || name.eq_ignore_ascii_case("quick access")
+    {
+        return Some(PathBuf::from("::QuickAccess"));
+    }
+    if is_recycle_bin_name(name) {
+        return Some(PathBuf::from(RECYCLE_BIN));
+    }
+    if name.eq_ignore_ascii_case("::ThisPC")
+        || name.eq_ignore_ascii_case("此电脑")
+        || name.eq_ignore_ascii_case("this pc")
+    {
+        return Some(crate::volumes::computer());
+    }
+    if name.eq_ignore_ascii_case("::Network")
+        || name.eq_ignore_ascii_case("网络")
+        || name.eq_ignore_ascii_case("network")
+    {
+        return Some(PathBuf::from("::Network"));
+    }
+    if name.eq_ignore_ascii_case("::Libraries")
+        || name.eq_ignore_ascii_case("库")
+        || name.eq_ignore_ascii_case("libraries")
+    {
+        return Some(PathBuf::from("::Libraries"));
+    }
+    None
+}
+
+/// Map an address-bar display name back to the location it belongs to.
+///
+/// Quick Access and the Recycle Bin have no filesystem path, so their address
+/// bar only shows a localized name (`快速访问`, `此电脑\回收站`). Typing that
+/// name back has to return to the location; otherwise the text is resolved
+/// against the disk and the navigation fails. The breadcrumb prefix is This
+/// PC's display name, which the user may rename (and the cached name may
+/// lag behind), so it is not required to match: only the location name is.
+/// Deeper namespace addresses (`此电脑\回收站\子文件夹`) are handled by
+/// [`resolve_display_path`] instead.
+pub fn resolve_named_location(text: &str) -> Option<PathBuf> {
+    let text = text.trim().trim_matches('"').trim();
+    if text.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = text
+        .split(['\\', '/'])
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    match parts.as_slice() {
+        [name] => named_location(name),
+        [prefix, name] if is_label(prefix) => named_location(name),
+        _ => None,
+    }
+}
+
 /// Resolve an address-bar path. Filesystem paths are handled by the caller;
 /// this resolves the `This PC\device\storage\folder` form used for portable
-/// devices, plus `mtp:` and `mtp://` PIDL addresses.
+/// devices, the `This PC\Recycle Bin\folder` form used inside the bin, plus
+/// `mtp:` and `mtp://` PIDL addresses.
 pub fn resolve_display_path(text: &str) -> Result<PathBuf> {
     let text = text.trim().trim_matches('"').trim();
     if let Some(hex) = text.strip_prefix("mtp://") {
@@ -408,28 +514,56 @@ pub fn resolve_display_path(text: &str) -> Result<PathBuf> {
         .collect();
     if parts
         .first()
-        .is_some_and(|part| part.eq_ignore_ascii_case(&root_name) || *part == "此电脑")
+        .is_some_and(|part| is_computer_label(part, &root_name))
     {
+        parts.remove(0);
+    }
+    let bin = item(Path::new(RECYCLE_BIN)).ok();
+    let bin_name = bin
+        .as_ref()
+        .and_then(|bin| unsafe { display_name(bin, SIGDN_NORMALDISPLAY) })
+        .unwrap_or_default();
+    let is_bin = |part: &str| part.eq_ignore_ascii_case(&bin_name) || is_recycle_bin_name(part);
+    // This PC's display name is user-renamable and a cached address may still
+    // carry the old one, so a label followed by the bin is accepted as well.
+    if parts.len() >= 2 && is_label(parts[0]) && is_bin(parts[1]) {
         parts.remove(0);
     }
     if parts.is_empty() {
         return Ok(PathBuf::from(THIS_PC));
     }
     let mut current = root;
+    // The Recycle Bin is a desktop child, not a child of This PC, so its
+    // displayed name becomes the namespace anchor for `\Recycle Bin\…`.
+    let mut recycle = false;
+    if let Some(first) = parts.first().copied() {
+        if let Some(bin) = bin
+            && is_bin(first)
+        {
+            recycle = true;
+            current = bin;
+            parts.remove(0);
+        }
+    }
+    if parts.is_empty() {
+        return Ok(PathBuf::from(if recycle { RECYCLE_BIN } else { THIS_PC }));
+    }
     let mut entered = 0;
     for part in parts {
         let children = enumerate_item(&current)?;
         let Some(child) = children.into_iter().find(|child| {
             unsafe { display_name(child, SIGDN_NORMALDISPLAY) }
-                .is_some_and(|name| name.eq_ignore_ascii_case(part))
+                .is_some_and(|name| name_matches(&name, part))
         }) else {
-            anyhow::bail!("在便携设备中找不到“{part}”");
+            anyhow::bail!("找不到“{part}”");
         };
         current = child;
         entered += 1;
     }
     let pidl = unsafe { item_pidl(&current) }?;
-    Ok(if entered == 1 {
+    Ok(if recycle {
+        encode_pidl_with_prefix(&pidl, "recycle:")
+    } else if entered == 1 {
         encode_device_pidl(&pidl)
     } else {
         encode_pidl(&pidl)
@@ -441,13 +575,18 @@ pub fn list(path: &Path) -> Result<Listing> {
     let _com = Com::new()?;
     let root = item(path)?;
     let items = enumerate(path)?;
-    let name = unsafe { display_name(&root, SIGDN_NORMALDISPLAY) }
+    let recycle = is_recycle_bin_path(path);
+    let mut name = unsafe { display_name(&root, SIGDN_NORMALDISPLAY) }
         .or_else(|| {
             path.file_name()
                 .map(|value| value.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "便携设备".into());
-    let recycle = is_recycle_bin_path(path);
+    if recycle && let Some(filename) = Path::new(&name).file_name() {
+        // A recycled folder reports its original full path as the display
+        // name; the listing, title and address bar only show its own name.
+        name = filename.to_string_lossy().into_owned();
+    }
     let entries = items
         .iter()
         .filter_map(|item| item_entry(item).map(|entry| (item, entry)))
@@ -515,7 +654,12 @@ pub fn list(path: &Path) -> Result<Listing> {
                 parents.drain(..index);
             }
         }
-        for (_, p) in &mut parents {
+        for (name, p) in &mut parents {
+            // A recycled folder's display name is its original full path, but
+            // the breadcrumb must only ever show the last component.
+            if let Some(filename) = Path::new(name).file_name() {
+                *name = filename.to_string_lossy().into_owned();
+            }
             if let Some(bytes) = decode_pidl(p) {
                 *p = encode_pidl_with_prefix(&bytes, "recycle:");
             }
@@ -562,14 +706,19 @@ pub fn device_paths() -> Result<Vec<(String, PathBuf)>> {
 
 /// Shell parsing names used by portable devices are not filesystem paths.
 pub fn is_shell_path(path: &Path) -> bool {
+    is_namespace_item(path) || {
+        let value = path.to_string_lossy();
+        value.starts_with("\\\\?\\") || value.starts_with("\\\\.\\")
+    }
+}
+/// Shell namespace items that are cached like files but have no path to stat.
+pub fn is_namespace_item(path: &Path) -> bool {
     let value = path.to_string_lossy();
     value.starts_with("mtp:")
         || value.starts_with("recycle:")
         || value.starts_with("mtp-root:")
         || value.starts_with("::{")
         || value.starts_with("shell:")
-        || value.starts_with("\\\\?\\")
-        || value.starts_with("\\\\.\\")
 }
 pub fn is_recycle_bin_path(path: &Path) -> bool {
     let value = path.to_string_lossy();
@@ -698,6 +847,56 @@ mod tests {
         ];
         assert_eq!(parent_from_chain(&child, &chain), Some(root));
         assert_eq!(decode_pidl(&child), Some(vec![2, 0, 2, 0]));
+    }
+
+    #[test]
+    fn displayed_address_names_return_to_their_location() {
+        let fast = Some(PathBuf::from("::QuickAccess"));
+        assert_eq!(resolve_named_location("快速访问"), fast);
+        assert_eq!(resolve_named_location(r"此电脑\快速访问"), fast);
+        assert_eq!(resolve_named_location("::QuickAccess"), fast);
+        assert_eq!(resolve_named_location(" Quick Access "), fast);
+        let bin = Some(PathBuf::from("shell:RecycleBinFolder"));
+        assert_eq!(resolve_named_location("回收站"), bin);
+        assert_eq!(resolve_named_location(r"我的电脑\回收站"), bin);
+        assert_eq!(resolve_named_location("Recycle Bin"), bin);
+        // This PC can be renamed, so the breadcrumb prefix is not trusted; the
+        // location name is what matters.
+        assert_eq!(resolve_named_location(r"此电脑222\回收站"), bin);
+        assert_eq!(resolve_named_location("DESKTOP-ABC\\回收站"), bin);
+        assert_eq!(resolve_named_location(r"此电脑222\快速访问"), fast);
+        assert_eq!(
+            resolve_named_location("::{645FF040-5081-101B-9F08-00AA002F954E}"),
+            bin
+        );
+        assert_eq!(
+            resolve_named_location("此电脑"),
+            Some(crate::volumes::computer())
+        );
+        assert_eq!(
+            resolve_named_location("网络"),
+            Some(PathBuf::from("::Network"))
+        );
+        // Deeper namespace addresses and normal paths keep the resolver below.
+        assert_eq!(resolve_named_location(r"此电脑\回收站\目录"), None);
+        assert_eq!(resolve_named_location(r"D:\报告"), None);
+        assert_eq!(resolve_named_location(r"D:\回收站"), None);
+        assert_eq!(resolve_named_location("C:\\"), None);
+        assert_eq!(resolve_named_location("recycle:00001400"), None);
+        assert_eq!(resolve_named_location(""), None);
+    }
+
+    #[test]
+    fn recycle_bin_breadcrumbs_are_recognized_by_their_second_part() {
+        assert!(is_recycle_bin_address(r"此电脑222\回收站"));
+        assert!(is_recycle_bin_address(r"此电脑222\回收站\目录"));
+        assert!(is_recycle_bin_address(r"此电脑\回收站\目录\子目录"));
+        assert!(!is_recycle_bin_address("回收站"));
+        assert!(!is_recycle_bin_address(r"D:\回收站"));
+        assert!(!is_recycle_bin_address(r"D:\回收站\目录"));
+        assert!(!is_recycle_bin_address(r"D:\报告"));
+        assert!(!is_recycle_bin_address("C:\\"));
+        assert!(!is_recycle_bin_address(""));
     }
 
     #[test]

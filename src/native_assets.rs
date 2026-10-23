@@ -22,7 +22,30 @@ pub struct IconRequest {
     #[serde(default)]
     pub epoch: u64,
 }
+/// Upper bound for the background icon queue of one folder. Every entry still gets
+/// its icon when it becomes visible; this only pre-resolves the first N real icons.
+pub const ICON_PREFETCH_LIMIT: usize = 3000;
 impl IconRequest {
+    /// Whether this item resolves an icon of its own (an executable, a shortcut, a
+    /// drive root) instead of a shared type icon. Used to queue a folder's real icons
+    /// ahead of scrolling.
+    pub fn needs_own_icon(path: &Path, directory: bool) -> bool {
+        if path.to_string_lossy().starts_with("mtp-root:") {
+            return true;
+        }
+        if directory {
+            return path.has_root() && path.parent().is_none();
+        }
+        path.is_absolute()
+            && matches!(
+                path.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "exe" | "lnk" | "url" | "ico" | "cur"
+            )
+    }
     pub fn ui(name: &str, pixels: u32) -> Self {
         Self {
             name: name.into(),
@@ -37,12 +60,16 @@ impl IconRequest {
         // handlers. Portable-device child folders/files use generic stock icons
         // so a phone folder does not issue one slow Shell icon request each.
         let shell_root = path.to_string_lossy().starts_with("mtp-root:");
-        // This constructor runs during GUI layout. Even probing desktop.ini can
-        // block on disconnected drives, so folder customization is resolved only
-        // by the bounded provider helper, using the actual path as its key.
-        let custom_folder = directory && path.is_absolute();
+        let drive_root = directory && path.has_root() && path.parent().is_none();
+        // Only folders that declare their own artwork (`C:\Windows\Offline Web
+        // Pages` and other shell folders) need a per-path Shell lookup. Every other
+        // folder shares one cached stock icon, so dragging through a folder such as
+        // WinSxS never waits for the icon helper. The check runs once per folder and
+        // is remembered for this process.
+        let custom_folder = directory && path.is_absolute() && folder_has_own_artwork(path);
         let per_item = shell_root
             || custom_folder
+            || drive_root
             || (path.is_absolute()
                 && matches!(
                     path.extension()
@@ -52,7 +79,7 @@ impl IconRequest {
                         .as_str(),
                     "exe" | "lnk" | "url" | "ico" | "cur"
                 ));
-        let key = if per_item || (directory && path.has_root() && path.parent().is_none()) {
+        let key = if per_item {
             path.to_path_buf()
         } else if directory {
             PathBuf::from("folder")
@@ -70,10 +97,11 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            epoch: if shell_root
-                || custom_folder
-                || (directory && path.has_root() && path.parent().is_none())
-            {
+            // A drive icon is cached under a stable key so a new process can paint it
+            // from disk on the first frame (an outdated badge is better than a blank
+            // square; "clear cache" refreshes it). Artwork folders and portable-device
+            // roots keep the time bucket because their icon can change on its own.
+            epoch: if shell_root || custom_folder {
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
@@ -84,6 +112,34 @@ impl IconRequest {
             },
         }
     }
+}
+/// The already generated icon for this request, if any. Read from disk without a
+/// helper round trip so a restarted application paints cached icons immediately.
+pub fn cached_icon_path(key: &IconRequest) -> Option<PathBuf> {
+    icon_cache_path(key).ok().filter(|path| path.is_file())
+}
+/// Whether a folder declares its own icon/class in `desktop.ini`. Memoized for the
+/// process: the answer only changes when the folder changes, and a long listing asks
+/// once per folder. Cheap enough to run while laying out a row (~10 µs), and it keeps
+/// the common case on the shared cached folder icon.
+fn folder_has_own_artwork(path: &Path) -> bool {
+    use std::cell::RefCell;
+    thread_local! {
+        static CACHE: RefCell<std::collections::HashMap<PathBuf, bool>> =
+            RefCell::new(std::collections::HashMap::new());
+    }
+    CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(found) = cache.get(path) {
+            return *found;
+        }
+        if cache.len() >= 32768 {
+            cache.clear();
+        }
+        let found = crate::system_icons::folder_has_custom_icon(path);
+        cache.insert(path.to_path_buf(), found);
+        found
+    })
 }
 #[derive(Clone, Copy, Serialize, Deserialize, Hash)]
 pub enum PreviewKind {
@@ -115,14 +171,29 @@ pub struct PreviewAsset {
     pub pages: u32,
     pub elapsed_ms: u128,
 }
+/// One cached thumbnail: the content-addressed PNG plus the decorations that
+/// belong to this *item*. A link badge or a photo resolution is not part of the
+/// image, so entries sharing one PNG still keep their own presentation.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ThumbnailAsset {
+    pub image: PathBuf,
+    pub presentation: crate::thumbnails::Presentation,
+}
 #[derive(Serialize, Deserialize)]
 enum Response {
     ShortcutTarget(PathBuf),
-    Thumbnail(PathBuf),
+    Thumbnail(ThumbnailAsset),
     ThumbnailError(String),
     Preview(PreviewAsset),
     Icons(Vec<Option<PathBuf>>),
 }
+
+/// Thumbnails are stored under the SHA-256 of their PNG bytes, so every item
+/// that renders the same image shares one file. The per-item index keeps the
+/// mapping and is what a cache hit reads.
+const THUMBNAIL_DIR: &str = "thumbnails-v7";
+const LEGACY_THUMBNAIL_DIR: &str = "thumbnails-v6";
+const ICON_DIR: &str = "icons-v2";
 
 fn cache_root() -> PathBuf {
     std::env::var_os("LOCALAPPDATA")
@@ -147,7 +218,12 @@ fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
     );
     let mut removed = 0;
     let mut failed = 0;
-    for folder in [root.to_path_buf(), root.join("thumbnails-v6")] {
+    for folder in [
+        root.to_path_buf(),
+        root.join(THUMBNAIL_DIR),
+        root.join(LEGACY_THUMBNAIL_DIR),
+        root.join(ICON_DIR),
+    ] {
         let Ok(metadata) = std::fs::symlink_metadata(&folder) else {
             continue;
         };
@@ -168,7 +244,7 @@ fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
             }
             if !matches!(
                 entry.path().extension().and_then(|s| s.to_str()),
-                Some("png" | "tmp")
+                Some("png" | "json" | "tmp")
             ) {
                 continue;
             }
@@ -188,34 +264,96 @@ fn cache_path(key: impl Hash) -> Result<PathBuf> {
     Ok(root.join(format!("{:016x}.png", hash.finish())))
 }
 
-fn thumbnail_cache_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = cache_root().join("thumbnails-v6");
+/// Icons live in their own revision directory: the resolution rules changed (real
+/// per-file icons for `.url`/`.lnk`/`.ico`), so older cached bitmaps must not be
+/// reused after an upgrade.
+fn icon_root() -> PathBuf {
+    cache_root().join(ICON_DIR)
+}
+
+fn icon_hash_path(item: &IconRequest) -> Result<PathBuf> {
+    let root = icon_root();
     std::fs::create_dir_all(&root)?;
     let mut hash = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hash);
+    item.hash(&mut hash);
     Ok(root.join(format!("{:016x}.png", hash.finish())))
 }
 
-fn png_dimensions(path: &Path) -> Result<(u32, u32)> {
-    use std::io::Read;
-    let mut header = [0u8; 24];
-    std::fs::File::open(path)?.read_exact(&mut header)?;
-    anyhow::ensure!(
-        &header[..8] == b"\x89PNG\r\n\x1a\n" && &header[12..16] == b"IHDR",
-        "Invalid thumbnail PNG header"
-    );
-    let width = u32::from_be_bytes(header[16..20].try_into().unwrap());
-    let height = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    anyhow::ensure!(
-        width > 0 && height > 0 && width <= 4096 && height <= 4096,
-        "Invalid thumbnail dimensions"
-    );
-    Ok((width, height))
+fn thumbnail_root() -> PathBuf {
+    cache_root().join(THUMBNAIL_DIR)
+}
+
+/// Stable per-item name for the index, derived from the thumbnail key only.
+fn thumbnail_index_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
+    let root = thumbnail_root();
+    std::fs::create_dir_all(&root)?;
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hash);
+    Ok(root.join(format!("{:016x}.json", hash.finish())))
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let digest = Sha256::digest(bytes);
+    let mut text = String::with_capacity(64);
+    for byte in digest {
+        text.push(HEX[(byte >> 4) as usize] as char);
+        text.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    text
+}
+
+fn load_thumbnail(index: &Path) -> Option<ThumbnailAsset> {
+    let bytes = std::fs::read(index).ok()?;
+    let asset: ThumbnailAsset = serde_json::from_slice(&bytes).ok()?;
+    asset.image.is_file().then_some(asset)
+}
+
+/// A provider that reported "no thumbnail" for this exact key is remembered next
+/// to the index, so reopening the folder (or restarting the application) does not
+/// pay the same Shell round trip again. The key already contains size and mtime.
+const MISS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+fn miss_path(index: &Path) -> PathBuf {
+    index.with_extension("miss")
+}
+fn missing_thumbnail(index: &Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(miss_path(index)) else {
+        return false;
+    };
+    let Ok(seconds) = text.trim().parse::<u64>() else {
+        return false;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    now.saturating_sub(seconds) < MISS_TTL.as_secs() && seconds <= now
+}
+pub fn remember_missing_thumbnail(key: &crate::thumbnails::Key) {
+    let Ok(index) = thumbnail_index_path(key) else {
+        return;
+    };
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let _ = std::fs::write(miss_path(&index), seconds.to_string());
+}
+
+fn save_thumbnail_index(index: &Path, asset: &ThumbnailAsset) -> Result<()> {
+    let temporary = index.with_extension(format!("{}.tmp", std::process::id()));
+    std::fs::write(&temporary, serde_json::to_vec(asset)?)?;
+    if std::fs::rename(&temporary, index).is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    Ok(())
 }
 
 fn prune_thumbnail_cache(root: &Path) {
-    // Only helpers touch disk. At most once per five minutes, cap this cache
-    // at 4096 PNGs / 128 MiB. Killing a slow helper also bounds this maintenance.
+    // Only helpers touch disk. At most once per five minutes, cap the shared
+    // images at 4096 PNGs / 128 MiB and the per-item indexes at 8192. Dropping an
+    // image only costs a regeneration: the same bytes map back to the same name.
     let marker = root.join("last-maintenance");
     if std::fs::metadata(&marker)
         .and_then(|m| m.modified())
@@ -229,39 +367,95 @@ fn prune_thumbnail_cache(root: &Path) {
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
-    let mut files: Vec<_> = entries
-        .flatten()
-        .take(8192)
-        .filter_map(|entry| {
-            if entry.path().extension().is_none_or(|e| e != "png") {
-                return None;
-            }
-            let metadata = entry.metadata().ok()?;
-            Some((metadata.modified().ok(), metadata.len(), entry.path()))
-        })
-        .collect();
-    files.sort_unstable_by_key(|(modified, _, _)| *modified);
-    let mut bytes: u64 = files.iter().map(|(_, size, _)| *size).sum();
-    let mut count = files.len();
-    for (_, size, path) in files {
+    let mut images = Vec::new();
+    let mut indexes = Vec::new();
+    for entry in entries.flatten().take(16384) {
+        let Ok(metadata) = entry.metadata() else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let record = (metadata.modified().ok(), metadata.len(), entry.path());
+        match entry.path().extension().and_then(|e| e.to_str()) {
+            Some("png") => images.push(record),
+            Some("json" | "miss") => indexes.push(record),
+            _ => {}
+        }
+    }
+    images.sort_unstable_by_key(|(modified, _, _)| *modified);
+    let mut bytes: u64 = images.iter().map(|(_, size, _)| *size).sum();
+    let mut count = images.len();
+    for (_, size, path) in images {
         if bytes <= 128 * 1024 * 1024 && count <= 4096 {
             break;
         }
         if std::fs::remove_file(&path).is_ok() {
-            let _ = std::fs::remove_file(path.with_extension("json"));
             bytes = bytes.saturating_sub(size);
             count -= 1;
         }
     }
+    if indexes.len() > 8192 {
+        indexes.sort_unstable_by_key(|(modified, _, _)| *modified);
+        for (_, _, path) in indexes.drain(..indexes.len() - 8192) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    remove_legacy_thumbnail_cache(root);
+}
+
+/// The previous cache stored one PNG per item. Drop it once the new directory
+/// exists so an upgrade does not keep the duplicates around.
+fn remove_legacy_thumbnail_cache(root: &Path) {
+    let Some(parent) = root.parent() else {
+        return;
+    };
+    let legacy = parent.join(LEGACY_THUMBNAIL_DIR);
+    let Ok(entries) = std::fs::read_dir(&legacy) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_file()
+            && matches!(
+                path.extension().and_then(|e| e.to_str()),
+                Some("png" | "json" | "tmp")
+            )
+        {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    let _ = std::fs::remove_dir(&legacy);
+}
+
+/// Folders with their own `desktop.ini` artwork need a per-path icon (7-Zip shows
+/// those too, e.g. `C:\Windows\Offline Web Pages`); every other folder shares the
+/// one attribute-based folder icon instead of caching a PNG per folder.
+///
+/// Drive roots (and UNC share roots) are never shared: their icon carries the
+/// drive type, BitLocker/optical/network overlays and the drive letter label.
+fn share_plain_folder_icon(mut item: IconRequest) -> IconRequest {
+    let root = item.path.has_root() && item.path.parent().is_none();
+    if item.name == "file"
+        && item.directory
+        && item.path.is_absolute()
+        && !root
+        && !crate::shell_folder::is_shell_path(&item.path)
+        && !crate::system_icons::folder_has_custom_icon(&item.path)
+    {
+        item.path = PathBuf::from("folder");
+        item.epoch = 0;
+    }
+    item
 }
 
 fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
     if item.epoch == 0 {
-        return cache_path(item);
+        return icon_hash_path(item);
     }
     let mut stable = item.clone();
     stable.epoch = 0;
-    let base = cache_path(&stable)?;
+    let base = icon_hash_path(&stable)?;
     let prefix = format!(
         "{}-drive-",
         base.file_stem().unwrap_or_default().to_string_lossy()
@@ -282,6 +476,37 @@ fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
                     }
                 }
             }
+        }
+    }
+    Ok(output)
+}
+/// Encode `rgba` and store it under the SHA-256 of the encoded PNG bytes.
+/// Identical thumbnails (stock folder art, the same document copied around, a
+/// generic file icon) therefore occupy one file.
+fn store_image(dir: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<PathBuf> {
+    anyhow::ensure!(
+        width > 0 && height > 0 && width <= 4096 && height <= 4096,
+        "原生图像尺寸无效"
+    );
+    let temporary = dir.join(format!("thumb-{}.tmp", std::process::id()));
+    image::save_buffer_with_format(
+        &temporary,
+        rgba,
+        width,
+        height,
+        image::ColorType::Rgba8,
+        image::ImageFormat::Png,
+    )?;
+    let bytes = std::fs::read(&temporary)?;
+    let output = dir.join(format!("{}.png", sha256_hex(&bytes)));
+    if output.is_file() {
+        let _ = std::fs::remove_file(&temporary);
+        return Ok(output);
+    }
+    if let Err(error) = std::fs::rename(&temporary, &output) {
+        let _ = std::fs::remove_file(&temporary);
+        if !output.is_file() {
+            return Err(error.into());
         }
     }
     Ok(output)
@@ -350,93 +575,96 @@ pub fn serve(json: &str) -> Result<()> {
         Request::Thumbnail { item } => {
             use std::os::windows::{ffi::OsStrExt, fs::MetadataExt};
             use windows::{Win32::Storage::FileSystem::GetDriveTypeW, core::PCWSTR};
-            anyhow::ensure!(
-                item.path.is_absolute() && !item.path.to_string_lossy().starts_with("\\\\"),
-                "不自动读取网络缩略图"
-            );
-            let root: Vec<u16> = item
-                .path
-                .ancestors()
-                .last()
-                .unwrap()
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            anyhow::ensure!(
-                unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 4,
-                "不自动读取网络驱动器缩略图"
-            );
-            // `item` is built from `symlink_metadata`; keep the identity check on the
-            // same source. Following a reparse point here reports the junction
-            // target's mtime, which never matches the link's own metadata.
-            let metadata = std::fs::symlink_metadata(&item.path)?;
-            anyhow::ensure!(
-                metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
-                "不自动下载脱机或云占位文件"
-            );
-            let directory = metadata.file_attributes() & 0x10 != 0;
-            anyhow::ensure!(
-                directory == item.directory
-                    && (if directory { 0 } else { metadata.len() }) == item.size
-                    && metadata.modified().ok() == item.modified,
-                "文件已变化"
-            );
-            let extension = item
-                .path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let shortcut = !directory && matches!(extension.as_str(), "lnk" | "url");
-            // A `.lnk` points at a file whose own artwork is what Explorer shows. A
-            // `.url` usually points at a web page: resolving it would leave us with a
-            // URL and no icon, so the Shell is asked for the shortcut file's own icon
-            // (the site favicon) instead.
-            let target = if extension == "lnk" {
-                crate::native_preview::shortcut_target(&item.path)?
-            } else {
-                item.path.clone()
-            };
-            let target_root: Vec<u16> = target
-                .ancestors()
-                .last()
-                .unwrap()
-                .as_os_str()
-                .encode_wide()
-                .chain(Some(0))
-                .collect();
-            anyhow::ensure!(
-                unsafe { GetDriveTypeW(PCWSTR(target_root.as_ptr())) } != 4,
-                "Do not thumbnail mapped network shortcut targets"
-            );
-            let target_metadata = std::fs::metadata(&target)?;
-            anyhow::ensure!(
-                target_metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
-                "Do not hydrate offline shortcut targets"
-            );
-            let resolved = crate::thumbnails::Key {
-                path: target,
-                size: if target_metadata.is_dir() {
-                    0
+            // Portable-device and recycled items have no filesystem path to stat;
+            // their listing already carries the size and mtime used as the cache
+            // identity, so they are cached exactly like local files.
+            let namespace = crate::shell_folder::is_namespace_item(&item.path);
+            let mut shortcut = false;
+            let mut resolved = item.clone();
+            if !namespace {
+                anyhow::ensure!(
+                    item.path.is_absolute() && !item.path.to_string_lossy().starts_with("\\\\"),
+                    "不自动读取网络缩略图"
+                );
+                let root: Vec<u16> = item
+                    .path
+                    .ancestors()
+                    .last()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                anyhow::ensure!(
+                    unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) } != 4,
+                    "不自动读取网络驱动器缩略图"
+                );
+                // `item` is built from `symlink_metadata`; keep the identity check on the
+                // same source. Following a reparse point here reports the junction
+                // target's mtime, which never matches the link's own metadata.
+                let metadata = std::fs::symlink_metadata(&item.path)?;
+                anyhow::ensure!(
+                    metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
+                    "不自动下载脱机或云占位文件"
+                );
+                let directory = metadata.file_attributes() & 0x10 != 0;
+                anyhow::ensure!(
+                    directory == item.directory
+                        && (if directory { 0 } else { metadata.len() }) == item.size
+                        && metadata.modified().ok() == item.modified,
+                    "文件已变化"
+                );
+                let extension = item
+                    .path
+                    .extension()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_ascii_lowercase();
+                shortcut = !directory && matches!(extension.as_str(), "lnk" | "url");
+                // A `.lnk` points at a file whose own artwork is what Explorer shows. A
+                // `.url` usually points at a web page: resolving it would leave us with a
+                // URL and no icon, so the Shell is asked for the shortcut file's own icon
+                // (the site favicon) instead.
+                let target = if extension == "lnk" {
+                    crate::native_preview::shortcut_target(&item.path)?
                 } else {
-                    target_metadata.len()
-                },
-                directory: target_metadata.is_dir(),
-                modified: target_metadata.modified().ok(),
-                pixels: item.pixels,
-                shortcut_epoch: item.shortcut_epoch,
-            };
-            let output = if shortcut {
-                let root = cache_root().join("thumbnails-v6");
-                std::fs::create_dir_all(&root)?;
-                let mut hash = std::collections::hash_map::DefaultHasher::new();
-                (&item, &resolved).hash(&mut hash);
-                root.join(format!("{:016x}.png", hash.finish()))
+                    item.path.clone()
+                };
+                let target_root: Vec<u16> = target
+                    .ancestors()
+                    .last()
+                    .unwrap()
+                    .as_os_str()
+                    .encode_wide()
+                    .chain(Some(0))
+                    .collect();
+                anyhow::ensure!(
+                    unsafe { GetDriveTypeW(PCWSTR(target_root.as_ptr())) } != 4,
+                    "Do not thumbnail mapped network shortcut targets"
+                );
+                let target_metadata = std::fs::metadata(&target)?;
+                anyhow::ensure!(
+                    target_metadata.file_attributes() & (0x1000 | 0x40000 | 0x400000) == 0,
+                    "Do not hydrate offline shortcut targets"
+                );
+                resolved = crate::thumbnails::Key {
+                    path: target,
+                    size: if target_metadata.is_dir() {
+                        0
+                    } else {
+                        target_metadata.len()
+                    },
+                    directory: target_metadata.is_dir(),
+                    modified: target_metadata.modified().ok(),
+                    pixels: item.pixels,
+                    shortcut_epoch: item.shortcut_epoch,
+                };
+            }
+            let index = thumbnail_index_path(&item)?;
+            if let Some(asset) = load_thumbnail(&index) {
+                Response::Thumbnail(asset)
             } else {
-                thumbnail_cache_path(&item)?
-            };
-            if !output.is_file() {
+                let image_root = thumbnail_root();
                 let pixels = item.pixels.clamp(32, 256);
                 let extension = resolved
                     .path
@@ -444,7 +672,15 @@ pub fn serve(json: &str) -> Result<()> {
                     .unwrap_or_default()
                     .to_string_lossy()
                     .to_ascii_lowercase();
-                let bitmap = if resolved.directory {
+                let bitmap = if namespace {
+                    // A portable device or recycled item: ask the Shell for the
+                    // item's own artwork through its ID list.
+                    crate::native_preview::shell_item_thumbnail(
+                        &item.path,
+                        pixels,
+                        resolved.directory,
+                    )?
+                } else if resolved.directory {
                     // Let Windows compose the folder's registered thumbnail. Do not
                     // enumerate children or extract a representative file ourselves.
                     crate::native_preview::folder_thumbnail(&resolved.path, pixels)?
@@ -491,55 +727,47 @@ pub fn serve(json: &str) -> Result<()> {
                 };
                 // No badge is painted into the bitmap: the view draws one link
                 // arrow per tile, so baking a second one here produced two arrows.
-                save_png(&output, bitmap.width, bitmap.height, &bitmap.rgba)?;
-                if let Some(root) = output.parent() {
-                    prune_thumbnail_cache(root);
-                }
-            }
-            let extension = resolved
-                .path
-                .extension()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_ascii_lowercase();
-            let (width, height) = png_dimensions(&output)?;
-            let (source_width, source_height) = if !resolved.directory
-                && matches!(
-                    extension.as_str(),
-                    "jpg"
-                        | "jpeg"
-                        | "png"
-                        | "gif"
-                        | "bmp"
-                        | "tif"
-                        | "tiff"
-                        | "webp"
-                        | "heic"
-                        | "heif"
-                        | "avif"
-                ) {
-                crate::native_preview::photo_dimensions(&resolved.path).unwrap_or_default()
-            } else {
-                (0, 0)
-            };
-            let presentation = crate::thumbnails::Presentation {
-                directory: resolved.directory,
-                shortcut,
-                source_width,
-                source_height,
-                width,
-                height,
-                video: !resolved.directory
+                let image = store_image(&image_root, bitmap.width, bitmap.height, &bitmap.rgba)?;
+                prune_thumbnail_cache(&image_root);
+                let (source_width, source_height) = if !namespace
+                    && !resolved.directory
                     && matches!(
                         extension.as_str(),
-                        "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
-                    ),
-            };
-            std::fs::write(
-                output.with_extension("json"),
-                serde_json::to_vec(&presentation)?,
-            )?;
-            Response::Thumbnail(output)
+                        "jpg"
+                            | "jpeg"
+                            | "png"
+                            | "gif"
+                            | "bmp"
+                            | "tif"
+                            | "tiff"
+                            | "webp"
+                            | "heic"
+                            | "heif"
+                            | "avif"
+                    ) {
+                    crate::native_preview::photo_dimensions(&resolved.path).unwrap_or_default()
+                } else {
+                    (0, 0)
+                };
+                let asset = ThumbnailAsset {
+                    image,
+                    presentation: crate::thumbnails::Presentation {
+                        directory: resolved.directory,
+                        shortcut,
+                        source_width,
+                        source_height,
+                        width: bitmap.width,
+                        height: bitmap.height,
+                        video: !resolved.directory
+                            && matches!(
+                                extension.as_str(),
+                                "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
+                            ),
+                    },
+                };
+                save_thumbnail_index(&index, &asset)?;
+                Response::Thumbnail(asset)
+            }
         }
         Request::Preview {
             path,
@@ -589,6 +817,7 @@ pub fn serve(json: &str) -> Result<()> {
         Request::Icons { items } => {
             let mut paths = Vec::with_capacity(items.len());
             for item in items {
+                let item = share_plain_folder_icon(item);
                 let result = (|| -> Result<PathBuf> {
                     let output = icon_cache_path(&item)?;
                     if !output.is_file() {
@@ -725,31 +954,45 @@ pub fn icons(items: Vec<IconRequest>) -> Vec<Option<PathBuf>> {
     }
     let count = items.len();
     let cancel = Arc::new(AtomicBool::new(false));
-    match call(
-        Request::Icons { items },
-        Duration::from_millis(1800),
-        &cancel,
-    ) {
+    // Bigger batches mean fewer helper starts while scrolling a large folder; the
+    // deadline grows with the batch so a slow Shell provider is not cut off.
+    let deadline = Duration::from_millis(1200 + 60 * count.min(64) as u64);
+    match call(Request::Icons { items }, deadline, &cancel) {
         Ok(Response::Icons(paths)) => paths,
         _ => vec![None; count],
     }
 }
 
-pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Result<PathBuf> {
-    let output = thumbnail_cache_path(key)?;
+pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Result<ThumbnailAsset> {
+    let index = thumbnail_index_path(key)?;
     if cancel.load(Ordering::Relaxed) {
         bail!("缩略图已取消");
     }
-    if key.shortcut_epoch == 0 && output.is_file() {
-        return Ok(output);
+    // The index name already contains the whole key (including the shortcut
+    // epoch), so reading it cannot return artwork for a different key.
+    if let Some(asset) = load_thumbnail(&index) {
+        return Ok(asset);
     }
     match call(
         Request::Thumbnail { item: key.clone() },
-        Duration::from_millis(800),
+        preview_deadline(key),
         cancel,
     )? {
-        Response::Thumbnail(path) => Ok(path),
+        Response::Thumbnail(asset) => Ok(asset),
         _ => bail!("无效缩略图响应"),
+    }
+}
+
+/// How long one preview may take. Folder composition and portable devices are much
+/// slower than a file thumbnail, and killing the helper mid-work costs another
+/// process start plus a repeat of that work.
+pub(crate) fn preview_deadline(key: &crate::thumbnails::Key) -> Duration {
+    if crate::shell_folder::is_namespace_item(&key.path) {
+        Duration::from_millis(4000)
+    } else if key.directory {
+        Duration::from_millis(3000)
+    } else {
+        Duration::from_millis(800)
     }
 }
 
@@ -793,60 +1036,77 @@ impl ThumbnailSession {
             let _ = running.child.wait();
         }
     }
+    /// Start the codec helper before the first preview is needed. Process start
+    /// costs ~80 ms, which otherwise lands on the first visible thumbnail.
+    pub fn warm(&mut self) {
+        let _ = self.ensure_process();
+    }
+    fn ensure_process(&mut self) -> Result<()> {
+        use std::{io::BufRead, os::windows::process::CommandExt};
+        if self.process.is_some() {
+            return Ok(());
+        }
+        let mut child = Command::new(std::env::current_exe()?)
+            .arg("--thumbnail-server")
+            .creation_flags(0x08000000)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()?;
+        let mut input = child.stdin.take().context("缩略图服务输入不可用")?;
+        let stdout = child.stdout.take().context("缩略图服务输出不可用")?;
+        let (tx, replies) = std::sync::mpsc::sync_channel(1);
+        let (requests, incoming) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        std::thread::spawn(move || {
+            use std::io::Write;
+            while let Ok(bytes) = incoming.recv() {
+                if input.write_all(&bytes).and_then(|_| input.flush()).is_err() {
+                    break;
+                }
+            }
+        });
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        self.process = Some(ThumbnailProcess {
+            child,
+            requests,
+            replies,
+        });
+        Ok(())
+    }
     pub fn get(
         &mut self,
         key: &crate::thumbnails::Key,
         cancel: &Arc<AtomicBool>,
-    ) -> Result<PathBuf> {
-        use std::{
-            io::{BufRead, Write},
-            os::windows::process::CommandExt,
-        };
-        let output = thumbnail_cache_path(key)?;
+    ) -> Result<ThumbnailAsset> {
+        let index = thumbnail_index_path(key)?;
         if cancel.load(Ordering::Relaxed) {
             bail!("缩略图已取消");
         }
-        if key.shortcut_epoch == 0 && output.is_file() {
-            return Ok(output);
+        // The index name contains the whole key (epoch included), so a hit always
+        // belongs to this key: no helper round trip for cached folders.
+        if let Some(asset) = load_thumbnail(&index) {
+            crate::shell::menu_trace("thumbnail: disk hit");
+            return Ok(asset);
         }
-        if self.process.is_none() {
-            let mut child = Command::new(std::env::current_exe()?)
-                .arg("--thumbnail-server")
-                .creation_flags(0x08000000)
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()?;
-            let mut input = child.stdin.take().context("缩略图服务输入不可用")?;
-            let stdout = child.stdout.take().context("缩略图服务输出不可用")?;
-            let (tx, replies) = std::sync::mpsc::sync_channel(1);
-            let (requests, incoming) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
-            std::thread::spawn(move || {
-                while let Ok(bytes) = incoming.recv() {
-                    if input.write_all(&bytes).and_then(|_| input.flush()).is_err() {
-                        break;
-                    }
-                }
-            });
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(stdout).lines() {
-                    let Ok(line) = line else {
-                        break;
-                    };
-                    if tx.send(line).is_err() {
-                        break;
-                    }
-                }
-            });
-            self.process = Some(ThumbnailProcess {
-                child,
-                requests,
-                replies,
-            });
+        if missing_thumbnail(&index) {
+            crate::shell::menu_trace("thumbnail: cached miss");
+            bail!("文件不支持缩略图");
         }
-        let result = (|| -> Result<PathBuf> {
+        crate::shell::menu_trace("thumbnail: generate");
+        self.ensure_process()?;
+        let result = (|| -> Result<ThumbnailAsset> {
             let process = self.process.as_mut().unwrap();
             let start = Instant::now();
+            let deadline = preview_deadline(key);
             let mut bytes = serde_json::to_vec(&Request::Thumbnail { item: key.clone() })?;
             bytes.push(b'\n');
             process
@@ -854,12 +1114,12 @@ impl ThumbnailSession {
                 .try_send(bytes)
                 .context("缩略图服务请求未接收")?;
             loop {
-                if cancel.load(Ordering::Relaxed) || start.elapsed() > Duration::from_millis(800) {
+                if cancel.load(Ordering::Relaxed) || start.elapsed() > deadline {
                     bail!("缩略图取消或超时");
                 }
                 match process.replies.recv_timeout(Duration::from_millis(10)) {
                     Ok(line) => match serde_json::from_str::<Response>(&line) {
-                        Ok(Response::Thumbnail(path)) => return Ok(path),
+                        Ok(Response::Thumbnail(asset)) => return Ok(asset),
                         Ok(Response::ThumbnailError(_)) => {
                             return Err(anyhow::anyhow!("文件不支持缩略图"));
                         }
@@ -891,35 +1151,173 @@ impl Drop for ThumbnailSession {
 
 #[cfg(test)]
 mod cache_tests {
-    #[test]
-    fn clearing_generated_cache_preserves_other_files_and_directories() {
+    use super::*;
+    fn temp_root(name: &str) -> PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "re-cache-test-{}-{}",
+            "re-cache-{name}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(root.join("thumbnails-v6")).unwrap();
+        std::fs::create_dir_all(&root).unwrap();
+        root
+    }
+    #[test]
+    fn plain_folders_share_an_icon_while_desktop_ini_folders_keep_their_own() {
+        let a = IconRequest::file(std::path::Path::new("C:\\Windows\\System32"), true, 96);
+        let b = IconRequest::file(std::path::Path::new("D:\\Games"), true, 96);
+        // Ordinary folders share one cached stock icon without asking the helper, so
+        // dragging through a 16k-folder directory never waits for an icon round trip.
+        assert_eq!(a.path, PathBuf::from("folder"));
+        assert_eq!(a.path, b.path);
+        assert_eq!(a.epoch, 0);
+
+        // A folder with its own artwork keeps its path so the Shell can resolve it.
+        let custom = temp_root("custom-folder");
+        std::fs::write(
+            custom.join("desktop.ini"),
+            b"[.ShellClassInfo]\r\nIconResource=C:\\x.ico,0\r\n",
+        )
+        .unwrap();
+        let request = IconRequest::file(&custom, true, 96);
+        assert_eq!(request.path, custom);
+        assert!(request.epoch > 0);
+        assert_eq!(share_plain_folder_icon(request.clone()).path, request.path);
+        std::fs::remove_dir_all(&custom).unwrap();
+
+        // Executables keep a per-path icon and are never shared or normalized.
+        let exe = IconRequest::file(std::path::Path::new("C:\\a\\app.exe"), false, 96);
+        let other = IconRequest::file(std::path::Path::new("C:\\b\\other.exe"), false, 96);
+        assert_ne!(exe.path, other.path);
+        assert_eq!(share_plain_folder_icon(exe.clone()).path, exe.path);
+
+        let drive = IconRequest::file(std::path::Path::new("C:\\"), true, 96);
+        assert_eq!(drive.path, PathBuf::from("C:\\"));
+        // A drive icon uses a stable key: a fresh process paints the cached bitmap
+        // immediately instead of waiting for the Shell (an outdated badge is fine).
+        assert_eq!(drive.epoch, 0);
+        // Drive roots keep their own icon: it carries the drive type and overlays,
+        // so it must never be replaced by the generic folder icon.
+        assert_eq!(share_plain_folder_icon(drive.clone()).path, drive.path);
+        assert_eq!(share_plain_folder_icon(drive).epoch, 0);
+        let unc = IconRequest::file(std::path::Path::new("\\\\server\\share"), true, 96);
+        assert_eq!(share_plain_folder_icon(unc.clone()).path, unc.path);
+
+        let text = IconRequest::file(std::path::Path::new("C:\\a\\x.txt"), false, 96);
+        let upper = IconRequest::file(std::path::Path::new("D:\\b\\y.TXT"), false, 96);
+        assert_eq!(text.path, PathBuf::from("file.txt"));
+        assert_eq!(text.path, upper.path);
+    }
+    #[test]
+    fn provider_negative_results_expire_instead_of_being_retried_every_session() {
+        let root = temp_root("miss");
+        let index = root.join("0123456789abcdef.json");
+        assert!(!super::missing_thumbnail(&index));
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        std::fs::write(super::miss_path(&index), now.to_string()).unwrap();
+        assert!(super::missing_thumbnail(&index));
+        // A stale marker is ignored so a newly installed codec gets a chance.
+        let stale = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as f64
+            - super::MISS_TTL.as_secs() as f64
+            - 60.) as u64;
+        std::fs::write(super::miss_path(&index), stale.to_string()).unwrap();
+        assert!(!super::missing_thumbnail(&index));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn cache_images_are_named_by_the_sha256_of_their_bytes() {
+        assert_eq!(
+            super::sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let root = temp_root("sha");
+        let rgba = vec![128u8; 4 * 4 * 4];
+        let image = super::store_image(&root, 4, 4, &rgba).unwrap();
+        let bytes = std::fs::read(&image).unwrap();
+        let name = image.file_name().unwrap().to_string_lossy().into_owned();
+        assert_eq!(name, format!("{}.png", super::sha256_hex(&bytes)));
+        assert_eq!(name.len(), 64 + 4);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn identical_thumbnails_share_one_file_and_the_index_keeps_their_presentation() {
+        let root = temp_root("dedupe");
+        let rgba = vec![90u8; 4 * 4 * 4];
+        let first = super::store_image(&root, 4, 4, &rgba).unwrap();
+        let second = super::store_image(&root, 4, 4, &rgba).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(std::fs::read_dir(&root).unwrap().flatten().count(), 1);
+        // One different pixel is a different image and gets its own file.
+        let mut other = rgba.clone();
+        other[0] = 255;
+        let third = super::store_image(&root, 4, 4, &other).unwrap();
+        assert_ne!(first, third);
+        assert_eq!(std::fs::read_dir(&root).unwrap().flatten().count(), 2);
+        let index = root.join("0000000000000001.json");
+        let asset = ThumbnailAsset {
+            image: first.clone(),
+            presentation: crate::thumbnails::Presentation {
+                directory: true,
+                width: 4,
+                height: 4,
+                ..Default::default()
+            },
+        };
+        super::save_thumbnail_index(&index, &asset).unwrap();
+        let loaded = super::load_thumbnail(&index).unwrap();
+        assert_eq!(loaded.image, first);
+        assert!(loaded.presentation.directory);
+        assert!(!loaded.presentation.shortcut);
+        assert_eq!(loaded.presentation.width, 4);
+        // A pruned image turns the entry into a miss instead of a broken path.
+        std::fs::remove_file(&first).unwrap();
+        assert!(super::load_thumbnail(&index).is_none());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+    #[test]
+    fn clearing_generated_cache_preserves_other_files_and_directories() {
+        let root = temp_root("clear");
+        std::fs::create_dir_all(root.join(super::THUMBNAIL_DIR)).unwrap();
+        std::fs::create_dir_all(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
+        std::fs::create_dir_all(root.join(super::ICON_DIR)).unwrap();
         std::fs::create_dir(root.join("other")).unwrap();
         for file in [
             "icon.png",
             "keep.txt",
-            "thumbnails-v6/thumb.png",
-            "thumbnails-v6/keep.txt",
+            "thumbnails-v7/thumb.png",
+            "thumbnails-v7/index.json",
+            "thumbnails-v7/keep.txt",
+            "thumbnails-v6/old.png",
+            "icons-v2/glyph.png",
             "other/untouched.png",
         ] {
             std::fs::write(root.join(file), b"fixture").unwrap();
         }
-        assert_eq!(super::clear_cache_at(&root).unwrap(), (2, 0));
-        assert!(!root.join("icon.png").exists());
-        assert!(!root.join("thumbnails-v6/thumb.png").exists());
-        for file in ["keep.txt", "thumbnails-v6/keep.txt", "other/untouched.png"] {
-            assert!(root.join(file).exists());
-            std::fs::remove_file(root.join(file)).unwrap();
+        assert_eq!(super::clear_cache_at(&root).unwrap(), (5, 0));
+        for gone in [
+            "icon.png",
+            "thumbnails-v7/thumb.png",
+            "thumbnails-v7/index.json",
+            "thumbnails-v6/old.png",
+            "icons-v2/glyph.png",
+        ] {
+            assert!(!root.join(gone).exists(), "{gone} should be cleared");
         }
-        std::fs::remove_dir(root.join("thumbnails-v6")).unwrap();
+        for kept in ["keep.txt", "thumbnails-v7/keep.txt", "other/untouched.png"] {
+            assert!(root.join(kept).exists(), "{kept} should be kept");
+            std::fs::remove_file(root.join(kept)).unwrap();
+        }
+        std::fs::remove_dir(root.join(super::THUMBNAIL_DIR)).unwrap();
+        std::fs::remove_dir(root.join(super::LEGACY_THUMBNAIL_DIR)).unwrap();
+        std::fs::remove_dir(root.join(super::ICON_DIR)).unwrap();
         std::fs::remove_dir(root.join("other")).unwrap();
         std::fs::remove_dir(&root).unwrap();
         assert_eq!(super::clear_cache_at(&root).unwrap(), (0, 0));

@@ -3852,7 +3852,7 @@ dependencies = [
 
 [[package]]
 name = "rust-explorer"
-version = "0.7.6"
+version = "0.7.7"
 dependencies = [
  "anyhow",
  "cc",
@@ -3867,6 +3867,7 @@ dependencies = [
  "raw-window-handle",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "unicode-segmentation",
  "windows",
  "windows-core 0.61.2",

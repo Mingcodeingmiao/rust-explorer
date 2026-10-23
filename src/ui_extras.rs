@@ -539,6 +539,38 @@ impl Explorer {
         })
         .detach();
     }
+    /// Queue the folder's per-item icons (executables, shortcuts, drives) once, so a
+    /// scroll does not have to wait for each real icon.
+    pub(super) fn prefetch_entry_icons(&self) {
+        if self.is_home() && self.volumes.is_empty() {
+            return;
+        }
+        let stamp = (self.generation, visual::icon_pixels());
+        if self.icon_prefetch.get() == Some(stamp) {
+            return;
+        }
+        self.icon_prefetch.set(Some(stamp));
+        let pixels = visual::icon_pixels();
+        let keys: Vec<_> = self
+            .entries
+            .iter()
+            .filter(|entry| {
+                rust_explorer::native_assets::IconRequest::needs_own_icon(
+                    &entry.path,
+                    entry.directory,
+                )
+            })
+            .map(|entry| {
+                rust_explorer::native_assets::IconRequest::file(
+                    &entry.path,
+                    entry.directory,
+                    pixels,
+                )
+            })
+            .take(rust_explorer::native_assets::ICON_PREFETCH_LIMIT)
+            .collect();
+        visual::prefetch_icons(keys);
+    }
     pub(super) fn sync_thumbnails(&self) {
         let enabled = matches!(
             self.view,
@@ -551,6 +583,26 @@ impl Explorer {
         } else {
             0
         };
+        // Eager whole-folder prefetch. It must not sit behind the viewport stamp:
+        // the first render of a folder usually hits that early return, which used to
+        // leave the queue with only the visible rows ("a page per scroll").
+        let prefetch_stamp = (self.generation, pixels);
+        if enabled {
+            if !self.entries.is_empty() && self.thumbnail_prefetch.get() != Some(prefetch_stamp) {
+                self.thumbnail_prefetch.set(Some(prefetch_stamp));
+                let all: Vec<_> = self
+                    .entries
+                    .iter()
+                    .filter_map(|entry| rust_explorer::thumbnails::Key::from_entry(entry, pixels))
+                    .take(rust_explorer::thumbnails::MAX_PREFETCH)
+                    .collect();
+                self.thumbnails.set_all(all);
+            }
+        } else if self.thumbnail_prefetch.get().is_some() {
+            // No previews are shown: drop the queue and stop generating.
+            self.thumbnail_prefetch.set(None);
+            self.thumbnails.set_all(Vec::new());
+        }
         let first = if enabled {
             self.list_scroll
                 .logical_scroll_top()
@@ -1277,7 +1329,13 @@ impl Explorer {
                     )
                     .on_click(cx.listener(move |v, _, _, cx| {
                         cx.stop_propagation();
+                        // Clicking an ancestor selects the folder we came from,
+                        // like the ↑ button and Explorer's breadcrumbs.
+                        let child = v.child_towards_current(&path);
                         v.navigate(path.clone(), cx);
+                        if let Some(child) = child {
+                            v.focus_after_load(child);
+                        }
                     })),
             );
             crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
@@ -2696,6 +2754,29 @@ impl Explorer {
         let down_bounds = painted_bounds.clone();
         let up_bounds = painted_bounds.clone();
         let zoom = self.zoom;
+        // A selected item answers a right click anywhere inside its own cell;
+        // an unselected one still requires a text/icon/metadata hit, so
+        // right-clicking the empty part of another row keeps the background
+        // menu and does not steal the selection.
+        let hit_test = move |v: &Self,
+                             bounds: Bounds<Pixels>,
+                             position: Point<Pixels>,
+                             regions: &[(f32, f32, f32, f32)]| {
+            let local = position - bounds.origin;
+            let (x, y) = (f32::from(local.x) / zoom, f32::from(local.y) / zoom);
+            let (width, height) = (
+                f32::from(bounds.size.width) / zoom,
+                f32::from(bounds.size.height) / zoom,
+            );
+            rust_explorer::layout_metrics::right_click_hits(
+                regions,
+                x,
+                y,
+                width,
+                height,
+                v.selected.contains(&index),
+            )
+        };
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
@@ -2795,11 +2876,7 @@ impl Explorer {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseDownEvent, _, cx| {
-                    let point = e.position - down_bounds.get().origin;
-                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
-                    if !down_regions.iter().any(|(left, top, width, height)| {
-                        x >= *left && x <= left + width && y >= *top && y <= top + height
-                    }) {
+                    if !hit_test(v, down_bounds.get(), e.position, &down_regions) {
                         return;
                     }
                     cx.stop_propagation();
@@ -2820,11 +2897,7 @@ impl Explorer {
             .on_mouse_up(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseUpEvent, w, cx| {
-                    let point = e.position - up_bounds.get().origin;
-                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
-                    if !right_regions.iter().any(|(left, top, width, height)| {
-                        x >= *left && x <= left + width && y >= *top && y <= top + height
-                    }) {
+                    if !hit_test(v, up_bounds.get(), e.position, &right_regions) {
                         return;
                     }
                     cx.stop_propagation();
@@ -3517,8 +3590,17 @@ impl Explorer {
                     MenuItem::separator(),
                     MenuItem::new("file-cut", "剪切"),
                     MenuItem::new("file-copy", "复制"),
-                    MenuItem::new("file-rename", "重命名")
-                        .enable(self.selected.len() == 1 && !navigation::is_virtual(&self.dir())),
+                    MenuItem::new("file-rename", "重命名").enable(
+                        self.selected.len() == 1
+                            && (!navigation::is_virtual(&self.dir())
+                                || self
+                                    .selected
+                                    .first()
+                                    .and_then(|index| self.entries.get(*index))
+                                    .is_some_and(|entry| {
+                                        rust_explorer::volume_label::is_drive_root(&entry.path)
+                                    })),
+                    ),
                     MenuItem::new("file-delete", "删除")
                         .enable(!navigation::is_app_virtual(&self.dir())),
                     MenuItem::new("copy-path", "复制路径"),
@@ -3738,8 +3820,15 @@ impl Explorer {
                             .enable(!navigation::is_app_virtual(&self.dir())),
                         "rename" => MenuItem::new("file-rename", "重命名").enable(
                             self.selected.len() == 1
-                                && !self.is_home()
-                                && !navigation::is_shell_folder(&self.dir()),
+                                && (self
+                                    .selected
+                                    .first()
+                                    .and_then(|index| self.entries.get(*index))
+                                    .is_some_and(|entry| {
+                                        rust_explorer::volume_label::is_drive_root(&entry.path)
+                                    })
+                                    || (!self.is_home()
+                                        && !navigation::is_shell_folder(&self.dir()))),
                         ),
                         "share" => MenuItem::new("file-share", "共享").enable(
                             self.selected.len() == 1
@@ -3787,7 +3876,6 @@ impl Explorer {
                     MenuItem::new("select-all", "全部选择"),
                     MenuItem::new("select-none", "全部取消").enable(any),
                     MenuItem::new("select-invert", "反向选择"),
-                    MenuItem::new("clear-cache", "清空缓存"),
                     MenuItem::separator(),
                     MenuItem::new("properties", "属性"),
                     MenuItem::new("options", "选项"),
@@ -4091,42 +4179,46 @@ impl Explorer {
         }
         overlay.into_any_element()
     }
+    /// Drop every generated cache (memory, thumbnails, folder sizes, disk).
+    /// Shared by the selection menu and the advanced options page.
+    pub(super) fn clear_caches(&mut self, cx: &mut Context<Self>) {
+        self.usage_cancel.store(true, Ordering::Relaxed);
+        self.usage_revision += 1;
+        self.usage_running = false;
+        self.usage.clear();
+        self.usage_enabled = false;
+        disk_usage::invalidate_cache();
+        visual::clear_cache();
+        visual::reset_image_cache(cx);
+        self.thumbnails = rust_explorer::thumbnails::Loader::new();
+        self.thumbnail_images = visual::ThumbnailImages::new(cx);
+        self.invalidate_list();
+        self.sync_thumbnails();
+        self.status = "正在清空缓存…".into();
+        let task = cx
+            .background_executor()
+            .spawn(async { rust_explorer::native_assets::clear_disk_cache() });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |v, cx| {
+                visual::clear_cache();
+                visual::reset_image_cache(cx);
+                v.thumbnails = rust_explorer::thumbnails::Loader::new();
+                v.thumbnail_images = visual::ThumbnailImages::new(cx);
+                v.status = match result {
+                    Ok((removed, failed)) => format!(
+                        "已清空缓存 · 删除 {removed} 个生成文件 · {failed} 个文件正在使用或无法删除"
+                    ),
+                    Err(error) => format!("内存缓存已清空，磁盘缓存清理失败：{error:#}"),
+                };
+                v.sync_thumbnails();
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
-        if id == "clear-cache" {
-            self.usage_cancel.store(true, Ordering::Relaxed);
-            self.usage_revision += 1;
-            self.usage_running = false;
-            self.usage.clear();
-            self.usage_enabled = false;
-            disk_usage::invalidate_cache();
-            visual::clear_cache();
-            visual::reset_image_cache(cx);
-            self.thumbnails = rust_explorer::thumbnails::Loader::new();
-            self.thumbnail_images = visual::ThumbnailImages::new(cx);
-            self.invalidate_list();
-            self.sync_thumbnails();
-            self.status = "正在清空缓存…".into();
-            let task = cx
-                .background_executor()
-                .spawn(async { rust_explorer::native_assets::clear_disk_cache() });
-            cx.spawn(async move |view, cx| {
-                let result = task.await;
-                let _ = view.update(cx, |v, cx| {
-                    visual::clear_cache();
-                    visual::reset_image_cache(cx);
-                    v.thumbnails = rust_explorer::thumbnails::Loader::new();
-                    v.thumbnail_images = visual::ThumbnailImages::new(cx);
-                    v.status = match result {
-                        Ok((removed, failed)) => format!("已清空缓存 · 删除 {removed} 个生成文件 · {failed} 个文件正在使用或无法删除"),
-                        Err(error) => format!("内存缓存已清空，磁盘缓存清理失败：{error:#}"),
-                    };
-                    v.sync_thumbnails();
-                    cx.notify();
-                });
-            }).detach();
-            cx.notify();
-            return;
-        }
         if let Some((force, number)) = id
             .strip_prefix("operation-stop:")
             .map(|id| (false, id))
@@ -4288,7 +4380,11 @@ impl Explorer {
             self.submenu = None;
             self.nested_submenu = None;
             if let Some(path) = path {
+                let child = self.child_towards_current(&path);
                 self.navigate(path, cx);
+                if let Some(child) = child {
+                    self.focus_after_load(child);
+                }
             }
             return;
         }
@@ -4308,7 +4404,11 @@ impl Explorer {
             self.submenu = None;
             self.nested_submenu = None;
             if let Some(path) = path {
+                let child = self.child_towards_current(&path);
                 self.navigate(path, cx);
+                if let Some(child) = child {
+                    self.focus_after_load(child);
+                }
             }
             return;
         }
@@ -4455,7 +4555,11 @@ impl Explorer {
             "file-cut" => self.copy(true, cx),
             "file-copy" => self.copy(false, cx),
             "file-paste" | "paste" => self.paste(cx),
-            "file-rename" => self.rename_dialog(w, cx),
+            "file-rename" => {
+                // The app popup is only used by the list (and the context menu).
+                self.pending_rename_site = Some(RenameSite::List);
+                self.rename_dialog(w, cx)
+            }
             "file-delete" => {
                 if w.modifiers().shift {
                     let paths = self.paths();
@@ -4611,6 +4715,10 @@ impl Explorer {
                 );
             }
             "computer-properties" => self.run_shell(shell::Request::SystemProperties, cx),
+            "computer-rename" => {
+                self.context_target = Some(volumes::computer());
+                self.begin_inline_rename(volumes::computer(), RenameSite::Tree, w, cx);
+            }
             "new-folder" => self.show_dialog(Dialog::NewFolder, w, cx),
             "new-shortcut" => self.show_dialog(Dialog::Shortcut, w, cx),
             "checkboxes" => self.settings.checkboxes = !self.settings.checkboxes,
@@ -4881,7 +4989,7 @@ impl Explorer {
                 v.association_busy = false;
                 match result {
                     Ok(true) => {
-                        v.status = "文件夹关联操作完成；恢复入口位于文件夹选项 → 常规".into()
+                        v.status = "文件夹关联操作完成；恢复入口位于文件夹选项 → 高级".into()
                     }
                     Ok(false) => {}
                     Err(e) => v.error = Some(e),
@@ -4892,6 +5000,40 @@ impl Explorer {
         .detach();
         cx.notify();
     }
+    /// One checkbox row on the folder-options pages. The advanced page reuses
+    /// it for the settings that are not part of a tab's main list.
+    fn setting_row(
+        &self,
+        id: &'static str,
+        label: &'static str,
+        checked: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        div()
+            .id(SharedString::from(format!("setting-{id}")))
+            .min_h(ui(32.))
+            .min_w_0()
+            .w_full()
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .rounded(ui(4.))
+            .cursor_pointer()
+            .hover(move |s| s.bg(rgb(t.hover)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(visual::checkbox(checked, t.muted))
+            .child(div().flex_1().min_w_0().whitespace_normal().child(label))
+            .on_click(cx.listener(move |v, _, _, cx| {
+                if let Some(s) = &mut v.options {
+                    toggle_option(s, id);
+                }
+                cx.notify();
+            }))
+            .into_any_element()
+    }
     pub(super) fn render_options(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = self.theme;
         let settings = self.options.as_ref().unwrap();
@@ -4901,7 +5043,8 @@ impl Explorer {
             .gap_1()
             .border_b_1()
             .border_color(rgb(t.border));
-        for (index, label) in ["常规", "查看", "搜索"].iter().enumerate() {
+        for (index, label) in ["常规", "查看", "细节", "搜索", "高级"].iter().enumerate()
+        {
             tabs = tabs.child(
                 button(("option-tab", index), *label, t)
                     .when(self.options_page == index, |d| d.bg(rgb(t.selection)))
@@ -4931,14 +5074,19 @@ impl Explorer {
             );
         }
         if self.options_page == 0 {
-            body = body.child(div().py_2().child("启动时打开"));
+            let mut startup = div()
+                .flex()
+                .flex_wrap()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2();
             for (page, label) in [
                 ("home", "主文件夹"),
                 ("this-pc", "此电脑"),
                 ("quick-access", "快速访问"),
             ] {
                 let selected = settings.startup_page == page;
-                body = body.child(
+                startup = startup.child(
                     button(SharedString::from(format!("startup-page-{page}")), label, t)
                         .flex_shrink_0()
                         .when(selected, |d| d.bg(rgb(t.selection)))
@@ -4950,19 +5098,10 @@ impl Explorer {
                         })),
                 );
             }
+            body = body.child(div().py_2().child("启动时打开")).child(startup);
         }
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
-                (
-                    "quick-access-new-tab",
-                    "默认在新标签页中打开快速访问的文件夹",
-                    settings.quick_access_new_tab,
-                ),
-                (
-                    "new-tab-this-pc",
-                    "新标签页打开此电脑（关闭时打开当前目录）",
-                    settings.new_tab_this_pc,
-                ),
                 (
                     "single",
                     "通过单击打开项目（指向时选定请使用复选框）",
@@ -4974,19 +5113,9 @@ impl Explorer {
                     settings.separate_process,
                 ),
                 (
-                    "shift-open-tab",
-                    "按住 Shift 打开文件夹时在新标签页中打开",
-                    settings.shift_open_tab,
-                ),
-                (
                     "remember",
                     "记住每个文件夹的查看方式",
                     settings.remember_views,
-                ),
-                (
-                    "folders-first",
-                    "始终将文件夹排列在文件前面",
-                    settings.folders_first,
                 ),
             ],
             1 => vec![
@@ -4998,11 +5127,6 @@ impl Explorer {
                 ("hidden", "显示隐藏的文件、文件夹和驱动器", settings.hidden),
                 ("protected", "显示受保护的操作系统文件", settings.protected),
                 ("checkboxes", "使用复选框以便选择项目", settings.checkboxes),
-                (
-                    "high-performance",
-                    "高性能模式（一屏加缓冲；不适用于中等及以上图标）",
-                    settings.high_performance,
-                ),
                 (
                     "thumbnails",
                     "显示文件缩略图（中等图标及以上）",
@@ -5029,6 +5153,33 @@ impl Explorer {
                     settings.preview,
                 ),
             ],
+            2 => vec![
+                (
+                    "quick-access-new-tab",
+                    "默认在新标签页中打开快速访问的文件夹",
+                    settings.quick_access_new_tab,
+                ),
+                (
+                    "new-tab-this-pc",
+                    "新标签页打开此电脑（关闭时打开当前目录）",
+                    settings.new_tab_this_pc,
+                ),
+                (
+                    "shift-open-tab",
+                    "按住 Shift 打开文件夹时在新标签页中打开",
+                    settings.shift_open_tab,
+                ),
+                (
+                    "folders-first",
+                    "始终将文件夹排列在文件前面",
+                    settings.folders_first,
+                ),
+                (
+                    "focus-existing-tab",
+                    "在新标签页中打开文件夹时，若已有同一目录的标签页则直接切换过去",
+                    settings.focus_existing_tab,
+                ),
+            ],
             _ => vec![],
         };
         if self.options_page == 0 {
@@ -5039,7 +5190,49 @@ impl Explorer {
                     .child("浏览文件夹与打开项目"),
             );
         }
-        if self.options_page == 0 {
+        if self.options_page == 1 {
+            let mut themes = div()
+                .flex()
+                .flex_wrap()
+                .flex_shrink_0()
+                .items_center()
+                .gap_2()
+                .child("外观");
+            for (id, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
+            {
+                themes = themes.child(
+                    button(SharedString::from(format!("theme-{id}")), label, t)
+                        .when(settings.theme == id, |d| d.bg(rgb(t.selection)))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            if let Some(s) = &mut v.options {
+                                s.theme = id.into();
+                            }
+                            cx.notify();
+                        })),
+                );
+            }
+            body = body.child(themes);
+        }
+        if self.options_page == 2 {
+            body = body.child(div().py_2().text_color(rgb(t.muted)).child("标签页与排序"));
+        }
+        if self.options_page == 4 {
+            body = body
+                .child(
+                    div()
+                        .py_2()
+                        .text_color(rgb(t.muted))
+                        .child("缓存与维护"),
+                )
+                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).child("清空图标、缩略图、文件夹大小和磁盘容量统计缓存；只删除本程序生成的文件。"))
+                .child(div().flex().flex_wrap().flex_shrink_0().gap_2()
+                    .child(button("options-clear-cache", "清空缓存", t).on_click(cx.listener(|v, _, _, cx| v.clear_caches(cx)))));
+            body = body.child(
+                div()
+                    .py_2()
+                    .text_color(rgb(t.muted))
+                    .child("默认文件夹（实验性）"),
+            );
             let status = rust_explorer::default_browser::status()
                 .unwrap_or_else(|e| format!("关联状态读取失败：{e:#}"));
             body = body.child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().child(format!("默认文件夹浏览器（实验性）：{status}。仅普通文件夹和驱动器。先试用 120 秒，确认后保留，超时自动恢复；与下方“应用”独立。")))
@@ -5065,86 +5258,27 @@ impl Explorer {
                     },
                 )),
             );
-        }
-        if self.options_page == 1 {
+            body = body
+                .child(div().py_2().text_color(rgb(t.muted)).child("性能"))
+                .child(self.setting_row(
+                    "high-performance",
+                    "高性能模式（一屏加缓冲；不适用于中等及以上图标）",
+                    settings.high_performance,
+                    cx,
+                ));
             let source = rust_explorer::fluent_icons::resource_status();
-            body = body.child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(format!(
+            body = body
+                .child(div().py_2().text_color(rgb(t.muted)).child("界面资源"))
+                .child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(format!(
                 "界面资源：{}（SVG {}，系统资源模块 {}）。仅引用本机文件，不复制到程序目录。",
                 source.source.map(|p| p.display().to_string()).unwrap_or_else(|| "当前系统".into()), source.svg_count, source.native_module_count
             ))).child(div().w_full().min_w_0().flex().flex_wrap().flex_shrink_0().gap_2()
                 .child(button("resource-file", "选择 DLL / EXE / MUN", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(false, cx))))
                 .child(button("resource-folder", "选择资源目录", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(true, cx))))
                 .child(button("resource-reset", "使用当前系统", t).on_click(cx.listener(|v, _, _, cx| v.load_resources(None, cx)))));
-            let mut themes = div()
-                .flex()
-                .flex_wrap()
-                .flex_shrink_0()
-                .items_center()
-                .gap_2()
-                .child("外观");
-            for (id, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
-            {
-                themes = themes.child(
-                    button(SharedString::from(format!("theme-{id}")), label, t)
-                        .when(settings.theme == id, |d| d.bg(rgb(t.selection)))
-                        .on_click(cx.listener(move |v, _, _, cx| {
-                            if let Some(s) = &mut v.options {
-                                s.theme = id.into();
-                            }
-                            cx.notify();
-                        })),
-                );
-            }
-            body = body
-                .child(themes)
-                .child(div().py_2().text_color(rgb(t.muted)).child("高级设置"));
         }
         for (id, label, checked) in options {
-            body = body.child(
-                div()
-                    .id(SharedString::from(format!("setting-{id}")))
-                    .min_h(ui(32.))
-                    .min_w_0()
-                    .w_full()
-                    .flex_shrink_0()
-                    .px_2()
-                    .py_1()
-                    .rounded(ui(4.))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(rgb(t.hover)))
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(visual::checkbox(checked, t.muted))
-                    .child(div().flex_1().min_w_0().whitespace_normal().child(label))
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        if let Some(s) = &mut v.options {
-                            match id {
-                                "quick-access-new-tab" => {
-                                    s.quick_access_new_tab = !s.quick_access_new_tab
-                                }
-                                "new-tab-this-pc" => s.new_tab_this_pc = !s.new_tab_this_pc,
-                                "single" => s.single_click = !s.single_click,
-                                "shift-open-tab" => s.shift_open_tab = !s.shift_open_tab,
-                                "separate" => s.separate_process = !s.separate_process,
-                                "remember" => s.remember_views = !s.remember_views,
-                                "folders-first" => s.folders_first = !s.folders_first,
-                                "extensions" => s.extensions = !s.extensions,
-                                "hidden" => s.hidden = !s.hidden,
-                                "protected" => s.protected = !s.protected,
-                                "checkboxes" => s.checkboxes = !s.checkboxes,
-                                "high-performance" => s.high_performance = !s.high_performance,
-                                "compact" => s.compact = !s.compact,
-                                "thumbnails" => s.thumbnails = !s.thumbnails,
-                                "full-system-menu" => s.full_system_menu = !s.full_system_menu,
-                                "full-path" => s.full_path = !s.full_path,
-                                "preview" => s.preview = !s.preview,
-                                _ => {}
-                            }
-                        }
-                        cx.notify();
-                    })),
-            )
+            body = body.child(self.setting_row(id, label, checked, cx));
         }
         if self.options_page == 1 {
             body = body.child(
@@ -5159,7 +5293,7 @@ impl Explorer {
                     })),
             );
         }
-        if self.options_page == 2 {
+        if self.options_page == 3 {
             body = body
                 .child(div().w_full().min_w_0().flex_shrink_0().py_2().whitespace_normal().child("搜索引擎：Everything（已安装时自动调用）"))
                 .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).line_height(ui(24.)).child("支持 Everything 查询语法。搜索框旁可切换当前文件夹 / 全盘范围。索引器不可用时，只筛选当前文件夹名称。目录内容、压缩包内容及系统索引服务集成未启用，避免后台扫描。"));
@@ -5282,5 +5416,29 @@ impl Explorer {
                     ),
             )
             .into_any_element()
+    }
+}
+/// Flip one pending option; only applied when the dialog is confirmed.
+fn toggle_option(settings: &mut Settings, id: &str) {
+    match id {
+        "quick-access-new-tab" => settings.quick_access_new_tab = !settings.quick_access_new_tab,
+        "new-tab-this-pc" => settings.new_tab_this_pc = !settings.new_tab_this_pc,
+        "single" => settings.single_click = !settings.single_click,
+        "shift-open-tab" => settings.shift_open_tab = !settings.shift_open_tab,
+        "separate" => settings.separate_process = !settings.separate_process,
+        "remember" => settings.remember_views = !settings.remember_views,
+        "folders-first" => settings.folders_first = !settings.folders_first,
+        "focus-existing-tab" => settings.focus_existing_tab = !settings.focus_existing_tab,
+        "extensions" => settings.extensions = !settings.extensions,
+        "hidden" => settings.hidden = !settings.hidden,
+        "protected" => settings.protected = !settings.protected,
+        "checkboxes" => settings.checkboxes = !settings.checkboxes,
+        "high-performance" => settings.high_performance = !settings.high_performance,
+        "compact" => settings.compact = !settings.compact,
+        "thumbnails" => settings.thumbnails = !settings.thumbnails,
+        "full-system-menu" => settings.full_system_menu = !settings.full_system_menu,
+        "full-path" => settings.full_path = !settings.full_path,
+        "preview" => settings.preview = !settings.preview,
+        _ => {}
     }
 }

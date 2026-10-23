@@ -20,6 +20,23 @@ pub fn recycled_row_count(viewport_height: f32, zoom: f32, total_rows: usize) ->
     total_rows.min(((viewport_height.max(0.) * zoom + 320.) / (26. * zoom)).ceil() as usize + 2)
 }
 
+/// Whether a right click targets one item cell. An unselected item only answers
+/// a hit on its icon, text or metadata regions; an item that is already
+/// selected answers anywhere inside its own cell.
+pub fn right_click_hits(
+    regions: &[(f32, f32, f32, f32)],
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    selected: bool,
+) -> bool {
+    let in_region = regions.iter().any(|(left, top, width, height)| {
+        x >= *left && x <= left + width && y >= *top && y <= top + height
+    });
+    in_region || (selected && x >= 0. && y >= 0. && x <= cell_width && y <= cell_height)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -50,6 +67,21 @@ mod tests {
             assert!((pool - 2) as f32 * 26. * zoom >= 600. * zoom + 320.);
         }
     }
+    #[test]
+    fn right_click_answers_the_whole_cell_only_for_a_selected_item() {
+        // One text region: icon plus name on a details row.
+        let regions = [(8., 4., 120., 26.)];
+        assert!(right_click_hits(&regions, 20., 10., 600., 34., false));
+        // Empty space of an unselected row stays with the background menu.
+        assert!(!right_click_hits(&regions, 400., 10., 600., 34., false));
+        // The same click on a selected row targets the item.
+        assert!(right_click_hits(&regions, 400., 10., 600., 34., true));
+        // Outside the cell is never the item, even when selected.
+        assert!(!right_click_hits(&regions, 601., 10., 600., 34., true));
+        assert!(!right_click_hits(&regions, 400., 35., 600., 34., true));
+        assert!(!right_click_hits(&regions, -1., 10., 600., 34., true));
+    }
+
     #[test]
     fn content_columns_cap_at_reference_dpi_and_hide_metadata_when_narrow() {
         let (wide, metadata) = content_columns(900., true);

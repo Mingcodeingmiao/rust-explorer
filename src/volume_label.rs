@@ -178,6 +178,14 @@ pub fn rename_with_elevation(path: &Path, label: &str) -> Result<()> {
 }
 
 pub fn rename_admin(encoded: &str) -> Result<()> {
+    // This elevated helper starts without an apartment; reading a mapped network
+    // drive goes through the Shell, which needs one.
+    let _ = unsafe {
+        windows::Win32::System::Com::CoInitializeEx(
+            None,
+            windows::Win32::System::Com::COINIT_APARTMENTTHREADED,
+        )
+    };
     ensure!(
         encoded.len() <= 32768 && encoded.len() % 2 == 0 && encoded.is_ascii(),
         "Invalid volume rename request"

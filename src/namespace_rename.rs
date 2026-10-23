@@ -164,7 +164,22 @@ fn template() -> Vec<u32> {
         .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
         .collect()
 }
-pub(super) fn computer(dark: bool) -> Result<()> {
+/// A namespace display name is not a file name on disk, but the Shell applies the
+/// same basic restrictions; validate here so the inline editor can report it.
+pub fn valid_computer_name(name: &str) -> Result<()> {
+    ensure!(!name.trim().is_empty(), "名称不能为空");
+    ensure!(
+        !name
+            .chars()
+            .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c)),
+        "名称包含无效字符"
+    );
+    Ok(())
+}
+
+/// Rename "This PC". With `name` the inline editor already collected the value;
+/// without it the explicit native prompt is used (the Shell's own verb path).
+pub(super) fn computer(dark: bool, name: Option<String>) -> Result<()> {
     unsafe {
         let mut raw = std::ptr::null_mut();
         SHParseDisplayName(
@@ -178,39 +193,46 @@ pub(super) fn computer(dark: bool) -> Result<()> {
         let current = SHGetNameFromIDList(pidl.0, SIGDN_NORMALDISPLAY)?;
         let initial = current.to_string().unwrap_or_else(|_| "此电脑".into());
         CoTaskMemFree(Some(current.0.cast()));
-        let mut state = Prompt {
-            initial,
-            name: None,
-            dark,
-        };
-        let bytes = template();
-        ensure!(
-            bytes.len() * 4 >= size_of::<DLGTEMPLATE>(),
-            "Invalid rename dialog template"
-        );
-        let result = DialogBoxIndirectParamW(
-            None,
-            bytes.as_ptr().cast(),
-            None,
-            Some(dialog_proc),
-            LPARAM((&mut state as *mut Prompt) as isize),
-        );
-        ensure!(result != -1, "Windows could not open the rename dialog");
-        if let Some(name) = state.name {
-            if name == state.initial {
-                return Ok(());
+        let chosen = if let Some(name) = name {
+            valid_computer_name(&name)?;
+            name.trim().to_string()
+        } else {
+            let mut state = Prompt {
+                initial: initial.clone(),
+                name: None,
+                dark,
+            };
+            let bytes = template();
+            ensure!(
+                bytes.len() * 4 >= size_of::<DLGTEMPLATE>(),
+                "Invalid rename dialog template"
+            );
+            let result = DialogBoxIndirectParamW(
+                None,
+                bytes.as_ptr().cast(),
+                None,
+                Some(dialog_proc),
+                LPARAM((&mut state as *mut Prompt) as isize),
+            );
+            ensure!(result != -1, "Windows could not open the rename dialog");
+            match state.name {
+                Some(name) => name,
+                None => return Ok(()),
             }
-            let parent: IShellFolder = SHBindToParent(pidl.0, None)?;
-            parent.SetNameOf(
-                None,
-                ILFindLastID(pidl.0),
-                PCWSTR(super::wide(&name).as_ptr()),
-                SHGDN_NORMAL,
-                None,
-            )?;
-            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_IDLIST, Some(pidl.0.cast()), None);
-            println!("computer-name:{name}");
+        };
+        if chosen == initial {
+            return Ok(());
         }
+        let parent: IShellFolder = SHBindToParent(pidl.0, None)?;
+        parent.SetNameOf(
+            None,
+            ILFindLastID(pidl.0),
+            PCWSTR(super::wide(&chosen).as_ptr()),
+            SHGDN_NORMAL,
+            None,
+        )?;
+        SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_IDLIST, Some(pidl.0.cast()), None);
+        println!("computer-name:{chosen}");
         Ok(())
     }
 }
@@ -229,5 +251,19 @@ pub(super) fn computer_name() -> Result<String> {
         let result = name.to_string();
         CoTaskMemFree(Some(name.0.cast()));
         Ok(result?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn computer_names_reject_empty_and_shell_invalid_values() {
+        assert!(super::valid_computer_name("我的电脑 2026").is_ok());
+        assert!(super::valid_computer_name("   ").is_err());
+        assert!(super::valid_computer_name("a/b").is_err());
+        assert!(super::valid_computer_name("a\"b").is_err());
+        assert!(super::valid_computer_name("a\nb").is_err());
+        // Leading/trailing spaces are trimmed by the caller, not rejected.
+        assert!(super::valid_computer_name("  工作机  ").is_ok());
     }
 }

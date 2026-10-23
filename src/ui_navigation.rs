@@ -7,9 +7,9 @@ pub(super) fn computer_name() -> String {
     computer_name_cache().read().unwrap().clone()
 }
 #[derive(Clone)]
-struct NavRow {
+pub(super) struct NavRow {
     label: String,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     depth: usize,
     expandable: bool,
     pinned: bool,
@@ -121,6 +121,7 @@ impl Explorer {
         if self.busy {
             return;
         }
+        self.context_origin = RenameSite::Tree;
         self.context_target = Some(path.clone());
         self.popup = None;
         self.submenu = None;
@@ -727,7 +728,7 @@ impl Explorer {
             });
         }
     }
-    fn nav_rows(&self) -> Vec<NavRow> {
+    pub(super) fn nav_rows(&self) -> Vec<NavRow> {
         let mut rows = vec![];
         let mut add = |label: &str, path: PathBuf, icon: &str| {
             rows.push(NavRow {
@@ -1039,15 +1040,22 @@ impl Explorer {
                                             t.text,
                                         )
                                     })
-                                    .child(
+                                    .child(if this.inline_rename.as_ref() == Some(&row.path)
+                                        && this.rename_site == super::RenameSite::Tree
+                                    {
+                                        let width = (width - row.depth as f32 * 12. - 48.)
+                                            .clamp(80., 360.);
+                                        this.inline_rename_overlay(("tree-rename", index), width)
+                                    } else {
                                         div()
                                             .flex_1()
                                             .min_w_0()
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
-                                            .child(row.label.clone()),
-                                    )
+                                            .child(row.label.clone())
+                                            .into_any_element()
+                                    })
                                     .when(pinned, |d| {
                                         d.child(
                                             div()
@@ -1132,6 +1140,8 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
+        let editing = self.inline_rename.as_ref() == Some(&volume.path)
+            && self.rename_site == super::RenameSite::List;
         let mode = self.view;
         let grid = matches!(
             mode,
@@ -1168,13 +1178,21 @@ impl Explorer {
             }
             _ => 0.,
         };
-        let capacity = volume.total.is_some_and(|n| n > 0) && volume.free.is_some();
-        let space = match (volume.total, volume.free) {
-            (Some(total), Some(free)) => format!(
+        // Optical media and volumes with no free bytes (full, read-only or empty
+        // drive) get no usage bar: it would always render as a misleading red bar.
+        let capacity = volume.kind != 5
+            && volume.total.is_some_and(|n| n > 0)
+            && volume.free.is_some_and(|free| free > 0);
+        let space = match (volume.total, volume.free, volume.kind) {
+            (Some(total), Some(free), 5) if free == 0 => {
+                format!("光盘 · 共 {}", fs::size_label(total))
+            }
+            (Some(total), Some(free), _) if free > 0 => format!(
                 "{} 可用，共 {}",
                 fs::size_label(free),
                 fs::size_label(total)
             ),
+            (Some(total), Some(_), _) => format!("0 字节可用，共 {}", fs::size_label(total)),
             _ if volume.kind == 7 => "便携设备 / MTP".into(),
             _ => volume
                 .remote
@@ -1378,7 +1396,15 @@ impl Explorer {
                 if key == "total" || key == "free" {
                     field = field.justify_end();
                 }
-                row = row.child(field.child(label(value).min_w_0()));
+                row =
+                    row.child(if key == "name" && editing {
+                        field.child(self.inline_rename_overlay(
+                            ("volume-rename", index),
+                            (*cell - 12.).max(80.),
+                        ))
+                    } else {
+                        field.child(label(value).min_w_0())
+                    });
             }
         } else {
             row = row.child(if volume.kind == 8 {
@@ -1394,7 +1420,12 @@ impl Explorer {
                 .when(tiles, |d| d.gap(ui(1.)).line_height(ui(16.)))
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
-                .child(if grid {
+                .child(if editing {
+                    self.inline_rename_overlay(
+                        ("volume-rename", index),
+                        (width - 16.).clamp(80., 360.),
+                    )
+                } else if grid {
                     icon_label(
                         &volume.label,
                         (width - 16.).max(24.),
