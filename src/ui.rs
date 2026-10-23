@@ -322,6 +322,7 @@ struct Explorer {
     entries: Arc<Vec<Entry>>,
     selected: BTreeSet<usize>,
     keyboard_cursor: Option<PathBuf>,
+    type_select: rust_explorer::type_select::TypeSelect,
     keyboard_focus_region: u8,
     view_wheel_remainder: f32,
     focus_item: Option<PathBuf>,
@@ -432,6 +433,20 @@ fn view_trace(message: impl std::fmt::Display) {
 }
 
 impl Explorer {
+    fn navigate_history(&mut self, direction: NavigationDirection, cx: &mut Context<Self>) {
+        if self.options.is_some() || (self.dialog.is_some() && self.inline_rename.is_none()) {
+            return;
+        }
+        let history = &mut self.tabs[self.active].history;
+        let changed = match direction {
+            NavigationDirection::Back => history.back(),
+            NavigationDirection::Forward => history.forward(),
+        };
+        if changed {
+            self.reload(cx);
+        }
+    }
+
     pub(super) fn begin_marquee(
         &mut self,
         event: &MouseDownEvent,
@@ -507,6 +522,7 @@ impl Explorer {
         if self.selected != selected {
             self.selected = selected;
             self.keyboard_cursor = None;
+            self.type_select.clear();
             cx.notify();
         }
         cx.notify();
@@ -904,6 +920,7 @@ impl Explorer {
             entries: Arc::new(vec![]),
             selected: BTreeSet::new(),
             keyboard_cursor: None,
+            type_select: Default::default(),
             keyboard_focus_region: 0,
             view_wheel_remainder: 0.,
             focus_item: None,
@@ -1301,6 +1318,8 @@ impl Explorer {
         self.selected.clear();
         self.focus_item = None;
         self.keyboard_cursor = None;
+        self.type_select.clear();
+        self.entries = Arc::new(vec![]);
         if !preserve_viewport {
             self.entries = Arc::new(vec![]);
             self.list_scroll.reset(0);
@@ -1585,6 +1604,7 @@ impl Explorer {
         self.rename_token += 1;
         self.selected_at = Instant::now();
         self.keyboard_cursor = None;
+        self.type_select.clear();
         if shift {
             self.selected = rust_explorer::file_filter::selection_range(&order, self.anchor, index)
                 .into_iter()
@@ -3012,6 +3032,7 @@ impl Explorer {
         {
             return;
         }
+        self.type_select.clear();
         let order = self.visible_file_order();
         let visible: std::collections::HashSet<_> = order.iter().copied().collect();
         if order.is_empty() {
@@ -3157,6 +3178,17 @@ impl Explorer {
         if !visible.contains(&index) {
             index = current;
         }
+        self.reveal_file(index, extend, focus_only, window, cx);
+    }
+
+    fn reveal_file(
+        &mut self,
+        index: usize,
+        extend: bool,
+        focus_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if focus_only {
             self.focus_item = Some(self.entries[index].path.clone());
             window.focus(&self.focus);
@@ -3684,6 +3716,50 @@ impl Render for Explorer {
                     }
                 }
             }))
+            .on_key_down(cx.listener(|v, event: &KeyDownEvent, w, cx| {
+                if !v.focus.is_focused(w)
+                    || v.options.is_some()
+                    || v.dialog.is_some()
+                    || v.popup.is_some()
+                    || v.inline_rename.is_some()
+                {
+                    v.type_select.clear();
+                    return;
+                }
+                let key = &event.keystroke;
+                if key.modifiers.control || key.modifiers.alt || key.modifiers.platform {
+                    v.type_select.clear();
+                    return;
+                }
+                let text = key.key_char.as_deref().unwrap_or(&key.key);
+                let mut chars = text.chars();
+                let Some(ch) = chars.next() else {
+                    return;
+                };
+                if chars.next().is_some() || !ch.is_alphanumeric() {
+                    v.type_select.clear();
+                    return;
+                }
+                let order = v.visible_file_order();
+                let current = v
+                    .keyboard_cursor
+                    .as_ref()
+                    .or(v.focus_item.as_ref())
+                    .and_then(|path| v.entries.iter().position(|e| &e.path == path))
+                    .filter(|i| order.contains(i))
+                    .or_else(|| v.selected.iter().rev().copied().find(|i| order.contains(i)));
+                let target = v
+                    .type_select
+                    .find(ch, Instant::now(), &order, current, |i| {
+                        v.entries[i].name.clone()
+                    });
+                if let Some(index) = target {
+                    let state = std::mem::take(&mut v.type_select);
+                    v.reveal_file(index, false, false, w, cx);
+                    v.type_select = state;
+                }
+                cx.stop_propagation();
+            }))
             .key_context("Explorer")
             .size_full()
             .flex()
@@ -3865,6 +3941,10 @@ impl Render for Explorer {
                 }
             }))
             .on_action(cx.listener(|v, _: &Back, _, cx| {
+                v.navigate_history(NavigationDirection::Back, cx);
+            }))
+            .on_action(cx.listener(|v, _: &Forward, _, cx| {
+                v.navigate_history(NavigationDirection::Forward, cx);
                 if v.options.is_some() || (v.dialog.is_some() && v.inline_rename.is_none()) {
                     return;
                 }
@@ -4090,7 +4170,12 @@ impl Render for Explorer {
             }));
 
         root = root
-            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, _| {
+            .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, cx| {
+                if let MouseButton::Navigate(direction) = e.button {
+                    v.navigate_history(direction, cx);
+                    cx.stop_propagation();
+                    return;
+                }
                 v.marquee = None;
                 v.pending_selection_click = None;
                 v.right_file_drag = None;
@@ -4328,6 +4413,12 @@ impl Render for Explorer {
                 _ => true,
             };
             let click = cx.listener(move |v, _, _, cx| match id {
+                "back" => {
+                    v.navigate_history(NavigationDirection::Back, cx);
+                }
+                "forward" => {
+                    v.navigate_history(NavigationDirection::Forward, cx);
+                }
                 "back" => v.go_back(cx),
                 "forward" => v.go_forward(cx),
                 "up" => v.go_up(cx),
