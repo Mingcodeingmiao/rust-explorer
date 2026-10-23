@@ -334,16 +334,10 @@ fn read_directory_find(path: &Path, cancelled: &Arc<AtomicBool>) -> Result<(Vec<
         Win32::Storage::FileSystem::{FindClose, FindFirstFileW, FindNextFileW, WIN32_FIND_DATAW},
         core::PCWSTR,
     };
-    let mut pattern = path.to_path_buf();
-    pattern.push("*");
-    // FindFirstFileW needs the extended prefix for paths beyond MAX_PATH.
-    let wide: Vec<u16> = if pattern.as_os_str().len() > 240 && pattern.is_absolute() {
-        let mut prefixed = std::ffi::OsString::from(r"\\?\");
-        prefixed.push(pattern.as_os_str());
-        prefixed.encode_wide().chain(Some(0)).collect()
-    } else {
-        pattern.as_os_str().encode_wide().chain(Some(0)).collect()
-    };
+    let wide: Vec<u16> = directory_pattern(path)
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
     let mut data = WIN32_FIND_DATAW::default();
     let handle = match unsafe { FindFirstFileW(PCWSTR(wide.as_ptr()), &mut data) } {
         Ok(handle) => handle,
@@ -376,6 +370,25 @@ fn read_directory_find(path: &Path, cancelled: &Arc<AtomicBool>) -> Result<(Vec<
     }
     let _ = unsafe { FindClose(handle) };
     Ok((entries, skipped))
+}
+
+#[cfg(windows)]
+fn directory_pattern(path: &Path) -> std::ffi::OsString {
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    let pattern = path.join("*");
+    let units: Vec<u16> = pattern.as_os_str().encode_wide().collect();
+    if units.len() <= 240 || !pattern.is_absolute() || units.starts_with(&[92, 92, 63, 92]) {
+        return pattern.into_os_string();
+    }
+    if units.starts_with(&[92, 92]) {
+        let mut extended = std::ffi::OsString::from(r"\\?\UNC\");
+        extended.push(std::ffi::OsString::from_wide(&units[2..]));
+        extended
+    } else {
+        let mut extended = std::ffi::OsString::from(r"\\?\");
+        extended.push(pattern);
+        extended
+    }
 }
 
 #[cfg(windows)]
@@ -575,6 +588,30 @@ impl History {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(windows)]
+    #[test]
+    fn directory_patterns_preserve_extended_and_unc_roots() {
+        let tail = "x".repeat(260);
+        let drive = format!("C:\\{tail}");
+        assert_eq!(
+            directory_pattern(Path::new(&drive)),
+            std::ffi::OsString::from(format!("\\\\?\\{drive}\\*"))
+        );
+        let extended = format!("\\\\?\\C:\\{tail}");
+        assert_eq!(
+            directory_pattern(Path::new(&extended)),
+            std::ffi::OsString::from(format!("{extended}\\*"))
+        );
+        let unc = format!("\\\\server\\share\\{tail}");
+        assert_eq!(
+            directory_pattern(Path::new(&unc)),
+            std::ffi::OsString::from(format!("\\\\?\\UNC\\server\\share\\{tail}\\*"))
+        );
+        assert_eq!(
+            directory_pattern(Path::new("C:\\short")),
+            std::ffi::OsString::from("C:\\short\\*")
+        );
+    }
     #[test]
     fn modified_sort_keeps_files_before_folders_in_both_directions() {
         let file = recycled("file", "recycle:0000", "D:\\", 1);
