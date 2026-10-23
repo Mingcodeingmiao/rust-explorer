@@ -1,5 +1,10 @@
 # Known limitations / 已知边界
 
+> [!WARNING]
+> **0.7.7 part1：Windows 原生右键菜单仍有问题，尚未完全修复。** Windows 10 下文件菜单可能仍有深浅色或样式不一致；不同系统和 Shell 扩展的行为仍需继续排查。本轮主要在 Windows 11 验证，不能据此宣称 Windows 10 菜单已经修复。
+>
+> **Windows native context menus remain a known issue.** Inconsistent styling may persist on Windows 10; broader OS and Shell-extension validation is still needed.
+
 - Windows 10/11 x64 only. Current validation is primarily on Windows 11 with the GNU toolchain; hosted MSVC CI provides additional build coverage. There is no claim of full Explorer parity.
 - Undo/redo covers operations successfully recorded by this application. Overwrite, directory merge, permanent deletion or operations without safe receipts create a history barrier. External changes and destination conflicts may prevent replay. See [file history](docs/file-history-062.md).
 - USB eject, BitLocker, formatting, network disconnect, volume-label changes and sharing permission changes are delegated to the OS. Hardware/permission combinations have not all been tested. Automated tests do not perform destructive device operations.
@@ -8,6 +13,9 @@
 - DPI, IME, narrow windows, all filter combinations and third-party Shell extensions have not been exhaustively tested. Third-party software compatibility layers are intentionally outside the project's scope.
 - Everything is optional. Without a usable installed Everything client/SDK, search falls back to filtering names in the current directory; it does not silently scan the entire disk.
 - Release binaries are currently unsigned. Verify the release checksum and source before running.
+- Version 0.7.6 includes experimental folder/drive associations (introduced in 0.7.3), disabled by default. They do not replace Win+E, the desktop Shell or software that explicitly starts Explorer. Keep the recovery files and restore the association before moving/removing the executable. See [recovery instructions](docs/default-folder-browser.md).
+- Dual-pane browsing, a separate top favorites bar and folder backgrounds are not implemented in 0.7.7. Blank-area double-click-up and optional reuse of an existing folder tab are implemented. Quick Access can optionally open folders in new tabs. See the [roadmap](ROADMAP.md); other contributor PRs are not automatically included.
+- In the 2026-10-21 revision of 0.7.6 (PR #30), owner-backed UI context menus run on an independent STA thread inside the application process, avoiding a new helper and cold extension loading on every click. A hanging/crashing third-party menu extension can still affect that thread/process; menus close through normal menu interaction, not helper force-stop. File operations retain separate cancellable helpers. Stopping them does not roll back completed changes, and external/elevated Windows hosts may need manual closing. Format completion means the dialog launch request completed, not that the drive was formatted.
 
 See the detailed [0.6.2 audit](docs/audit-0.6.2.md) for the distinction between source checks and actual GUI validation. Please report reproducible issues using disposable files and the repository's bug template.
 

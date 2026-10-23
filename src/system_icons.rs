@@ -28,6 +28,44 @@ pub struct IconBitmap {
     /// Straight (not premultiplied) sRGB RGBA, top row first.
     pub rgba: Vec<u8>,
 }
+fn trim_icon_padding(icon: IconBitmap) -> IconBitmap {
+    let Some(image) = image::RgbaImage::from_raw(icon.width, icon.height, icon.rgba.clone()) else {
+        return icon;
+    };
+    let (mut left, mut top, mut right, mut bottom) = (icon.width, icon.height, 0, 0);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] > 16 {
+            left = left.min(x);
+            top = top.min(y);
+            right = right.max(x + 1);
+            bottom = bottom.max(y + 1);
+        }
+    }
+    if right <= left || bottom <= top {
+        return icon;
+    }
+    let crop = image::imageops::crop_imm(&image, left, top, right - left, bottom - top).to_image();
+    let scale =
+        (icon.width.min(icon.height) as f32 * 0.92) / crop.width().max(crop.height()) as f32;
+    let resized = image::imageops::resize(
+        &crop,
+        (crop.width() as f32 * scale).round().max(1.) as u32,
+        (crop.height() as f32 * scale).round().max(1.) as u32,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut canvas = image::RgbaImage::new(icon.width, icon.height);
+    image::imageops::overlay(
+        &mut canvas,
+        &resized,
+        ((icon.width - resized.width()) / 2) as i64,
+        ((icon.height - resized.height()) / 2) as i64,
+    );
+    IconBitmap {
+        width: icon.width,
+        height: icon.height,
+        rgba: canvas.into_raw(),
+    }
+}
 
 fn wide(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
     value.as_ref().encode_wide().chain(Some(0)).collect()
@@ -38,6 +76,22 @@ fn pixels(value: u32) -> Result<u32> {
         bail!("icon size must be 8..=256 pixels");
     }
     Ok(value)
+}
+
+/// STA apartment for Shell icon handlers that are COM servers. Returns `None`
+/// when the thread already lives in an apartment (MTA or STA), so the caller
+/// never changes an existing COM configuration.
+fn sta_apartment() -> Option<Apartment> {
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }
+        .is_ok()
+        .then_some(Apartment)
+}
+struct Apartment;
+impl Drop for Apartment {
+    fn drop(&mut self) {
+        unsafe { windows::Win32::System::Com::CoUninitialize() };
+    }
 }
 
 struct Icon(HICON);
@@ -87,6 +141,11 @@ pub fn folder_has_custom_icon(path: &Path) -> bool {
 /// Obtain Explorer's associated file-type icon without reading normal files.
 /// Executables, shortcuts and .ico files retain their per-item Shell icon.
 pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> {
+    // Internet shortcuts (`.url` with `IconFile=`) and several shell handlers are
+    // COM servers. Without an apartment the Shell silently returns the generic
+    // page for them, so ask for one STA apartment when this thread has none. A
+    // thread already in an MTA keeps working as before.
+    let _apartment = sta_apartment();
     let size = pixels(size)?;
     let shell_root = path.to_string_lossy().starts_with("mtp-root:");
     if directory {
@@ -97,17 +156,19 @@ pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> 
                 return Ok(icon);
             }
         }
-        if path.is_absolute() && folder_has_custom_icon(path) {
-            if let Ok(icon) = shell_image(path, true, size, false) {
-                return Ok(icon);
-            }
-        }
         if path.parent().is_none() && path.has_root() {
             // Let the Shell supply the current Windows/BitLocker/optical overlays.
             if let Ok(icon) = shell_image(path, true, size, false) {
                 return Ok(icon);
             }
             return stock_icon(SIID_DRIVEFIXED, size);
+        }
+        if path.is_absolute() && folder_has_custom_icon(path) {
+            // Only reached for a folder requested by its real path (drive roots and
+            // other per-item callers); ordinary folders share one attribute icon.
+            if let Ok(icon) = shell_image(path, true, size, false) {
+                return Ok(icon);
+            }
         }
         // Preserve the native icons of the user's actual known folders, even
         // when OneDrive or a policy has redirected them to a different drive.
@@ -322,7 +383,26 @@ fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Res
     };
     anyhow::ensure!(result != 0, "Shell icon unavailable");
     let small = Icon(info.hIcon);
+    let extension = path
+        .extension()
+        .map(|value| value.to_string_lossy().to_ascii_lowercase())
+        .unwrap_or_default();
+    // An internet shortcut's icon comes from the file itself (`IconFile=`) and only
+    // exists as an icon handle: its image-list index points at a *different* icon in
+    // the extra-large list, which is why `.url` files used to appear as blank pages.
+    // `.ico` and `.cur` are their own artwork for the same reason.
+    let file_icon = path.is_absolute() && matches!(extension.as_str(), "url" | "ico" | "cur");
+    if file_icon && !small.0.is_invalid() {
+        return bitmap(small.0, size);
+    }
     if size <= 32 && !small.0.is_invalid() {
+        return bitmap(small.0, size);
+    }
+    let index = info.iIcon & 0x00ffffff;
+    // A shortcut whose target icon cannot be placed in the image lists comes back
+    // with index 0 (the generic page), so keep its handle instead.
+    let self_icon = path.is_absolute() && extension == "lnk";
+    if index == 0 && self_icon && !small.0.is_invalid() {
         return bitmap(small.0, size);
     }
     let list: IImageList = unsafe {
@@ -332,9 +412,14 @@ fn shell_image(path: &Path, directory: bool, size: u32, attributes: bool) -> Res
             SHIL_EXTRALARGE
         } as i32)?
     };
-    let index = info.iIcon & 0x00ffffff;
     let overlay = ((info.iIcon as u32 >> 24) & 0xff) << 8;
-    let icon = Icon(unsafe { list.GetIcon(index, ILD_TRANSPARENT.0 | overlay)? });
+    let drawn = unsafe { list.GetIcon(index, ILD_TRANSPARENT.0 | overlay) };
+    let icon = match drawn {
+        Ok(icon) => Icon(icon),
+        // The list has no such entry: fall back to the icon handle we received.
+        Err(_) if !small.0.is_invalid() => small,
+        Err(error) => return Err(error.into()),
+    };
     bitmap(icon.0, size)
 }
 
@@ -353,61 +438,65 @@ fn generic_file_index() -> Option<i32> {
     })
 }
 
-/// Load a visually verified Windows resource or a documented Shell stock icon.
-/// Missing/unverified resources return an error so the caller can draw its
-/// original Fluent fallback. Numeric resource identifiers are not OS contracts.
-fn desktop_icon(size: u32) -> Result<IconBitmap> {
-    // Resolve the real Desktop shell item rather than reusing the computer stock icon.
-    let pidl = unsafe { SHGetKnownFolderIDList(&FOLDERID_Desktop, 0, None)? };
-    let mut info = SHFILEINFOW::default();
-    let result = unsafe {
-        SHGetFileInfoW(
-            PCWSTR(pidl.cast()),
-            FILE_ATTRIBUTE_NORMAL,
-            Some(&mut info),
-            size_of::<SHFILEINFOW>() as u32,
-            SHGFI_PIDL
-                | SHGFI_ICON
-                | SHGFI_SYSICONINDEX
-                | if size <= 16 {
-                    SHGFI_SMALLICON
-                } else {
-                    SHGFI_LARGEICON
-                },
-        )
-    };
-    unsafe {
-        windows::Win32::System::Com::CoTaskMemFree(Some(pidl.cast()));
-    }
-    anyhow::ensure!(
-        result != 0 && !info.hIcon.is_invalid(),
-        "Desktop shell icon unavailable"
-    );
-    let icon = Icon(info.hIcon);
-    if size > 32 {
-        use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
-        let list: IImageList = unsafe {
-            SHGetImageList(if size > 48 {
-                SHIL_JUMBO
-            } else {
-                SHIL_EXTRALARGE
-            } as i32)?
+pub fn windows_11() -> bool {
+    static VERSION: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *VERSION.get_or_init(|| unsafe {
+        use windows::Win32::System::SystemInformation::{GetVersionExW, OSVERSIONINFOW};
+        let mut version = OSVERSIONINFOW {
+            dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+            ..Default::default()
         };
-        let large = Icon(unsafe { list.GetIcon(info.iIcon, ILD_TRANSPARENT.0)? });
-        return bitmap(large.0, size);
-    }
-    bitmap(icon.0, size)
+        GetVersionExW(&mut version).is_ok() && version.dwBuildNumber >= 22000
+    })
 }
-
+pub fn has_ui_icon(name: &str) -> bool {
+    matches!(
+        name,
+        "network"
+            | "pin"
+            | "recycle-bin"
+            | "folder"
+            | "folder-open"
+            | "drive"
+            | "search"
+            | "rename"
+            | "delete"
+            | "computer"
+            | "computer-colored"
+            | "desktop"
+            | "video"
+            | "video-file"
+            | "image"
+            | "image-file"
+            | "audio"
+            | "audio-file"
+            | "file"
+            | "up"
+            | "refresh"
+            | "new-folder"
+            | "cut"
+            | "copy"
+            | "paste"
+            | "preview"
+            | "home"
+            | "downloads"
+            | "documents"
+            | "pictures"
+            | "music"
+            | "videos"
+            | "close"
+    )
+}
 pub fn ui_icon(name: &str, size: u32) -> Result<IconBitmap> {
     let size = pixels(size)?;
-    if name == "desktop" {
-        if let Ok(icon) = desktop_icon(size) {
-            return Ok(icon);
-        }
+    match name {
+        "desktop" => return resource_icon("imageres.dll", 183, size),
+        "network" => return resource_icon("imageres.dll", 25, size),
+        "pin" => return resource_icon("imageres.dll", 5100, size).map(trim_icon_padding),
+        "computer" | "computer-colored" => return resource_icon("imageres.dll", 109, size),
+        _ => {}
     }
     let stock = match name {
-        "network" => Some(SIID_WORLD),
         "recycle-bin" => Some(SIID_RECYCLER),
         "folder" => Some(SIID_FOLDER),
         "folder-open" => Some(SIID_FOLDEROPEN),

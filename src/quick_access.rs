@@ -23,6 +23,25 @@ pub struct Item {
     pub pinned: Option<bool>,
 }
 
+/// Quick Access list read earlier in this process. A window that opens later reuses
+/// it instead of spawning (and waiting for) another helper.
+static CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Item>)>> =
+    std::sync::Mutex::new(None);
+const CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Cached list from this process, if it was read recently enough to be reused.
+pub fn cached() -> Option<Vec<Item>> {
+    let guard = CACHE.lock().ok()?;
+    let (taken, items) = guard.as_ref()?;
+    (taken.elapsed() < CACHE_TTL).then(|| items.clone())
+}
+
+pub fn remember(items: &[Item]) {
+    if let Ok(mut guard) = CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), items.to_vec()));
+    }
+}
+
 struct MenuInventory {
     menu: IContextMenu,
     commands: Vec<(u32, String)>,
@@ -169,7 +188,11 @@ unsafe fn display_name(item: &IShellItem, kind: SIGDN) -> Result<String> {
 }
 
 pub fn snapshot() -> Result<Vec<Item>> {
+    let trace = std::env::var_os("RUST_EXPLORER_QUICK_ACCESS_TRACE").is_some();
     unsafe {
+        if trace {
+            eprintln!("quick-access: initialize");
+        }
         CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()?;
         let _apartment = Apartment;
         // The same shell namespace used by Explorer's Quick Access location.
@@ -177,9 +200,19 @@ pub fn snapshot() -> Result<Vec<Item>> {
             w!("shell:::{679f85cb-0220-4080-b29b-5540cc05aab6}"),
             None,
         )?;
+        if trace {
+            eprintln!("quick-access: bind enumeration");
+        }
         let enumeration: IEnumShellItems = root.BindToHandler(None, &BHID_EnumItems)?;
         let mut items = Vec::new();
+        // Never instantiate context menus while loading the list. A single Shell
+        // extension can block QueryContextMenu beyond the entire helper deadline;
+        // checking elapsed time before that call cannot bound its duration. Pin
+        // commands resolve their canonical verbs separately in set_pinned().
         loop {
+            if trace {
+                eprintln!("quick-access: next {}", items.len());
+            }
             let mut fetched = 0;
             let mut batch = [None];
             enumeration.Next(&mut batch, Some(&mut fetched))?;
@@ -204,9 +237,6 @@ pub fn snapshot() -> Result<Vec<Item>> {
             items.push(Item {
                 name,
                 path: path.into(),
-                // Do not instantiate a context menu here: namespace extension
-                // handlers can take seconds per item. Pin state is unknown
-                // until an explicit action; frequent items remain visible.
                 pinned: None,
             });
             if items.len() >= 256 {

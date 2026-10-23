@@ -1,6 +1,6 @@
 [package]
 name = "rust-explorer"
-version = "0.7.2"
+version = "0.7.7"
 edition = "2024"
 license = "Apache-2.0"
 description = "A Windows file manager built with Rust and GPUI"
@@ -14,6 +14,7 @@ default = ["desktop"]
 desktop = ["dep:gpui", "dep:unicode-segmentation", "dep:notify"]
 
 [dependencies]
+rust-explorer-i18n-macros = { path = "crates/i18n-macros" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,16 +23,18 @@ encoding_rs = "0.8"
 pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
 libloading = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
+sha2 = "0.10"
 gpui = { version = "=0.2.2", default-features = false, optional = true }
 unicode-segmentation = { version = "1", optional = true }
 notify = { version = "8", optional = true }
 windows-registry = "0.5"
 windows-core = "0.61"
 raw-window-handle = "0.6"
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [dependencies.windows]
 version = "0.61"
-features = ["Win32_Globalization", "Data_Pdf", "Storage", "Storage_Streams", "Graphics_Imaging", "Foundation", "Win32_System_WinRT", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse"]
+features = ["Win32_Security", "Win32_Globalization", "Data_Pdf", "Storage", "Storage_Streams", "Graphics_Imaging", "Foundation", "Win32_System_WinRT", "Win32_System_Threading", "Win32_System_Diagnostics_Debug", "Win32_System_SystemInformation", "Win32_System_SystemServices", "Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_Com_StructuredStorage", "Win32_System_Ole", "Win32_System_DataExchange", "Win32_System_Memory", "Win32_System_Registry", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Variant", "Win32_UI_Shell_Common", "Win32_UI_Controls", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse"]
 
 [[bin]]
 name = "rust-explorer"
@@ -39,6 +42,7 @@ path = "src/main.rs"
 
 [build-dependencies]
 embed-resource = "3"
+cc = "1"
 
 [profile.dev]
 debug = 0

@@ -1,8 +1,27 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+use anyhow::Context;
 
 fn main() {
+    rust_explorer::i18n::set_language(&rust_explorer::settings::Settings::load().language);
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
+        Some("--open-folder") => args
+            .get(2)
+            .context("缺少文件夹路径")
+            .and_then(|path| rust_explorer::shell_bridge::open(std::path::Path::new(path))),
+        Some("--folder-association-guard") => rust_explorer::default_browser::guard_main(
+            args.get(2).map(String::as_str).unwrap_or(""),
+        ),
+        Some("--test-folder-browser") => rust_explorer::default_browser::begin_trial(
+            args.get(2).and_then(|s| s.parse().ok()).unwrap_or(120),
+        ),
+        Some("--confirm-folder-browser") => rust_explorer::default_browser::confirm_trial(),
+        Some("--folder-association-status") => rust_explorer::default_browser::diagnostics()
+            .and_then(|v| {
+                println!("{}", serde_json::to_string_pretty(&v)?);
+                Ok(())
+            }),
+        Some("--restore-folder-browser") => rust_explorer::default_browser::disable(),
         Some("--shell-parent") => (|| -> anyhow::Result<()> {
             let path: std::path::PathBuf =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
@@ -112,6 +131,22 @@ fn main() {
                     Ok(())
                 })
         }
+        Some("--rename-volume-admin") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少驱动器重命名请求"))
+            .and_then(|value| rust_explorer::volume_label::rename_admin(value)),
+        // Elevated helper for the drive context menu's "Format" verb: the format
+        // dialog has to run in an administrator process, and it is modal there.
+        Some("--format-drive") => args
+            .get(2)
+            .ok_or_else(|| anyhow::anyhow!("缺少要格式化的驱动器"))
+            .and_then(|value| rust_explorer::shell::format_drive(value)),
+        Some("--shell-server") => {
+            if let Some(pid) = args.get(2).and_then(|value| value.parse::<u32>().ok()) {
+                rust_explorer::shell::watch_parent_process(pid);
+            }
+            rust_explorer::shell::serve_menu_requests()
+        }
         Some("--shell-stdin") => rust_explorer::shell::read_request(std::io::stdin().lock())
             .and_then(rust_explorer::shell::dispatch),
         Some("--shell") => args
@@ -122,7 +157,31 @@ fn main() {
         _ => {
             #[cfg(feature = "desktop")]
             {
-                ui::run();
+                let launch = match rust_explorer::launch_request::current() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        eprintln!("{error:#}");
+                        // Release builds have no console: do not fail invisibly.
+                        let message: Vec<u16> = format!("无法打开目标位置：\n{error:#}")
+                            .encode_utf16()
+                            .chain(Some(0))
+                            .collect();
+                        unsafe {
+                            use windows::Win32::UI::WindowsAndMessaging::*;
+                            MessageBoxW(
+                                None,
+                                windows::core::PCWSTR(message.as_ptr()),
+                                windows::core::w!("Rust Explorer"),
+                                MB_OK | MB_ICONERROR,
+                            );
+                        }
+                        std::process::exit(1);
+                    }
+                };
+                let (_instance, forwarded) = rust_explorer::instance::handoff(launch.as_ref());
+                if !forwarded {
+                    ui::run(launch);
+                }
                 Ok(())
             }
             #[cfg(not(feature = "desktop"))]

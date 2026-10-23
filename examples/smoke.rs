@@ -50,6 +50,7 @@ fn main() -> Result<()> {
     let mut entries = Vec::new();
     for i in (0..100_000).rev() {
         entries.push(fs::Entry {
+            recycle: None,
             path: PathBuf::from(format!("{i}.txt")),
             name: format!("文件{i}.txt"),
             directory: false,

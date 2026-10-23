@@ -9,7 +9,12 @@ use windows::{Win32::Storage::FileSystem::*, core::PCWSTR};
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Volume {
     pub path: PathBuf,
+    /// Display name, including the drive letter suffix (`Data (D:)`).
     pub label: String,
+    /// Raw kernel volume label (`Data`), empty when the volume has none. Renaming
+    /// must start from this value, never from [`Volume::label`].
+    #[serde(default)]
+    pub name: String,
     pub kind: u32,
     pub total: Option<u64>,
     pub free: Option<u64>,
@@ -17,6 +22,14 @@ pub struct Volume {
     pub remote: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+}
+/// The kernel volume label of a drive, for the inline rename editor.
+pub fn rename_initial(volume: &Volume) -> String {
+    if volume.kind == 4 {
+        // Mapped network drives are renamed by display name; keep the suffix off.
+        return volume.label.clone();
+    }
+    volume.name.clone()
 }
 pub fn computer() -> PathBuf {
     PathBuf::from("::ThisPC")
@@ -57,6 +70,10 @@ pub fn basic(path: &Path) -> Volume {
         kind = 4;
     }
     let name = match kind {
+        // DRIVE_UNKNOWN / DRIVE_NO_ROOT_DIR: a removed or disconnected mapping
+        // still has a letter in HKCU\Network, so never call it a local disk.
+        0 => "未知设备",
+        1 => "未连接",
         2 => "可移动磁盘",
         4 => "网络驱动器",
         5 => "DVD 驱动器",
@@ -65,7 +82,11 @@ pub fn basic(path: &Path) -> Volume {
     };
     Volume {
         path: path.to_path_buf(),
-        label: format!("{} ({letter}:)", remote.as_deref().unwrap_or(name)),
+        label: format!(
+            "{} ({letter}:)",
+            remote.as_deref().unwrap_or(crate::i18n::text(name))
+        ),
+        name: String::new(),
         kind,
         total: None,
         free: None,
@@ -74,7 +95,39 @@ pub fn basic(path: &Path) -> Volume {
         read_only: kind == 5,
     }
 }
+/// `SEM_FAILCRITICALERRORS` must already be active for the *first* query against
+/// a possibly-disconnected network drive, and the previous mode must be restored
+/// afterwards. Both were wrong before: the guard was installed after the first
+/// `GetDiskFreeSpaceExW` and never undone.
+pub(crate) struct QuietVolumeErrors {
+    previous: windows::Win32::System::Diagnostics::Debug::THREAD_ERROR_MODE,
+    active: bool,
+}
+impl QuietVolumeErrors {
+    pub(crate) fn suppress() -> Self {
+        use windows::Win32::System::Diagnostics::Debug::{
+            SEM_FAILCRITICALERRORS, SetThreadErrorMode, THREAD_ERROR_MODE,
+        };
+        let mut previous = THREAD_ERROR_MODE(0);
+        let active =
+            unsafe { SetThreadErrorMode(SEM_FAILCRITICALERRORS, Some(&mut previous)) }.is_ok();
+        Self { previous, active }
+    }
+}
+impl Drop for QuietVolumeErrors {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
+                    self.previous,
+                    None,
+                );
+            }
+        }
+    }
+}
 pub fn info(path: &Path) -> Volume {
+    let _quiet = QuietVolumeErrors::suppress();
     let mut volume = basic(path);
     if volume.kind == 4 {
         // This function runs only in a killable helper (800 ms total budget).
@@ -96,10 +149,6 @@ pub fn info(path: &Path) -> Volume {
         }
         let mut flags = 0;
         unsafe {
-            let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
-                windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
-                None,
-            );
             if GetVolumeInformationW(
                 PCWSTR(path.as_ptr()),
                 None,
@@ -123,10 +172,6 @@ pub fn info(path: &Path) -> Volume {
     let mut flags = 0;
     unsafe {
         // Empty optical/card readers must not raise a system error dialog.
-        let _ = windows::Win32::System::Diagnostics::Debug::SetThreadErrorMode(
-            windows::Win32::System::Diagnostics::Debug::SEM_FAILCRITICALERRORS,
-            None,
-        );
         if GetVolumeInformationW(
             PCWSTR(path.as_ptr()),
             Some(&mut name),
@@ -144,6 +189,7 @@ pub fn info(path: &Path) -> Volume {
             if !label.is_empty() {
                 let letter = volume.path.to_string_lossy().chars().next().unwrap_or('?');
                 volume.label = format!("{label} ({letter}:)");
+                volume.name = label;
             }
             volume.filesystem = String::from_utf16_lossy(
                 &filesystem[..filesystem
@@ -214,40 +260,109 @@ pub fn bounded<T: serde::de::DeserializeOwned>(
     );
     Ok(serde_json::from_slice(&output)?)
 }
+/// Snapshot taken earlier in this process. All windows live in one process, so a
+/// window that opens later can reuse the drive list instead of enumerating every
+/// drive (and spawning a helper per drive) again.
+static SNAPSHOT_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<Volume>)>> =
+    std::sync::Mutex::new(None);
+const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Snapshot from this process, if one was taken recently enough to be reused.
+pub fn cached_snapshot() -> Option<Vec<Volume>> {
+    let guard = SNAPSHOT_CACHE.lock().ok()?;
+    let (taken, volumes) = guard.as_ref()?;
+    (taken.elapsed() < SNAPSHOT_TTL).then(|| volumes.clone())
+}
+
+pub fn remember_snapshot(volumes: &[Volume]) {
+    if let Ok(mut guard) = SNAPSHOT_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), volumes.to_vec()));
+    }
+}
+/// Last portable-device enumeration. The Shell namespace walk is the slow part of
+/// a snapshot (and it can time out while the phone is busy), so the result is kept
+/// for a minute: a window opened in that time shows the phone immediately instead
+/// of letting it disappear and come back. A disconnect is reflected on the next
+/// enumeration after this window.
+static DEVICE_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, PathBuf)>)>> =
+    std::sync::Mutex::new(None);
+const DEVICE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn cached_devices() -> Vec<(String, PathBuf)> {
+    let Ok(guard) = DEVICE_CACHE.lock() else {
+        return Vec::new();
+    };
+    guard
+        .as_ref()
+        .filter(|(taken, _)| taken.elapsed() < DEVICE_TTL)
+        .map(|(_, devices)| devices.clone())
+        .unwrap_or_default()
+}
+
+fn remember_devices(devices: &[(String, PathBuf)]) {
+    if let Ok(mut guard) = DEVICE_CACHE.lock() {
+        *guard = Some((std::time::Instant::now(), devices.to_vec()));
+    }
+}
+
+fn append_devices(result: &mut Vec<Volume>, devices: &[(String, PathBuf)]) {
+    for (label, path) in devices {
+        if result.iter().any(|volume| volume.path == *path) {
+            continue;
+        }
+        result.push(Volume {
+            path: path.clone(),
+            label: label.clone(),
+            name: label.clone(),
+            kind: 7,
+            total: None,
+            free: None,
+            filesystem: "MTP".into(),
+            remote: None,
+            read_only: false,
+        });
+    }
+}
 pub fn snapshot() -> Vec<Volume> {
-    let mut result: Vec<Volume> = roots()
-        .into_iter()
-        .map(|path| {
-            let basic = basic(&path);
-            bounded(
-                "--volume-info",
-                &serde_json::to_string(&path).unwrap(),
-                Duration::from_millis(800),
-            )
-            .unwrap_or(basic)
-        })
-        .collect();
+    let roots = roots();
+    let mut result: Vec<Volume> = std::thread::scope(|scope| {
+        let tasks: Vec<_> = roots
+            .iter()
+            .map(|path| {
+                scope.spawn(move || {
+                    bounded(
+                        "--volume-info",
+                        &serde_json::to_string(path).unwrap(),
+                        Duration::from_millis(800),
+                    )
+                    .unwrap_or_else(|_| basic(path))
+                })
+            })
+            .collect();
+        tasks
+            .into_iter()
+            .zip(&roots)
+            .map(|(task, path)| task.join().unwrap_or_else(|_| basic(path)))
+            .collect()
+    });
+    // Publish local capacities before a disconnected phone/network provider is
+    // allowed to consume its own timeout budget. Known portable devices ride
+    // along so this early snapshot never shows a phone-less list to a window
+    // that opens in the meantime.
+    append_devices(&mut result, &cached_devices());
+    remember_snapshot(&result);
     // Portable/MTP devices have no filesystem path; list them through the
     // Shell namespace in an isolated helper.
-    if let Ok(devices) =
-        bounded::<Vec<(String, PathBuf)>>("--shell-devices", "", Duration::from_millis(2500))
-    {
-        for (label, path) in devices {
-            if result.iter().any(|volume| volume.path == path) {
-                continue;
-            }
-            result.push(Volume {
-                path,
-                label,
-                kind: 7,
-                total: None,
-                free: None,
-                filesystem: "MTP".into(),
-                remote: None,
-                read_only: false,
-            });
+    match bounded::<Vec<(String, PathBuf)>>("--shell-devices", "", Duration::from_millis(2500)) {
+        Ok(devices) => {
+            remember_devices(&devices);
+            result.retain(|volume| volume.kind != 7);
+            append_devices(&mut result, &devices);
         }
+        // A timeout keeps the last enumeration instead of dropping the device.
+        Err(_) => {}
     }
+    remember_snapshot(&result);
     result
 }
 #[derive(Serialize, Deserialize)]
@@ -316,6 +431,7 @@ mod ordering_tests {
         Volume {
             path: letter.into(),
             label: label.into(),
+            name: label.into(),
             kind: 3,
             total,
             free,

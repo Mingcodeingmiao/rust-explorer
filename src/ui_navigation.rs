@@ -1,15 +1,15 @@
 use super::*;
 fn computer_name_cache() -> &'static std::sync::RwLock<String> {
     static CACHE: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::RwLock::new("此电脑".into()))
+    CACHE.get_or_init(|| std::sync::RwLock::new(rust_explorer::i18n::text("此电脑").into()))
 }
 pub(super) fn computer_name() -> String {
     computer_name_cache().read().unwrap().clone()
 }
 #[derive(Clone)]
-struct NavRow {
+pub(super) struct NavRow {
     label: String,
-    path: PathBuf,
+    pub(super) path: PathBuf,
     depth: usize,
     expandable: bool,
     pinned: bool,
@@ -36,9 +36,9 @@ pub(super) fn is_virtual(path: &std::path::Path) -> bool {
 pub(super) fn location_name(path: &std::path::Path) -> String {
     match path.to_string_lossy().as_ref() {
         "::ThisPC" => computer_name(),
-        "::Network" => "网络".into(),
-        "::Libraries" => "库".into(),
-        "::QuickAccess" => "快速访问".into(),
+        "::Network" => rust_explorer::i18n::text("网络").into(),
+        "::Libraries" => rust_explorer::i18n::text("库").into(),
+        "::QuickAccess" => rust_explorer::i18n::text("快速访问").into(),
         _ => path
             .file_name()
             .unwrap_or(path.as_os_str())
@@ -48,13 +48,13 @@ pub(super) fn location_name(path: &std::path::Path) -> String {
 }
 fn volume_type(volume: &Volume) -> &'static str {
     match volume.kind {
-        2 => "可移动磁盘",
-        4 => "网络驱动器",
-        5 => "光盘驱动器",
-        6 => "RAM 磁盘",
-        7 => "便携设备",
-        8 => "便携设备存储",
-        _ => "本地磁盘",
+        2 => rust_explorer::i18n::text("可移动磁盘"),
+        4 => rust_explorer::i18n::text("网络驱动器"),
+        5 => rust_explorer::i18n::text("光盘驱动器"),
+        6 => rust_explorer::i18n::text("RAM 磁盘"),
+        7 => rust_explorer::i18n::text("便携设备"),
+        8 => rust_explorer::i18n::text("便携设备存储"),
+        _ => rust_explorer::i18n::text("本地磁盘"),
     }
 }
 impl Explorer {
@@ -121,6 +121,7 @@ impl Explorer {
         if self.busy {
             return;
         }
+        self.context_origin = RenameSite::Tree;
         self.context_target = Some(path.clone());
         self.popup = None;
         self.submenu = None;
@@ -132,6 +133,7 @@ impl Explorer {
                     y,
                     dark: self.theme.dark,
                     expanded: self.tree_is_open(&path),
+                    owner: shell::active_window_owner(),
                 },
                 cx,
             );
@@ -141,6 +143,10 @@ impl Explorer {
             && !path.to_string_lossy().starts_with("shell:")
         {
             let (x, y) = shell::cursor();
+            let quick_access_pinned = self
+                .system_quick_access
+                .iter()
+                .any(|item| item.path == path && item.pinned == Some(true));
             self.run_shell(
                 shell::Request::ThemedMenu {
                     folder: path.parent().unwrap_or(&path).to_path_buf(),
@@ -156,6 +162,9 @@ impl Explorer {
                         Sort::Name => "name",
                         Sort::Modified => "modified",
                         Sort::Created => "created",
+                        Sort::Location => "location",
+                        Sort::Original => "original",
+                        Sort::Deleted => "deleted",
                         Sort::Kind => "kind",
                         Sort::Size => "size",
                     }
@@ -165,6 +174,8 @@ impl Explorer {
                     undo: !self.undo_stack.is_empty(),
                     redo: !self.redo_stack.is_empty(),
                     can_paste: false,
+                    quick_access_pinned,
+                    owner: shell::active_window_owner(),
                 },
                 cx,
             );
@@ -257,10 +268,15 @@ impl Explorer {
             }
             Effect::Activate(index) => {
                 let path = rows[index].path.clone();
-                if self.settings.file_favorites.contains(&path)
-                    || path == PathBuf::from("shell:RecycleBinFolder")
-                {
+                if self.settings.file_favorites.contains(&path) {
                     self.run_shell(shell::Request::Open { path }, cx);
+                } else if rows[index].depth == 1
+                    && self.settings.quick_access_new_tab
+                    && self.quick_access_items().iter().any(|(_, p)| p == &path)
+                    && !window.modifiers().control
+                    && !window.modifiers().shift
+                {
+                    self.open_directory(path, rust_explorer::open_target::OpenDisposition::Tab, cx);
                 } else {
                     self.navigate_with_modifiers(path, window.modifiers(), cx);
                 }
@@ -308,20 +324,40 @@ impl Explorer {
         if self.quick_access_busy || self.quick_access_tick.elapsed() < Duration::from_secs(15) {
             return;
         }
+        // Reuse the list this process already read: opening a window must not wait
+        // for another Quick Access helper.
+        if self.system_quick_access.is_empty() {
+            if let Some(cached) = rust_explorer::quick_access::cached() {
+                self.quick_access_tick = Instant::now();
+                self.system_quick_access = cached;
+                if self.dir() == PathBuf::from("::QuickAccess") && self.is_home() {
+                    self.sync_computer_entries();
+                }
+                cx.notify();
+                return;
+            }
+        }
         self.quick_access_busy = true;
         self.quick_access_tick = Instant::now();
         let task = cx.background_executor().spawn(async {
             volumes::bounded::<Vec<rust_explorer::quick_access::Item>>(
                 "--quick-access",
                 "null",
-                Duration::from_millis(1600),
+                Duration::from_secs(4),
             )
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |v, cx| {
                 v.quick_access_busy = false;
+                if result.is_err() && v.dir() == PathBuf::from("::QuickAccess") {
+                    v.status =
+                        rust_explorer::i18n::text("快速访问读取失败，保留已有列表 · F5 重试")
+                            .into();
+                    cx.notify();
+                }
                 if let Ok(items) = result {
+                    rust_explorer::quick_access::remember(&items);
                     if v.system_quick_access != items {
                         let anchor = v.navigation_anchor();
                         v.system_quick_access = items;
@@ -368,6 +404,19 @@ impl Explorer {
     pub(super) fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
         if self.volume_busy {
             return;
+        }
+        // A window opened later reuses the snapshot this process already took, so its
+        // sidebar appears immediately instead of re-enumerating every drive.
+        if self.volumes.is_empty() {
+            if let Some(cached) = volumes::cached_snapshot() {
+                self.volume_capacity_tick = Instant::now();
+                self.volumes = cached;
+                if self.is_home() {
+                    self.sync_computer_entries();
+                }
+                cx.notify();
+                return;
+            }
         }
         self.volume_busy = true;
         self.volume_tick = Instant::now();
@@ -418,6 +467,7 @@ impl Explorer {
             self.quick_access_items()
                 .into_iter()
                 .map(|(name, path)| Entry {
+                    recycle: None,
                     path,
                     name,
                     directory: true,
@@ -429,7 +479,7 @@ impl Explorer {
                     free: None,
                     modified: None,
                     created: None,
-                    kind: "文件夹".into(),
+                    kind: rust_explorer::i18n::text("文件夹").into(),
                 })
                 .collect()
         } else if self.dir() == PathBuf::from("::Libraries") {
@@ -437,6 +487,7 @@ impl Explorer {
                 .iter()
                 .filter(|(n, _)| matches!(n.as_str(), "文档" | "图片" | "音乐" | "视频"))
                 .map(|(label, path)| Entry {
+                    recycle: None,
                     path: path.clone(),
                     name: label.clone(),
                     directory: true,
@@ -448,7 +499,7 @@ impl Explorer {
                     free: None,
                     modified: None,
                     created: None,
-                    kind: "库文件夹".into(),
+                    kind: rust_explorer::i18n::text("库文件夹").into(),
                 })
                 .collect()
         } else {
@@ -463,6 +514,7 @@ impl Explorer {
                             .contains(&self.tabs[self.active].query.to_lowercase())
                 })
                 .map(|volume| Entry {
+                    recycle: None,
                     path: volume.path.clone(),
                     name: volume.label.clone(),
                     directory: true,
@@ -475,9 +527,9 @@ impl Explorer {
                     modified: None,
                     created: None,
                     kind: match volume.kind {
-                        4 => "网络位置",
-                        7 => "便携设备",
-                        _ => "驱动器",
+                        4 => rust_explorer::i18n::text("网络位置"),
+                        7 => rust_explorer::i18n::text("便携设备"),
+                        _ => rust_explorer::i18n::text("驱动器"),
                     }
                     .into(),
                 })
@@ -508,7 +560,7 @@ impl Explorer {
             .enumerate()
             .filter_map(|(i, e)| selected.contains(&e.path).then_some(i))
             .collect();
-        self.status = format!("{} 个项目", self.entries.len());
+        self.status = rust_explorer::trf!("{} 个项目", self.entries.len());
         self.rebuild_rows();
     }
     fn tree_is_open(&self, path: &std::path::Path) -> bool {
@@ -660,7 +712,7 @@ impl Explorer {
                     }
                 }
                 Err(_) => out.push(NavRow {
-                    label: "无法读取或超时（折叠后可重试）".into(),
+                    label: rust_explorer::i18n::text("无法读取或超时（折叠后可重试）").into(),
                     path: PathBuf::new(),
                     depth: depth + 1,
                     expandable: false,
@@ -670,7 +722,7 @@ impl Explorer {
             }
         } else if self.tree_loading.contains(path) {
             out.push(NavRow {
-                label: "正在加载…".into(),
+                label: rust_explorer::i18n::text("正在加载…").into(),
                 path: PathBuf::new(),
                 depth: depth + 1,
                 expandable: false,
@@ -679,7 +731,7 @@ impl Explorer {
             });
         }
     }
-    fn nav_rows(&self) -> Vec<NavRow> {
+    pub(super) fn nav_rows(&self) -> Vec<NavRow> {
         let mut rows = vec![];
         let mut add = |label: &str, path: PathBuf, icon: &str| {
             rows.push(NavRow {
@@ -692,25 +744,25 @@ impl Explorer {
             })
         };
         add(
-            "主文件夹",
+            rust_explorer::i18n::text("主文件夹"),
             shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Profile)
                 .unwrap_or_else(|| PathBuf::from("C:\\")),
             "home",
         );
         add(
-            "图库",
+            rust_explorer::i18n::text("图库"),
             shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Pictures)
                 .unwrap_or_else(|| PathBuf::from("C:\\")),
             "pictures",
         );
         add(
-            "回收站",
+            rust_explorer::i18n::text("回收站"),
             PathBuf::from("shell:RecycleBinFolder"),
             "recycle-bin",
         );
         add("", PathBuf::new(), "");
         rows.push(NavRow {
-            label: "快速访问".into(),
+            label: rust_explorer::i18n::text("快速访问").into(),
             path: PathBuf::from("::QuickAccess"),
             depth: 0,
             expandable: true,
@@ -738,7 +790,15 @@ impl Explorer {
                     _ => "folder",
                 };
                 rows.push(NavRow {
-                    label: name,
+                    label: if self
+                        .places
+                        .iter()
+                        .any(|(label, known_path)| known_path == &path && label == &name)
+                    {
+                        rust_explorer::i18n::text(&name).to_owned()
+                    } else {
+                        name
+                    },
                     path: path.clone(),
                     depth: 1,
                     expandable: false,
@@ -761,7 +821,13 @@ impl Explorer {
         });
         if self.settings.show_all_folders {
             if let Some(path) = shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Desktop) {
-                self.append_tree(&path, "桌面".into(), 0, "desktop", &mut rows);
+                self.append_tree(
+                    &path,
+                    rust_explorer::i18n::text("桌面").into(),
+                    0,
+                    "desktop",
+                    &mut rows,
+                );
             }
         }
         if self.settings.show_computer {
@@ -781,7 +847,7 @@ impl Explorer {
         }
         if self.settings.show_libraries {
             rows.push(NavRow {
-                label: "库".into(),
+                label: rust_explorer::i18n::text("库").into(),
                 path: PathBuf::from("::Libraries"),
                 depth: 0,
                 expandable: true,
@@ -791,14 +857,20 @@ impl Explorer {
             if self.tree_open.contains(&PathBuf::from("::Libraries")) {
                 for (name, path) in &self.places {
                     if matches!(name.as_str(), "文档" | "图片" | "音乐" | "视频") {
-                        self.append_tree(path, name.clone(), 1, "folder", &mut rows);
+                        self.append_tree(
+                            path,
+                            rust_explorer::i18n::text(name).to_owned(),
+                            1,
+                            "folder",
+                            &mut rows,
+                        );
                     }
                 }
             }
         }
         if self.settings.show_network {
             rows.push(NavRow {
-                label: "网络".into(),
+                label: rust_explorer::i18n::text("网络").into(),
                 path: PathBuf::from("::Network"),
                 depth: 0,
                 expandable: true,
@@ -879,6 +951,7 @@ impl Explorer {
                                     && !this.settings.file_favorites.contains(&path);
                                 let expandable = row.expandable;
                                 let pinned = row.pinned;
+                                let quick_access_item = row.depth == 1 && (pinned || this.system_quick_access.iter().any(|item| item.path == path));
                                 let expanded = this.tree_is_open(&path);
                                 let keyboard = this.nav_focus.is_focused(window)
                                     && this.nav_keyboard_index == index;
@@ -894,7 +967,7 @@ impl Explorer {
                                 let drop_bounds = this.file_drop_bounds.clone();
                                 div()
                                     .id(("nav", index))
-                                    .w(ui((width - 20.).max(100.)))
+                                    .w(ui((width - 12.).max(100.)))
                                     .h(ui(row_height))
                                     .pl(ui(3. + row.depth as f32 * 16.))
                                     .pr_2()
@@ -990,20 +1063,27 @@ impl Explorer {
                                             t.text,
                                         )
                                     })
-                                    .child(
+                                    .child(if this.inline_rename.as_ref() == Some(&row.path)
+                                        && this.rename_site == super::RenameSite::Tree
+                                    {
+                                        let width = (width - row.depth as f32 * 12. - 48.)
+                                            .clamp(80., 360.);
+                                        this.inline_rename_overlay(("tree-rename", index), width)
+                                    } else {
                                         div()
                                             .flex_1()
                                             .min_w_0()
                                             .overflow_hidden()
                                             .whitespace_nowrap()
                                             .text_ellipsis()
-                                            .child(row.label.clone()),
-                                    )
+                                            .child(row.label.clone())
+                                            .into_any_element()
+                                    })
                                     .when(pinned, |d| {
                                         d.child(
                                             div()
                                                 // Keep the pin clear of the overlay scrollbar.
-                                                .pr(ui(10.))
+                                                .pr(ui(0.))
                                                 .child(visual::icon("pin", t.muted)),
                                         )
                                     })
@@ -1016,7 +1096,7 @@ impl Explorer {
                                         |d| {
                                             d.child(
                                                 div()
-                                                    .pr(ui(10.))
+                                                    .pr(ui(0.))
                                                     .opacity(0.45)
                                                     .child(visual::icon("pin", t.muted)),
                                             )
@@ -1035,11 +1115,11 @@ impl Explorer {
                                                     cx,
                                                 );
                                             } else {
-                                                v.navigate_with_modifiers(
-                                                    path.clone(),
-                                                    window.modifiers(),
-                                                    cx,
-                                                );
+                                                if quick_access_item && v.settings.quick_access_new_tab && !window.modifiers().control && !window.modifiers().shift {
+                                                    v.open_directory(path.clone(), rust_explorer::open_target::OpenDisposition::Tab, cx);
+                                                } else {
+                                                    v.navigate_with_modifiers(path.clone(), window.modifiers(), cx);
+                                                }
                                             }
                                         }),
                                     )
@@ -1083,6 +1163,8 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let t = self.theme;
+        let editing = self.inline_rename.as_ref() == Some(&volume.path)
+            && self.rename_site == super::RenameSite::List;
         let mode = self.view;
         let grid = matches!(
             mode,
@@ -1119,18 +1201,28 @@ impl Explorer {
             }
             _ => 0.,
         };
-        let capacity = volume.total.is_some_and(|n| n > 0) && volume.free.is_some();
-        let space = match (volume.total, volume.free) {
-            (Some(total), Some(free)) => format!(
+        // Optical media and volumes with no free bytes (full, read-only or empty
+        // drive) get no usage bar: it would always render as a misleading red bar.
+        let capacity = volume.kind != 5
+            && volume.total.is_some_and(|n| n > 0)
+            && volume.free.is_some_and(|free| free > 0);
+        let space = match (volume.total, volume.free, volume.kind) {
+            (Some(total), Some(free), 5) if free == 0 => {
+                rust_explorer::trf!("光盘 · 共 {}", fs::size_label(total))
+            }
+            (Some(total), Some(free), _) if free > 0 => rust_explorer::trf!(
                 "{} 可用，共 {}",
                 fs::size_label(free),
                 fs::size_label(total)
             ),
-            _ if volume.kind == 7 => "便携设备 / MTP".into(),
+            (Some(total), Some(_), _) => {
+                rust_explorer::trf!("0 字节可用，共 {}", fs::size_label(total))
+            }
+            _ if volume.kind == 7 => rust_explorer::i18n::text("便携设备 / MTP").into(),
             _ => volume
                 .remote
                 .clone()
-                .unwrap_or_else(|| "空间信息不可用".into()),
+                .unwrap_or_else(|| rust_explorer::i18n::text("空间信息不可用").into()),
         };
         let label = |value: String| {
             div()
@@ -1139,6 +1231,61 @@ impl Explorer {
                 .text_ellipsis()
                 .child(value)
         };
+        let right_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+        let paint_bounds = right_bounds.clone();
+        let measure = |text: String| {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(t.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(text.into(), px(13. * self.zoom), &[run], None)
+                    .width,
+            ) / self.zoom
+        };
+        let mut right_regions = Vec::new();
+        if details {
+            let mut x = 0.;
+            for (key, cell) in volume_columns {
+                let value = match key.as_str() {
+                    "name" => volume.label.clone(),
+                    "kind" => volume_type(volume).into(),
+                    "total" => volume.total.map(fs::size_label).unwrap_or_default(),
+                    "free" => volume.free.map(fs::size_label).unwrap_or_default(),
+                    _ => String::new(),
+                };
+                let text = measure(value);
+                let occupied = (text + if key == "name" { 32. } else { 8. }).min(cell - 12.);
+                let left = if matches!(key.as_str(), "total" | "free") {
+                    x + cell - occupied - 8.
+                } else {
+                    x + 4.
+                };
+                right_regions.push((left, 0., occupied, 34.));
+                x += cell;
+            }
+        } else if grid {
+            right_regions.push(((width - size) / 2. - 4., 4., size + 8., size + 8.));
+            let text = (measure(volume.label.clone()) + 16.).min(width - 8.);
+            right_regions.push(((width - text) / 2., size + 8., text, 64.));
+        } else {
+            let occupied = (size
+                + 24.
+                + measure(volume.label.clone()).max(if small {
+                    0.
+                } else {
+                    measure(space.clone())
+                }))
+            .min(width - 4.);
+            right_regions.push((4., 0., occupied, if small { 34. } else { 96. }));
+        }
+        let zoom = self.zoom;
         let mut row = div()
             .id(("volume", index))
             .w(ui(width))
@@ -1187,6 +1334,7 @@ impl Explorer {
             .child(
                 canvas(
                     move |bounds, _, _| {
+                        paint_bounds.set(bounds);
                         drop_bounds
                             .borrow_mut()
                             .push((bounds_path.clone(), bounds, true));
@@ -1219,7 +1367,9 @@ impl Explorer {
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
                     v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
-                    if e.click_count == 2 || v.settings.single_click {
+                    if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                        || v.settings.single_click
+                    {
                         v.navigate_with_modifiers(path.clone(), e.modifiers, cx);
                     }
                 }),
@@ -1227,6 +1377,13 @@ impl Explorer {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
+                    let point = e.position - right_bounds.get().origin;
+                    let (x, y) = (f32::from(point.x) / zoom, f32::from(point.y) / zoom);
+                    if !right_regions.iter().any(|(left, top, width, height)| {
+                        x >= *left && x <= left + width && y >= *top && y <= top + height
+                    }) {
+                        return;
+                    }
                     cx.stop_propagation();
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);
@@ -1266,7 +1423,15 @@ impl Explorer {
                 if key == "total" || key == "free" {
                     field = field.justify_end();
                 }
-                row = row.child(field.child(label(value).min_w_0()));
+                row =
+                    row.child(if key == "name" && editing {
+                        field.child(self.inline_rename_overlay(
+                            ("volume-rename", index),
+                            (*cell - 12.).max(80.),
+                        ))
+                    } else {
+                        field.child(label(value).min_w_0())
+                    });
             }
         } else {
             row = row.child(if volume.kind == 8 {
@@ -1282,7 +1447,12 @@ impl Explorer {
                 .when(tiles, |d| d.gap(ui(1.)).line_height(ui(16.)))
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
-                .child(if grid {
+                .child(if editing {
+                    self.inline_rename_overlay(
+                        ("volume-rename", index),
+                        (width - 16.).clamp(80., 360.),
+                    )
+                } else if grid {
                     icon_label(
                         &volume.label,
                         (width - 16.).max(24.),
@@ -1377,9 +1547,9 @@ impl Explorer {
             };
             let title = match self.group.as_str() {
                 "kind" => match volume.kind {
-                    4 => "网络位置".into(),
-                    7 => "便携设备".into(),
-                    _ => "设备和驱动器".into(),
+                    4 => rust_explorer::i18n::text("网络位置").into(),
+                    7 => rust_explorer::i18n::text("便携设备").into(),
+                    _ => rust_explorer::i18n::text("设备和驱动器").into(),
                 },
                 "name" => volume
                     .label
@@ -1389,9 +1559,9 @@ impl Explorer {
                     .unwrap_or_default(),
                 "size" => {
                     if volume.total.unwrap_or(0) >= 1024 * 1024 * 1024 * 1024 {
-                        "1 TB 及以上".into()
+                        rust_explorer::i18n::text("1 TB 及以上").into()
                     } else {
-                        "小于 1 TB".into()
+                        rust_explorer::i18n::text("小于 1 TB").into()
                     }
                 }
                 _ => String::new(),
@@ -1602,9 +1772,9 @@ impl Explorer {
                     .p_4()
                     .text_color(rgb(t.muted))
                     .child(if self.volume_busy {
-                        "正在更新设备…"
+                        rust_explorer::i18n::text("正在更新设备…")
                     } else {
-                        "没有可显示的存储设备或映射网络位置"
+                        rust_explorer::i18n::text("没有可显示的存储设备或映射网络位置")
                     }),
             );
         }
@@ -1756,7 +1926,9 @@ impl Explorer {
                             cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                                 cx.stop_propagation();
                                 v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
-                                if e.click_count == 2 || v.settings.single_click {
+                                if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                                    || v.settings.single_click
+                                {
                                     v.open_selected(cx);
                                 }
                             }),
@@ -1777,7 +1949,7 @@ impl Explorer {
                 .child(
                     div()
                         .py_2()
-                        .child(format!("常用文件夹 ({})", self.entries.len())),
+                        .child(rust_explorer::trf!("常用文件夹 ({})", self.entries.len())),
                 )
                 .child(cards)
                 .into_any_element();

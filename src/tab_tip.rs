@@ -16,11 +16,12 @@ use windows::{
         System::LibraryLoader::GetModuleHandleW,
         UI::WindowsAndMessaging::{
             CS_HREDRAW, CS_VREDRAW, CreateWindowExW, DefWindowProcW, DestroyWindow, GWLP_USERDATA,
-            GetClientRect, GetSystemMetrics, GetWindowLongPtrW, HTTRANSPARENT, HWND_TOPMOST,
-            MA_NOACTIVATE, RegisterClassW, SM_CXSCREEN, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-            SWP_SHOWWINDOW, SetWindowLongPtrW, SetWindowPos, ShowWindow, WINDOW_EX_STYLE,
-            WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND, WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT,
-            WNDCLASSW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
+            GetClientRect, GetSystemMetrics, GetWindowLongPtrW, GetWindowRect, HTTRANSPARENT,
+            MA_NOACTIVATE, RegisterClassW, SM_CXSCREEN, SM_YVIRTUALSCREEN, SW_HIDE,
+            SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowLongPtrW,
+            SetWindowPos, ShowWindow, WINDOW_EX_STYLE, WINDOW_STYLE, WM_DESTROY, WM_ERASEBKGND,
+            WM_MOUSEACTIVATE, WM_NCHITTEST, WM_PAINT, WNDCLASSW, WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW, WS_POPUP,
         },
     },
     core::w,
@@ -38,6 +39,8 @@ struct TipState {
 
 pub struct TabTip {
     hwnd: isize,
+    /// Window that owns the card; being owned keeps it above that window only.
+    owner: isize,
     dark: bool,
 }
 
@@ -125,12 +128,17 @@ fn register_class() {
 }
 
 impl TabTip {
-    pub fn new(scale: f32, dark: bool) -> Option<Self> {
+    /// `owner` is the application window: the card is an owned popup, so it stays
+    /// above that window and never floats over another application.
+    pub fn new(owner: Option<isize>, scale: f32, dark: bool) -> Option<Self> {
         register_class();
         unsafe {
             let module = GetModuleHandleW(None).ok()?;
+            let owner_hwnd = owner
+                .filter(|value| *value != 0)
+                .map(|value| HWND(value as _));
             let hwnd = CreateWindowExW(
-                WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0 | WS_EX_TOPMOST.0),
+                WINDOW_EX_STYLE(WS_EX_TOOLWINDOW.0 | WS_EX_NOACTIVATE.0),
                 w!("RustExplorer.TabTip"),
                 w!(""),
                 WINDOW_STYLE(WS_POPUP.0),
@@ -138,7 +146,7 @@ impl TabTip {
                 0,
                 1,
                 1,
-                None,
+                owner_hwnd,
                 None,
                 Some(HINSTANCE(module.0)),
                 None,
@@ -168,12 +176,16 @@ impl TabTip {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize);
             Some(Self {
                 hwnd: hwnd.0 as isize,
+                owner: owner_hwnd.map(|hwnd| hwnd.0 as isize).unwrap_or(0),
                 dark,
             })
         }
     }
 
-    pub fn show(&mut self, text: &str, x: i32, tab_top: i32, scale: f32) {
+    /// Show the card above the owning window, with its bottom edge flush against the
+    /// window's top edge. When the window already touches the top of the desktop the
+    /// card moves **below the tab** instead, so it never covers the tab itself.
+    pub fn show(&mut self, text: &str, x: i32, tab_bottom: i32, scale: f32) {
         if self.hwnd == 0 {
             return;
         }
@@ -196,22 +208,36 @@ impl TabTip {
             let width = (size.cx + (TIP_PAD_X * 2. * scale) as i32)
                 .clamp((80. * scale) as i32, (900. * scale) as i32);
             let height = (size.cy + (TIP_PAD_Y * 2. * scale) as i32).max((26. * scale) as i32);
-            let top = tab_top - height - (4. * scale) as i32;
-            if top < 0 {
-                // No room above the tab. Do not cover the tab / next tab.
-                let _ = ShowWindow(hwnd, SW_HIDE);
-                return;
-            }
-            let screen = GetSystemMetrics(SM_CXSCREEN);
-            let left = x.min((screen - width - 4).max(4));
+            // Bottom edge flush with the top edge of the owning window: the card hangs
+            // directly above the window instead of leaving a gap or covering the tab.
+            let (min_left, window_top, max_right) = if self.owner != 0 {
+                let mut rect = RECT::default();
+                if GetWindowRect(HWND(self.owner as _), &mut rect).is_ok() {
+                    (rect.left, rect.top, rect.right)
+                } else {
+                    (0, i32::MIN / 2, GetSystemMetrics(SM_CXSCREEN))
+                }
+            } else {
+                (0, i32::MIN / 2, GetSystemMetrics(SM_CXSCREEN))
+            };
+            let virtual_top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            let above_window = window_top - height;
+            // Window already touches the top of the desktop: hang the card **below**
+            // the tab so the tab itself is never covered.
+            let top = if above_window >= virtual_top {
+                above_window
+            } else {
+                tab_bottom + (2. * scale) as i32
+            };
+            let left = x.max(min_left).min((max_right - width).max(min_left));
             let _ = SetWindowPos(
                 hwnd,
-                Some(HWND_TOPMOST),
+                None,
                 left,
-                top,
+                top.max(virtual_top),
                 width,
                 height,
-                SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
             let _ = InvalidateRect(Some(hwnd), None, false);
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);

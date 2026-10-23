@@ -4,7 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.2 is a pre-release**, combining PR #11 with the maintainer's changes. See [integration validation](docs/pr-11-integration-072.md) and [MTP validation](docs/mtp-tabs-validation-2026-10-18.md). MTP/WPD paths may require serialized device I/O; same-device copy/move depends on device capabilities and can return ERROR_BUSY. Complete transfers one at a time, using the PC as an intermediate location when needed. Default-folder associations remain deferred. It does not claim full Explorer parity.
+Version **0.7.7 part1** adds a manual English/Chinese/Japanese/Korean language selector (English by default), configurable SQLite thumbnail storage, repeated double-click navigation fixes, search result paths, and root-specific sharing commands. See the [release notes](docs/v0.7.7-part1.md).
+
+> [!WARNING]
+> **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
+
+Latest published download: [Rust Explorer 0.7.7 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7-part1). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
 
 ## Features
 

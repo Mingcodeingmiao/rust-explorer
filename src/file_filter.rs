@@ -155,6 +155,7 @@ mod tests {
     use super::*;
     fn entry(name: &str, kind: &str, size: u64) -> Entry {
         Entry {
+            recycle: None,
             path: name.into(),
             name: name.into(),
             directory: false,
