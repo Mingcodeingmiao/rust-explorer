@@ -91,12 +91,24 @@ impl NameTip {
             }
         };
         if entry.directory {
-            push("创建日期", format_date(entry.created));
-            push("大小", "未统计".into());
+            push(
+                rust_explorer::i18n::text("创建日期"),
+                format_date(entry.created),
+            );
+            push(
+                rust_explorer::i18n::text("大小"),
+                rust_explorer::i18n::text("未统计").into(),
+            );
         } else {
-            push("项目类型", entry.kind.clone());
-            push("大小", fs::size_label(entry.size));
-            push("修改日期", entry.date());
+            push(
+                rust_explorer::i18n::text("项目类型"),
+                rust_explorer::i18n::kind(&entry.kind),
+            );
+            push(
+                rust_explorer::i18n::text("大小"),
+                fs::size_label(entry.size),
+            );
+            push(rust_explorer::i18n::text("修改日期"), entry.date());
         }
         let hint = FileHint {
             name: entry.name,
@@ -172,12 +184,19 @@ impl Render for NameTip {
             self.tip_scale = scale;
         }
         let text = std::iter::once(self.hint.name.clone())
-            .chain(
-                self.hint
-                    .lines
-                    .iter()
-                    .map(|line| format!("{}：{}", line.label, line.value)),
-            )
+            .chain(self.hint.lines.iter().map(|line| {
+                format!(
+                    "{}: {}",
+                    rust_explorer::i18n::text(&line.label),
+                    if line.label == "项目类型" {
+                        rust_explorer::i18n::kind(&line.value)
+                    } else if line.value == "未统计" {
+                        rust_explorer::i18n::text(&line.value).to_owned()
+                    } else {
+                        line.value.clone()
+                    }
+                )
+            }))
             .collect::<Vec<_>>()
             .join("\n");
         if let Some(tip) = self.tip.as_mut() {
@@ -326,6 +345,7 @@ pub(super) fn compare_entries(
         return a.directory.cmp(&b.directory);
     }
     let value = match column {
+        Sort::Location => a.path.parent().cmp(&b.path.parent()),
         Sort::Name => fs::natural_cmp(&a.name, &b.name),
         Sort::Modified => a.modified.cmp(&b.modified),
         Sort::Created => a.created.cmp(&b.created),
@@ -350,6 +370,7 @@ fn is_image_entry(entry: &Entry) -> bool {
 }
 fn column_sort(id: &str) -> Sort {
     match id {
+        "location" => Sort::Location,
         "original" => Sort::Original,
         "deleted" => Sort::Deleted,
         "modified" => Sort::Modified,
@@ -361,14 +382,15 @@ fn column_sort(id: &str) -> Sort {
 }
 fn column_label(id: &str, usage: bool) -> &'static str {
     match id {
-        "original" => "原位置",
-        "deleted" => "删除日期",
-        "modified" => "修改日期",
-        "created" => "创建日期",
-        "kind" => "类型",
-        "size" if usage => "统计大小",
-        "size" => "大小",
-        _ => "名称",
+        "location" => rust_explorer::i18n::text("文件夹路径"),
+        "original" => rust_explorer::i18n::text("原位置"),
+        "deleted" => rust_explorer::i18n::text("删除日期"),
+        "modified" => rust_explorer::i18n::text("修改日期"),
+        "created" => rust_explorer::i18n::text("创建日期"),
+        "kind" => rust_explorer::i18n::text("类型"),
+        "size" if usage => rust_explorer::i18n::text("统计大小"),
+        "size" => rust_explorer::i18n::text("大小"),
+        _ => rust_explorer::i18n::text("名称"),
     }
 }
 pub(super) fn icon_label_lines(
@@ -517,12 +539,13 @@ impl Explorer {
                     local_only |= fallback;
                 }
                 v.status = if local_only {
-                    "已更新本程序快速访问；部分项目未写入系统固定列表".into()
+                    rust_explorer::i18n::text("已更新本程序快速访问；部分项目未写入系统固定列表")
+                        .into()
                 } else {
-                    "已更新 Windows 快速访问".into()
+                    rust_explorer::i18n::text("已更新 Windows 快速访问").into()
                 };
                 if !errors.is_empty() {
-                    v.error = Some(format!(
+                    v.error = Some(rust_explorer::trf!(
                         "系统快速访问更新失败，已仅更新本程序列表：\n{}",
                         errors.join("\n")
                     ));
@@ -995,12 +1018,12 @@ impl Explorer {
     }
     pub(super) fn file_drag_label(&self, drag: &FileDragState) -> String {
         let Some(target) = &drag.target else {
-            return format!("{} 个项目 · 不能放置到此处", drag.paths.len());
+            return rust_explorer::trf!("{} 个项目 · 不能放置到此处", drag.paths.len());
         };
         let operation = match drag.mode {
-            shell::TransferMode::Copy => "复制到",
-            shell::TransferMode::Move => "移动到",
-            shell::TransferMode::Link => "创建快捷方式到",
+            shell::TransferMode::Copy => rust_explorer::i18n::text("复制到"),
+            shell::TransferMode::Move => rust_explorer::i18n::text("移动到"),
+            shell::TransferMode::Link => rust_explorer::i18n::text("创建快捷方式到"),
             shell::TransferMode::Auto => {
                 let target_volume = target
                     .components()
@@ -1012,13 +1035,13 @@ impl Explorer {
                         .map(|p| p.as_os_str().to_string_lossy().to_lowercase())
                         == target_volume
                 }) {
-                    "移动到"
+                    rust_explorer::i18n::text("移动到")
                 } else {
-                    "复制到"
+                    rust_explorer::i18n::text("复制到")
                 }
             }
         };
-        format!(
+        rust_explorer::trf!(
             "{} 个项目 · {operation} {}",
             drag.paths.len(),
             target
@@ -1397,24 +1420,29 @@ impl Explorer {
                     .next()
                     .map(|c| c.to_uppercase().to_string())
                     .unwrap_or_default(),
-                "modified" => e.date().split(' ').next().unwrap_or("未知日期").to_string(),
+                "modified" => e
+                    .date()
+                    .split(' ')
+                    .next()
+                    .unwrap_or(rust_explorer::i18n::text("未知日期"))
+                    .to_string(),
                 "created" => format_date(e.created)
                     .split(' ')
                     .next()
-                    .unwrap_or("未知日期")
+                    .unwrap_or(rust_explorer::i18n::text("未知日期"))
                     .to_string(),
                 "size" => {
                     let size = self.entry_size(e).unwrap_or(0);
                     if e.directory && !self.usage_enabled {
-                        "文件夹"
+                        rust_explorer::i18n::text("文件夹")
                     } else if size < 1024 * 1024 {
-                        "小于 1 MB"
+                        rust_explorer::i18n::text("小于 1 MB")
                     } else if size < 100 * 1024 * 1024 {
                         "1–100 MB"
                     } else if size < 1024 * 1024 * 1024 {
                         "100 MB–1 GB"
                     } else {
-                        "大于 1 GB"
+                        rust_explorer::i18n::text("大于 1 GB")
                     }
                 }
                 .into(),
@@ -1620,9 +1648,9 @@ impl Explorer {
                 }
             ),
             None => if self.usage_running {
-                "统计中…"
+                rust_explorer::i18n::text("统计中…")
             } else {
-                "未统计"
+                rust_explorer::i18n::text("未统计")
             }
             .into(),
         }
@@ -1635,7 +1663,7 @@ impl Explorer {
             self.usage_cancel.store(true, Ordering::Relaxed);
             self.usage_revision = self.usage_revision.wrapping_add(1);
             self.usage_running = false;
-            self.status = "统计已停止；* 表示跳过项目或部分结果".into();
+            self.status = rust_explorer::i18n::text("统计已停止；* 表示跳过项目或部分结果").into();
             cx.notify();
             return;
         }
@@ -1654,7 +1682,10 @@ impl Explorer {
                 .filter(|e| e.directory)
                 .map(|e| e.path.as_path()),
         );
-        self.status = "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整".into();
+        self.status = rust_explorer::i18n::text(
+            "后台统计当前层目录 · 不跨越联接/挂载点 · * 表示跳过或不完整",
+        )
+        .into();
         let task = cx.background_executor().spawn(async move {
             let mut skipped = 0;
             let mut hits = 0;
@@ -1674,7 +1705,7 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 if v.usage_revision == generation {
                     v.usage_running = false;
-                    v.status = format!(
+                    v.status = rust_explorer::trf!(
                         "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
                     );
                     v.rebuild_rows();
@@ -2093,6 +2124,7 @@ impl Explorer {
                     .child(
                         div()
                             .id(("close-tab", tab.id))
+                            .mr(ui(-4.))
                             .child(visual::icon_at("close", t.text, 16. * 2. / 3. * 1.27))
                             .size(ui(24.))
                             .hover(move |s| s.bg(rgb(t.hover)))
@@ -2222,6 +2254,8 @@ impl Explorer {
     pub(super) fn active_columns_mut(&mut self) -> &mut Vec<(String, f32)> {
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
             &mut self.settings.recycle_columns
+        } else if !self.tabs[self.active].query.is_empty() {
+            &mut self.settings.search_columns
         } else {
             &mut self.settings.columns
         }
@@ -2229,6 +2263,9 @@ impl Explorer {
     pub(super) fn column_widths(&self, _available: f32) -> Vec<(String, f32)> {
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
             return self.settings.recycle_columns.clone();
+        }
+        if !self.tabs[self.active].query.is_empty() {
+            return self.settings.search_columns.clone();
         }
         self.settings.columns.clone()
     }
@@ -2515,7 +2552,9 @@ impl Explorer {
                     } else {
                         v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     }
-                    if e.click_count == 2 || v.settings.single_click {
+                    if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                        || v.settings.single_click
+                    {
                         v.rename_token += 1;
                         v.open_selected_with(e.modifiers, cx);
                     } else if rename {
@@ -2637,9 +2676,17 @@ impl Explorer {
                         natural_name.clone(),
                         28. + if self.settings.checkboxes { 30. } else { 0. },
                     ),
+                    "location" => (
+                        entry
+                            .path
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
+                        0.,
+                    ),
                     "modified" => (entry.date(), 0.),
                     "created" => (format_date(entry.created), 0.),
-                    "kind" => (entry.kind.clone(), 0.),
+                    "kind" => (rust_explorer::i18n::kind(&entry.kind), 0.),
                     "size" => (self.entry_size_text(entry), 0.),
                     "original" => (
                         entry
@@ -2696,7 +2743,7 @@ impl Explorer {
             let title_width = text_width.max(if entry.directory || image {
                 0.
             } else {
-                measure(entry.kind.clone())
+                measure(rust_explorer::i18n::kind(&entry.kind))
             });
             hit_regions.push((
                 12. + icon + 8.,
@@ -2707,10 +2754,11 @@ impl Explorer {
             if visible {
                 let metadata = (inner - first - 16.).clamp(1., 240.);
                 let text = if image {
-                    measure(format!("大小：{}", self.entry_size_text(entry)))
+                    measure(rust_explorer::trf!("大小：{}", self.entry_size_text(entry)))
                 } else {
-                    measure(format!("修改日期：{}", entry.date()))
-                        .max(measure(format!("大小：{}", self.entry_size_text(entry))))
+                    measure(rust_explorer::trf!("修改日期：{}", entry.date())).max(measure(
+                        rust_explorer::trf!("大小：{}", self.entry_size_text(entry)),
+                    ))
                 };
                 hit_regions.push((
                     item_width - 12. - metadata,
@@ -2720,9 +2768,14 @@ impl Explorer {
                 ));
                 if image {
                     let middle = (inner - first - metadata - 16.).max(1.);
-                    let text = measure(format!("类型：{}", entry.kind)).max(measure(format!(
+                    let text = measure(rust_explorer::trf!(
+                        "类型：{}",
+                        rust_explorer::i18n::kind(&entry.kind)
+                    ))
+                    .max(measure(rust_explorer::trf!(
                         "分辨率：{} x {}",
-                        presentation.source_width, presentation.source_height
+                        presentation.source_width,
+                        presentation.source_height
                     )));
                     hit_regions.push((first + 20., 10., (text + 8.).min(middle), 54.));
                 }
@@ -2734,7 +2787,7 @@ impl Explorer {
                 (self.view.icon_size()
                     + text_width.max(measure(format!(
                         "{}  {}",
-                        entry.kind,
+                        rust_explorer::i18n::kind(&entry.kind),
                         self.entry_size_text(entry)
                     )))
                     + 24.)
@@ -2868,7 +2921,9 @@ impl Explorer {
                     } else {
                         v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
                     }
-                    if e.click_count == 2 || v.settings.single_click {
+                    if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                        || v.settings.single_click
+                    {
                         v.open_selected_with(e.modifiers, cx);
                     }
                 }),
@@ -2976,9 +3031,14 @@ impl Explorer {
                         .into_any_element()
                 } else {
                     let value = match id.as_str() {
+                        "location" => entry
+                            .path
+                            .parent()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default(),
                         "modified" => entry.date(),
                         "created" => format_date(entry.created),
-                        "kind" => entry.kind.clone(),
+                        "kind" => rust_explorer::i18n::kind(&entry.kind),
                         "size" if entry.recycle.is_some() => fs::size_label(entry.size),
                         "original" => entry
                             .recycle
@@ -3087,7 +3147,7 @@ impl Explorer {
                     .child(self.name_element(index, entry, text_width, window, cx));
                 if !entry.directory && !image {
                     title = title.child(
-                        ellipsis(entry.kind.clone(), text_width)
+                        ellipsis(rust_explorer::i18n::kind(&entry.kind), text_width)
                             .text_color(rgb(t.muted))
                             .text_size(ui(12.)),
                     );
@@ -3114,11 +3174,18 @@ impl Explorer {
                                 .flex_col()
                                 .text_size(ui(12.))
                                 .text_color(rgb(t.muted))
-                                .child(ellipsis(format!("类型：{}", entry.kind), image_width))
                                 .child(ellipsis(
-                                    format!(
+                                    rust_explorer::trf!(
+                                        "类型：{}",
+                                        rust_explorer::i18n::kind(&entry.kind)
+                                    ),
+                                    image_width,
+                                ))
+                                .child(ellipsis(
+                                    rust_explorer::trf!(
                                         "分辨率：{} x {}",
-                                        presentation.source_width, presentation.source_height
+                                        presentation.source_width,
+                                        presentation.source_height
                                     ),
                                     image_width,
                                 )),
@@ -3136,13 +3203,13 @@ impl Explorer {
                         .text_color(rgb(t.muted));
                     if !image {
                         metadata = metadata.child(ellipsis(
-                            format!("修改日期：{}", entry.date()),
+                            rust_explorer::trf!("修改日期：{}", entry.date()),
                             metadata_width,
                         ));
                     }
                     if !entry.directory {
                         metadata = metadata.child(ellipsis(
-                            format!("大小：{}", self.entry_size_text(entry)),
+                            rust_explorer::trf!("大小：{}", self.entry_size_text(entry)),
                             metadata_width,
                         ));
                     }
@@ -3179,14 +3246,18 @@ impl Explorer {
                             .overflow_hidden()
                             .whitespace_nowrap()
                             .text_ellipsis()
-                            .child(format!("{}  {}", entry.kind, self.entry_size_text(entry))),
+                            .child(format!(
+                                "{}  {}",
+                                rust_explorer::i18n::kind(&entry.kind),
+                                self.entry_size_text(entry)
+                            )),
                     );
                     if self.view == ViewMode::Content {
                         name = name.child(
                             div()
                                 .text_color(rgb(t.muted))
                                 .text_size(ui(12.))
-                                .child(format!("修改日期：{}", entry.date())),
+                                .child(rust_explorer::trf!("修改日期：{}", entry.date())),
                         );
                     }
                 }
@@ -3351,7 +3422,14 @@ impl Explorer {
                         },
                         self.theme.text,
                     ))
-                    .child(format!("{label} ({count})"))
+                    .child(format!(
+                        "{} ({count})",
+                        if self.group == "kind" {
+                            rust_explorer::i18n::kind(label)
+                        } else {
+                            label.clone()
+                        }
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |v, e: &MouseDownEvent, w, cx| {
@@ -3456,26 +3534,29 @@ impl Explorer {
             let choices: Vec<(String, String)> = match column {
                 "name" => rust_explorer::file_filter::NAMES
                     .iter()
-                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .map(|(k, v)| ((*k).into(), rust_explorer::i18n::text(v).into()))
                     .collect(),
                 "modified" | "created" => rust_explorer::file_filter::DATES
                     .iter()
-                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .map(|(k, v)| ((*k).into(), rust_explorer::i18n::text(v).into()))
                     .collect(),
                 "size" => rust_explorer::file_filter::SIZES
                     .iter()
-                    .map(|(k, v)| ((*k).into(), (*v).into()))
+                    .map(|(k, v)| ((*k).into(), rust_explorer::i18n::text(v).into()))
                     .collect(),
                 "kind" => self
                     .filter_types
                     .iter()
-                    .map(|s| (s.clone(), s.clone()))
+                    .map(|s| (s.clone(), rust_explorer::i18n::kind(s)))
                     .collect(),
                 _ => Vec::new(),
             };
             return std::iter::once(
-                MenuItem::new(format!("filter-clear:{column}"), "清除此列筛选")
-                    .enable(self.filters.active(column)),
+                MenuItem::new(
+                    format!("filter-clear:{column}"),
+                    rust_explorer::i18n::text("清除此列筛选"),
+                )
+                .enable(self.filters.active(column)),
             )
             .chain(std::iter::once(MenuItem::separator()))
             .chain(choices.into_iter().map(|(key, label)| {
@@ -3484,8 +3565,8 @@ impl Explorer {
             }))
             .chain([
                 MenuItem::separator(),
-                MenuItem::new("filter-reset", "清除所有筛选"),
-                MenuItem::new("filter-done", "完成"),
+                MenuItem::new("filter-reset", rust_explorer::i18n::text("清除所有筛选")),
+                MenuItem::new("filter-done", rust_explorer::i18n::text("完成")),
             ])
             .collect();
         }
@@ -3503,18 +3584,18 @@ impl Explorer {
                     let mut items = vec![
                         MenuItem::new(
                             "operation-info",
-                            format!("{} · {:.1}秒 · {}", op.label, elapsed, op.status),
+                            rust_explorer::trf!("{} · {:.1}秒 · {}", op.label, elapsed, op.status),
                         )
                         .enable(false),
                     ];
                     if op.finished.is_none() {
                         items.push(MenuItem::new(
                             format!("operation-stop:{}", op.id),
-                            "停止（请求关闭系统窗口）",
+                            rust_explorer::i18n::text("停止（请求关闭系统窗口）"),
                         ));
                         items.push(MenuItem::new(
                             format!("operation-force:{}", op.id),
-                            "强行停止（可能已完成部分操作）",
+                            rust_explorer::i18n::text("强行停止（可能已完成部分操作）"),
                         ));
                     }
                     items.push(MenuItem::separator());
@@ -3522,10 +3603,10 @@ impl Explorer {
                 })
                 .collect(),
             "text-menu" => [
-                ("cut", "剪切    Ctrl+X"),
-                ("copy", "复制    Ctrl+C"),
-                ("paste", "粘贴    Ctrl+V"),
-                ("all", "全选    Ctrl+A"),
+                ("cut", rust_explorer::i18n::text("剪切    Ctrl+X")),
+                ("copy", rust_explorer::i18n::text("复制    Ctrl+C")),
+                ("paste", rust_explorer::i18n::text("粘贴    Ctrl+V")),
+                ("all", rust_explorer::i18n::text("全选    Ctrl+A")),
             ]
             .into_iter()
             .filter(|(id, _)| {
@@ -3541,11 +3622,11 @@ impl Explorer {
             .map(|(id, label)| MenuItem::new(format!("text:{id}"), label))
             .collect(),
             "drop-menu" => vec![
-                MenuItem::new("drop:copy", "复制到这里"),
-                MenuItem::new("drop:move", "移动到这里"),
-                MenuItem::new("drop:link", "在此创建快捷方式"),
+                MenuItem::new("drop:copy", rust_explorer::i18n::text("复制到这里")),
+                MenuItem::new("drop:move", rust_explorer::i18n::text("移动到这里")),
+                MenuItem::new("drop:link", rust_explorer::i18n::text("在此创建快捷方式")),
                 MenuItem::separator(),
-                MenuItem::new("drop:cancel", "取消"),
+                MenuItem::new("drop:cancel", rust_explorer::i18n::text("取消")),
             ],
             "crumbs-menu" => self
                 .hidden_breadcrumbs
@@ -3563,34 +3644,64 @@ impl Explorer {
                         .is_some_and(|i| self.entries[*i].directory);
                 if navigation::is_shell_folder(&self.dir()) {
                     let single = self.selected.len() == 1;
-                    let mut items = vec![MenuItem::new("file-open", "打开")];
+                    let mut items = vec![MenuItem::new(
+                        "file-open",
+                        rust_explorer::i18n::text("打开"),
+                    )];
                     if folder {
-                        items.push(MenuItem::new("file-tab", "在新标签页中打开"));
-                        items.push(MenuItem::new("file-window", "在新窗口中打开"));
+                        items.push(MenuItem::new(
+                            "file-tab",
+                            rust_explorer::i18n::text("在新标签页中打开"),
+                        ));
+                        items.push(MenuItem::new(
+                            "file-window",
+                            rust_explorer::i18n::text("在新窗口中打开"),
+                        ));
                     }
                     items.push(MenuItem::separator());
                     if folder {
-                        items.push(MenuItem::new("file-cut", "剪切"));
-                        items.push(MenuItem::new("file-copy", "复制"));
+                        items.push(MenuItem::new("file-cut", rust_explorer::i18n::text("剪切")));
+                        items.push(MenuItem::new(
+                            "file-copy",
+                            rust_explorer::i18n::text("复制"),
+                        ));
                     } else {
-                        items.push(MenuItem::new("file-copy", "复制"));
-                        items.push(MenuItem::new("file-cut", "剪切"));
+                        items.push(MenuItem::new(
+                            "file-copy",
+                            rust_explorer::i18n::text("复制"),
+                        ));
+                        items.push(MenuItem::new("file-cut", rust_explorer::i18n::text("剪切")));
                     }
-                    items.push(MenuItem::new("file-delete", "删除"));
-                    items.push(MenuItem::new("file-rename", "重命名").enable(single));
+                    items.push(MenuItem::new(
+                        "file-delete",
+                        rust_explorer::i18n::text("删除"),
+                    ));
+                    items.push(
+                        MenuItem::new("file-rename", rust_explorer::i18n::text("重命名"))
+                            .enable(single),
+                    );
                     items.push(MenuItem::separator());
-                    items.push(MenuItem::new("properties", "属性").enable(single));
+                    items.push(
+                        MenuItem::new("properties", rust_explorer::i18n::text("属性"))
+                            .enable(single),
+                    );
                     return items;
                 }
                 vec![
-                    MenuItem::new("file-open", "打开"),
-                    MenuItem::new("file-tab", "在新标签页中打开").enable(folder),
-                    MenuItem::new("file-window", "在新窗口中打开").enable(folder),
-                    MenuItem::new("file-explorer", "在系统资源管理器中打开").enable(folder),
+                    MenuItem::new("file-open", rust_explorer::i18n::text("打开")),
+                    MenuItem::new("file-tab", rust_explorer::i18n::text("在新标签页中打开"))
+                        .enable(folder),
+                    MenuItem::new("file-window", rust_explorer::i18n::text("在新窗口中打开"))
+                        .enable(folder),
+                    MenuItem::new(
+                        "file-explorer",
+                        rust_explorer::i18n::text("在系统资源管理器中打开"),
+                    )
+                    .enable(folder),
                     MenuItem::separator(),
-                    MenuItem::new("file-cut", "剪切"),
-                    MenuItem::new("file-copy", "复制"),
-                    MenuItem::new("file-rename", "重命名").enable(
+                    MenuItem::new("file-cut", rust_explorer::i18n::text("剪切")),
+                    MenuItem::new("file-copy", rust_explorer::i18n::text("复制")),
+                    MenuItem::new("file-rename", rust_explorer::i18n::text("重命名")).enable(
                         self.selected.len() == 1
                             && (!navigation::is_virtual(&self.dir())
                                 || self
@@ -3601,17 +3712,20 @@ impl Explorer {
                                         rust_explorer::volume_label::is_drive_root(&entry.path)
                                     })),
                     ),
-                    MenuItem::new("file-delete", "删除")
+                    MenuItem::new("file-delete", rust_explorer::i18n::text("删除"))
                         .enable(!navigation::is_app_virtual(&self.dir())),
-                    MenuItem::new("copy-path", "复制路径"),
-                    MenuItem::new("pin", "固定到快速访问")
+                    MenuItem::new("copy-path", rust_explorer::i18n::text("复制路径")),
+                    MenuItem::new("pin", rust_explorer::i18n::text("固定到快速访问"))
                         .enable(folder && !navigation::is_virtual(&self.dir())),
-                    MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
-                        .enable(folder && !navigation::is_virtual(&self.dir())),
+                    MenuItem::new(
+                        "submenu:access-menu",
+                        rust_explorer::i18n::text("授予访问权限                 ›"),
+                    )
+                    .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::separator(),
-                    MenuItem::new("properties", "属性")
+                    MenuItem::new("properties", rust_explorer::i18n::text("属性"))
                         .enable(!navigation::is_shell_folder(&self.dir())),
-                    MenuItem::new("system-menu", "显示完整系统菜单")
+                    MenuItem::new("system-menu", rust_explorer::i18n::text("显示完整系统菜单"))
                         .enable(!navigation::is_shell_folder(&self.dir())),
                 ]
             }
@@ -3625,76 +3739,115 @@ impl Explorer {
                     .unwrap_or_else(|| self.dir());
                 if path.has_root() && path.parent().is_none() {
                     // Explorer exposes only Advanced Sharing at a drive root.
-                    vec![MenuItem::new("advanced-share", "高级共享…")]
+                    vec![MenuItem::new(
+                        "advanced-share",
+                        rust_explorer::i18n::text("高级共享…"),
+                    )]
                 } else {
                     vec![
-                        MenuItem::new("remove-access", "删除访问权限（系统设置）…"),
-                        MenuItem::new("grant-access", "特定用户…"),
+                        MenuItem::new(
+                            "remove-access",
+                            rust_explorer::i18n::text("删除访问权限（系统设置）…"),
+                        ),
+                        MenuItem::new("grant-access", rust_explorer::i18n::text("特定用户…")),
                     ]
                 }
             }
             "background-menu" => vec![
-                MenuItem::new("undo", "撤销    Ctrl+Z")
+                MenuItem::new("undo", rust_explorer::i18n::text("撤销    Ctrl+Z"))
                     .enable(!self.undo_stack.is_empty() && !self.busy),
-                MenuItem::new("redo", "重做    Ctrl+Y")
+                MenuItem::new("redo", rust_explorer::i18n::text("重做    Ctrl+Y"))
                     .enable(!self.redo_stack.is_empty() && !self.busy),
                 MenuItem::separator(),
-                MenuItem::new("submenu:view-menu", "查看                         ›"),
-                MenuItem::new("submenu:sort-menu", "排序                         ›"),
-                MenuItem::new("submenu:group", "分组依据                     ›"),
-                MenuItem::new("refresh-folder", "刷新"),
+                MenuItem::new(
+                    "submenu:view-menu",
+                    rust_explorer::i18n::text("查看                         ›"),
+                ),
+                MenuItem::new(
+                    "submenu:sort-menu",
+                    rust_explorer::i18n::text("排序                         ›"),
+                ),
+                MenuItem::new(
+                    "submenu:group",
+                    rust_explorer::i18n::text("分组依据                     ›"),
+                ),
+                MenuItem::new("refresh-folder", rust_explorer::i18n::text("刷新")),
                 MenuItem::separator(),
-                MenuItem::new("file-paste", "粘贴").enable(self.can_paste()),
-                MenuItem::new("submenu:new-menu", "新建                         ›")
-                    .enable(!navigation::is_virtual(&self.dir())),
-                MenuItem::new("submenu:access-menu", "授予访问权限                 ›")
-                    .enable(!navigation::is_virtual(&self.dir())),
+                MenuItem::new("file-paste", rust_explorer::i18n::text("粘贴"))
+                    .enable(self.can_paste()),
+                MenuItem::new(
+                    "submenu:new-menu",
+                    rust_explorer::i18n::text("新建                         ›"),
+                )
+                .enable(!navigation::is_virtual(&self.dir())),
+                MenuItem::new(
+                    "submenu:access-menu",
+                    rust_explorer::i18n::text("授予访问权限                 ›"),
+                )
+                .enable(!navigation::is_virtual(&self.dir())),
                 MenuItem::separator(),
-                MenuItem::new("properties", "属性")
+                MenuItem::new("properties", rust_explorer::i18n::text("属性"))
                     .enable(!navigation::is_shell_folder(&self.dir())),
-                MenuItem::new("system-menu", "显示完整系统菜单")
+                MenuItem::new("system-menu", rust_explorer::i18n::text("显示完整系统菜单"))
                     .enable(!navigation::is_shell_folder(&self.dir())),
             ],
             "quick-background-menu" => vec![
-                MenuItem::new("submenu:view-menu", "查看                         ›"),
-                MenuItem::new("refresh-quick", "刷新"),
+                MenuItem::new(
+                    "submenu:view-menu",
+                    rust_explorer::i18n::text("查看                         ›"),
+                ),
+                MenuItem::new("refresh-quick", rust_explorer::i18n::text("刷新")),
                 MenuItem::separator(),
-                MenuItem::new("file-paste", "粘贴").enable(false),
+                MenuItem::new("file-paste", rust_explorer::i18n::text("粘贴")).enable(false),
             ],
             "view-menu" => {
                 let mut items: Vec<_> = ViewMode::ALL
                     .iter()
                     .enumerate()
                     .map(|(i, (mode, label))| {
-                        MenuItem::new(format!("view:{i}"), *label).check(self.view == *mode)
+                        MenuItem::new(format!("view:{i}"), rust_explorer::i18n::text(label))
+                            .check(self.view == *mode)
                     })
                     .collect();
                 items.extend([
                     MenuItem::separator(),
-                    MenuItem::new("details-pane", "详细信息窗格").check(self.settings.details_pane),
-                    MenuItem::new("preview-pane", "预览窗格").check(self.preview_open),
+                    MenuItem::new("details-pane", rust_explorer::i18n::text("详细信息窗格"))
+                        .check(self.settings.details_pane),
+                    MenuItem::new("preview-pane", rust_explorer::i18n::text("预览窗格"))
+                        .check(self.preview_open),
                     MenuItem::separator(),
-                    MenuItem::new("submenu:show", "显示                         ›"),
+                    MenuItem::new(
+                        "submenu:show",
+                        rust_explorer::i18n::text("显示                         ›"),
+                    ),
                 ]);
                 items
             }
             "show" => vec![
-                MenuItem::new("checkboxes", "项目复选框").check(self.settings.checkboxes),
-                MenuItem::new("extensions", "文件扩展名").check(self.settings.extensions),
-                MenuItem::new("hidden", "隐藏的项目").check(self.hidden),
-                MenuItem::new("compact", "紧凑视图").check(self.settings.compact),
+                MenuItem::new("checkboxes", rust_explorer::i18n::text("项目复选框"))
+                    .check(self.settings.checkboxes),
+                MenuItem::new("extensions", rust_explorer::i18n::text("文件扩展名"))
+                    .check(self.settings.extensions),
+                MenuItem::new("hidden", rust_explorer::i18n::text("隐藏的项目")).check(self.hidden),
+                MenuItem::new("compact", rust_explorer::i18n::text("紧凑视图"))
+                    .check(self.settings.compact),
             ],
             "nav-menu" => vec![
-                MenuItem::new("nav-computer", "显示此电脑").check(self.settings.show_computer),
-                MenuItem::new("nav-network", "显示网络").check(self.settings.show_network),
-                MenuItem::new("nav-libraries", "显示库").check(self.settings.show_libraries),
-                MenuItem::new("nav-all", "显示所有文件夹").check(self.settings.show_all_folders),
-                MenuItem::new("nav-expand", "展开到当前文件夹").check(self.settings.expand_current),
+                MenuItem::new("nav-computer", rust_explorer::i18n::text("显示此电脑"))
+                    .check(self.settings.show_computer),
+                MenuItem::new("nav-network", rust_explorer::i18n::text("显示网络"))
+                    .check(self.settings.show_network),
+                MenuItem::new("nav-libraries", rust_explorer::i18n::text("显示库"))
+                    .check(self.settings.show_libraries),
+                MenuItem::new("nav-all", rust_explorer::i18n::text("显示所有文件夹"))
+                    .check(self.settings.show_all_folders),
+                MenuItem::new("nav-expand", rust_explorer::i18n::text("展开到当前文件夹"))
+                    .check(self.settings.expand_current),
             ],
             "quick-menu" | "tree-menu" => {
                 let mut items = vec![
-                    MenuItem::new("nav-tab", "在新标签页中打开"),
-                    MenuItem::new("nav-window", "在新窗口中打开"),
+                    MenuItem::new("nav-tab", rust_explorer::i18n::text("在新标签页中打开")),
+                    MenuItem::new("nav-window", rust_explorer::i18n::text("在新窗口中打开")),
                 ];
                 if kind == "quick-menu" {
                     let known_pinned = self.context_target.as_ref().is_some_and(|path| {
@@ -3707,9 +3860,9 @@ impl Explorer {
                     items.push(MenuItem::new(
                         "nav-unpin",
                         if known_pinned {
-                            "从快速访问取消固定"
+                            rust_explorer::i18n::text("从快速访问取消固定")
                         } else {
-                            "从快速访问移除"
+                            rust_explorer::i18n::text("从快速访问移除")
                         },
                     ));
                 } else if self
@@ -3717,7 +3870,10 @@ impl Explorer {
                     .as_ref()
                     .is_some_and(|p| !navigation::is_virtual(p))
                 {
-                    items.push(MenuItem::new("nav-pin", "固定到快速访问"));
+                    items.push(MenuItem::new(
+                        "nav-pin",
+                        rust_explorer::i18n::text("固定到快速访问"),
+                    ));
                 }
                 let shell_target = self
                     .context_target
@@ -3725,47 +3881,70 @@ impl Explorer {
                     .is_some_and(|path| navigation::is_shell_folder(path));
                 items.extend([
                     MenuItem::separator(),
-                    MenuItem::new("nav-copy-path", "复制文件地址"),
-                    MenuItem::new("nav-properties", "属性").enable(!shell_target),
-                    MenuItem::new("nav-system-menu", "显示完整系统菜单").enable(!shell_target),
+                    MenuItem::new("nav-copy-path", rust_explorer::i18n::text("复制文件地址")),
+                    MenuItem::new("nav-properties", rust_explorer::i18n::text("属性"))
+                        .enable(!shell_target),
+                    MenuItem::new(
+                        "nav-system-menu",
+                        rust_explorer::i18n::text("显示完整系统菜单"),
+                    )
+                    .enable(!shell_target),
                 ]);
                 items
             }
             "computer-menu" => vec![
-                MenuItem::new("submenu:view-menu", "查看                         ›"),
-                MenuItem::new("submenu:sort-menu", "排序方式                     ›"),
-                MenuItem::new("submenu:group", "分组依据                     ›"),
+                MenuItem::new(
+                    "submenu:view-menu",
+                    rust_explorer::i18n::text("查看                         ›"),
+                ),
+                MenuItem::new(
+                    "submenu:sort-menu",
+                    rust_explorer::i18n::text("排序方式                     ›"),
+                ),
+                MenuItem::new(
+                    "submenu:group",
+                    rust_explorer::i18n::text("分组依据                     ›"),
+                ),
                 MenuItem::separator(),
-                MenuItem::new("refresh-devices", "刷新"),
-                MenuItem::new("computer-properties", "属性"),
+                MenuItem::new("refresh-devices", rust_explorer::i18n::text("刷新")),
+                MenuItem::new("computer-properties", rust_explorer::i18n::text("属性")),
             ],
             "sort-menu" => vec![
-                MenuItem::new("sort:name", "名称").check(self.sort == Sort::Name),
-                MenuItem::new("sort:modified", "修改日期").check(self.sort == Sort::Modified),
-                MenuItem::new("sort:kind", "类型").check(self.sort == Sort::Kind),
+                MenuItem::new("sort:name", rust_explorer::i18n::text("名称"))
+                    .check(self.sort == Sort::Name),
+                MenuItem::new("sort:modified", rust_explorer::i18n::text("修改日期"))
+                    .check(self.sort == Sort::Modified),
+                MenuItem::new("sort:kind", rust_explorer::i18n::text("类型"))
+                    .check(self.sort == Sort::Kind),
                 MenuItem::new(
                     "sort:size",
                     if self.usage_enabled {
-                        "统计大小"
+                        rust_explorer::i18n::text("统计大小")
                     } else {
-                        "大小"
+                        rust_explorer::i18n::text("大小")
                     },
                 )
                 .check(self.sort == Sort::Size),
-                MenuItem::new("sort:created", "创建日期").check(self.sort == Sort::Created),
+                MenuItem::new("sort:created", rust_explorer::i18n::text("创建日期"))
+                    .check(self.sort == Sort::Created),
                 MenuItem::separator(),
-                MenuItem::new("ascending", "递增").check(!self.descending),
-                MenuItem::new("descending", "递减").check(self.descending),
+                MenuItem::new("ascending", rust_explorer::i18n::text("递增"))
+                    .check(!self.descending),
+                MenuItem::new("descending", rust_explorer::i18n::text("递减"))
+                    .check(self.descending),
                 MenuItem::separator(),
-                MenuItem::new("submenu:group", "分组依据                     ›"),
+                MenuItem::new(
+                    "submenu:group",
+                    rust_explorer::i18n::text("分组依据                     ›"),
+                ),
             ],
             "group" => [
-                ("", "（无）"),
-                ("name", "名称"),
-                ("modified", "修改日期"),
-                ("kind", "类型"),
-                ("size", "大小"),
-                ("created", "创建日期"),
+                ("", rust_explorer::i18n::text("（无）")),
+                ("name", rust_explorer::i18n::text("名称")),
+                ("modified", rust_explorer::i18n::text("修改日期")),
+                ("kind", rust_explorer::i18n::text("类型")),
+                ("size", rust_explorer::i18n::text("大小")),
+                ("created", rust_explorer::i18n::text("创建日期")),
             ]
             .iter()
             .map(|(id, label)| {
@@ -3785,13 +3964,13 @@ impl Explorer {
             })
             .chain([
                 MenuItem::separator(),
-                MenuItem::new("reset-columns", "重置列宽和顺序"),
+                MenuItem::new("reset-columns", rust_explorer::i18n::text("重置列宽和顺序")),
             ])
             .collect(),
             "new-menu" => {
                 let mut items = vec![
-                    MenuItem::new("new-folder", "文件夹"),
-                    MenuItem::new("new-shortcut", "快捷方式"),
+                    MenuItem::new("new-folder", rust_explorer::i18n::text("文件夹")),
+                    MenuItem::new("new-shortcut", rust_explorer::i18n::text("快捷方式")),
                     MenuItem::separator(),
                 ];
                 items.extend(
@@ -3808,47 +3987,61 @@ impl Explorer {
                 let mut items = Vec::new();
                 for id in &self.toolbar_overflow {
                     let item = match *id {
-                        "view-menu" => {
-                            MenuItem::new("submenu:view-menu", "查看                         ›")
+                        "view-menu" => MenuItem::new(
+                            "submenu:view-menu",
+                            rust_explorer::i18n::text("查看                         ›"),
+                        ),
+                        "sort-menu" => MenuItem::new(
+                            "submenu:sort-menu",
+                            rust_explorer::i18n::text("排序                         ›"),
+                        ),
+                        "cut" => {
+                            MenuItem::new("file-cut", rust_explorer::i18n::text("剪切")).enable(any)
                         }
-                        "sort-menu" => {
-                            MenuItem::new("submenu:sort-menu", "排序                         ›")
-                        }
-                        "cut" => MenuItem::new("file-cut", "剪切").enable(any),
-                        "copy" => MenuItem::new("file-copy", "复制").enable(any),
-                        "paste" => MenuItem::new("file-paste", "粘贴")
+                        "copy" => MenuItem::new("file-copy", rust_explorer::i18n::text("复制"))
+                            .enable(any),
+                        "paste" => MenuItem::new("file-paste", rust_explorer::i18n::text("粘贴"))
                             .enable(!navigation::is_app_virtual(&self.dir())),
-                        "rename" => MenuItem::new("file-rename", "重命名").enable(
-                            self.selected.len() == 1
-                                && (self
-                                    .selected
-                                    .first()
-                                    .and_then(|index| self.entries.get(*index))
-                                    .is_some_and(|entry| {
-                                        rust_explorer::volume_label::is_drive_root(&entry.path)
-                                    })
-                                    || (!self.is_home()
-                                        && !navigation::is_shell_folder(&self.dir()))),
-                        ),
-                        "share" => MenuItem::new("file-share", "共享").enable(
-                            self.selected.len() == 1
-                                && !navigation::is_shell_folder(&self.dir())
-                                && self
-                                    .selected
-                                    .first()
-                                    .is_some_and(|i| !self.entries[*i].directory),
-                        ),
-                        "delete" => MenuItem::new("file-delete", "删除").enable(any),
+                        "rename" => {
+                            MenuItem::new("file-rename", rust_explorer::i18n::text("重命名"))
+                                .enable(
+                                    self.selected.len() == 1
+                                        && (self
+                                            .selected
+                                            .first()
+                                            .and_then(|index| self.entries.get(*index))
+                                            .is_some_and(|entry| {
+                                                rust_explorer::volume_label::is_drive_root(
+                                                    &entry.path,
+                                                )
+                                            })
+                                            || (!self.is_home()
+                                                && !navigation::is_shell_folder(&self.dir()))),
+                                )
+                        }
+                        "share" => MenuItem::new("file-share", rust_explorer::i18n::text("共享"))
+                            .enable(
+                                self.selected.len() == 1
+                                    && !navigation::is_shell_folder(&self.dir())
+                                    && self
+                                        .selected
+                                        .first()
+                                        .is_some_and(|i| !self.entries[*i].directory),
+                            ),
+                        "delete" => MenuItem::new("file-delete", rust_explorer::i18n::text("删除"))
+                            .enable(any),
                         "usage" => MenuItem::new(
                             "usage",
                             if self.usage_running {
-                                "停止统计大小"
+                                rust_explorer::i18n::text("停止统计大小")
                             } else {
-                                "统计大小"
+                                rust_explorer::i18n::text("统计大小")
                             },
                         ),
-                        "global" => MenuItem::new("global", "在全盘搜索")
-                            .check(self.tabs[self.active].global),
+                        "global" => {
+                            MenuItem::new("global", rust_explorer::i18n::text("在全盘搜索"))
+                                .check(self.tabs[self.active].global)
+                        }
                         _ => continue,
                     };
                     items.push(item);
@@ -3857,31 +4050,34 @@ impl Explorer {
                     items.push(MenuItem::separator());
                 }
                 items.extend([
-                    MenuItem::new("zip", "压缩为 ZIP 文件").enable(any),
-                    MenuItem::new("undo", "撤销    Ctrl+Z")
+                    MenuItem::new("zip", rust_explorer::i18n::text("压缩为 ZIP 文件")).enable(any),
+                    MenuItem::new("undo", rust_explorer::i18n::text("撤销    Ctrl+Z"))
                         .enable(!self.undo_stack.is_empty() && !self.busy),
-                    MenuItem::new("redo", "重做    Ctrl+Y")
+                    MenuItem::new("redo", rust_explorer::i18n::text("重做    Ctrl+Y"))
                         .enable(!self.redo_stack.is_empty() && !self.busy),
                     MenuItem::new(
                         "pin",
                         if all_folders {
-                            "固定到快速访问"
+                            rust_explorer::i18n::text("固定到快速访问")
                         } else {
-                            "添加到收藏夹"
+                            rust_explorer::i18n::text("添加到收藏夹")
                         },
                     )
                     .enable(any),
-                    MenuItem::new("copy-path", "复制路径").enable(any),
+                    MenuItem::new("copy-path", rust_explorer::i18n::text("复制路径")).enable(any),
                     MenuItem::separator(),
-                    MenuItem::new("select-all", "全部选择"),
-                    MenuItem::new("select-none", "全部取消").enable(any),
-                    MenuItem::new("select-invert", "反向选择"),
+                    MenuItem::new("select-all", rust_explorer::i18n::text("全部选择")),
+                    MenuItem::new("select-none", rust_explorer::i18n::text("全部取消")).enable(any),
+                    MenuItem::new("select-invert", rust_explorer::i18n::text("反向选择")),
                     MenuItem::separator(),
-                    MenuItem::new("properties", "属性"),
-                    MenuItem::new("options", "选项"),
+                    MenuItem::new("properties", rust_explorer::i18n::text("属性")),
+                    MenuItem::new("options", rust_explorer::i18n::text("选项")),
                     MenuItem::separator(),
-                    MenuItem::new("new-window", "新建窗口"),
-                    MenuItem::new("detach-tab", "将当前标签移至新窗口"),
+                    MenuItem::new("new-window", rust_explorer::i18n::text("新建窗口")),
+                    MenuItem::new(
+                        "detach-tab",
+                        rust_explorer::i18n::text("将当前标签移至新窗口"),
+                    ),
                 ]);
                 items
             }
@@ -4034,9 +4230,13 @@ impl Explorer {
                 .flex_col()
                 .gap_3()
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(div().text_size(ui(15.)).child("系统操作详情"));
+                .child(
+                    div()
+                        .text_size(ui(15.))
+                        .child(rust_explorer::i18n::text("系统操作详情")),
+                );
             if self.system_operations.is_empty() {
-                panel = panel.child("暂无系统操作记录");
+                panel = panel.child(rust_explorer::i18n::text("暂无系统操作记录"));
             }
             for op in self.system_operations.iter().rev() {
                 let elapsed = op
@@ -4053,13 +4253,13 @@ impl Explorer {
                     .border_b_1()
                     .border_color(rgb(t.border))
                     .child(op.label.clone())
-                    .child(format!("用时：{elapsed:.1} 秒"))
+                    .child(rust_explorer::trf!("用时：{elapsed:.1} 秒"))
                     .child(div().whitespace_normal().child(op.status.clone()));
                 if op.finished.is_none() {
                     card = card.child(div().flex().gap_2()
-                        .child(button(("stop-operation", id), "停止", t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-stop:{id}"), w, cx))))
-                        .child(button(("force-operation", id), "强行停止", t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-force:{id}"), w, cx)))))
-                        .child(div().text_size(ui(11.)).text_color(rgb(t.muted)).child("强行停止不会回滚已完成的文件操作；提升权限的系统窗口可能需要手动关闭。"));
+                        .child(button(("stop-operation", id), rust_explorer::i18n::text("停止"), t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-stop:{id}"), w, cx))))
+                        .child(button(("force-operation", id), rust_explorer::i18n::text("强行停止"), t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-force:{id}"), w, cx)))))
+                        .child(div().text_size(ui(11.)).text_color(rgb(t.muted)).child(rust_explorer::i18n::text("强行停止不会回滚已完成的文件操作；提升权限的系统窗口可能需要手动关闭。")));
                 }
                 panel = panel.child(card);
             }
@@ -4194,7 +4394,7 @@ impl Explorer {
         self.thumbnail_images = visual::ThumbnailImages::new(cx);
         self.invalidate_list();
         self.sync_thumbnails();
-        self.status = "正在清空缓存…".into();
+        self.status = rust_explorer::i18n::text("正在清空缓存…").into();
         let task = cx
             .background_executor()
             .spawn(async { rust_explorer::native_assets::clear_disk_cache() });
@@ -4206,10 +4406,12 @@ impl Explorer {
                 v.thumbnails = rust_explorer::thumbnails::Loader::new();
                 v.thumbnail_images = visual::ThumbnailImages::new(cx);
                 v.status = match result {
-                    Ok((removed, failed)) => format!(
+                    Ok((removed, failed)) => rust_explorer::trf!(
                         "已清空缓存 · 删除 {removed} 个生成文件 · {failed} 个文件正在使用或无法删除"
                     ),
-                    Err(error) => format!("内存缓存已清空，磁盘缓存清理失败：{error:#}"),
+                    Err(error) => {
+                        rust_explorer::trf!("内存缓存已清空，磁盘缓存清理失败：{error:#}")
+                    }
                 };
                 v.sync_thumbnails();
                 cx.notify();
@@ -4232,9 +4434,9 @@ impl Explorer {
                 {
                     op.control.stop(force);
                     op.status = if force {
-                        "正在强行停止"
+                        rust_explorer::i18n::text("正在强行停止")
                     } else {
-                        "正在请求停止"
+                        rust_explorer::i18n::text("正在请求停止")
                     }
                     .into();
                 }
@@ -4245,7 +4447,7 @@ impl Explorer {
         if let Some(payload) = id.strip_prefix("shell-verb:") {
             match serde_json::from_str::<shell::Request>(payload) {
                 Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
-                _ => self.error = Some("无效的系统菜单操作".into()),
+                _ => self.error = Some(rust_explorer::i18n::text("无效的系统菜单操作").into()),
             }
             cx.notify();
             return;
@@ -4267,9 +4469,9 @@ impl Explorer {
             self.quick_access_tick = Instant::now() - Duration::from_secs(16);
             self.refresh_quick_access(cx);
             self.status = if id == "quick-pinned" {
-                "已固定到快速访问".into()
+                rust_explorer::i18n::text("已固定到快速访问").into()
             } else {
-                "已从快速访问取消固定".into()
+                rust_explorer::i18n::text("已从快速访问取消固定").into()
             };
             w.focus(&self.focus);
             cx.notify();
@@ -4680,6 +4882,7 @@ impl Explorer {
                                     Sort::Name => "name",
                                     Sort::Modified => "modified",
                                     Sort::Created => "created",
+                                    Sort::Location => "location",
                                     Sort::Original => "original",
                                     Sort::Deleted => "deleted",
                                     Sort::Kind => "kind",
@@ -4780,7 +4983,7 @@ impl Explorer {
                     .collect::<Vec<_>>()
                     .join("\r\n");
                 cx.write_to_clipboard(ClipboardItem::new_string(text));
-                self.status = "已复制路径".into();
+                self.status = rust_explorer::i18n::text("已复制路径").into();
             }
             "properties" => {
                 let mut paths = self.paths();
@@ -4834,7 +5037,7 @@ impl Explorer {
         }
         let folder = self.dir();
         self.busy = true;
-        self.status = "正在压缩 ZIP…".into();
+        self.status = rust_explorer::i18n::text("正在压缩 ZIP…").into();
         let task = cx.background_executor().spawn(async move {
             (move || -> anyhow::Result<PathBuf> {
                 let stem = if paths.len() == 1 {
@@ -4844,7 +5047,7 @@ impl Explorer {
                         .to_string_lossy()
                         .to_string()
                 } else {
-                    "存档".into()
+                    rust_explorer::i18n::text("存档").into()
                 };
                 let archive = (0..10000)
                     .map(|i| {
@@ -4901,6 +5104,8 @@ impl Explorer {
                 self.view
             };
             self.settings = settings;
+            rust_explorer::i18n::set_language(&self.settings.language);
+            self.language_menu_open = false;
             self.theme = Theme::preference(&self.settings.theme);
             self.tree_children.clear();
             self.hidden = self.settings.hidden;
@@ -4919,7 +5124,7 @@ impl Explorer {
             files: !directory,
             directories: directory,
             multiple: false,
-            prompt: Some("选择本机 Windows 界面资源".into()),
+            prompt: Some(rust_explorer::i18n::text("选择本机 Windows 界面资源").into()),
         });
         cx.spawn(async move |view, cx| {
             if let Ok(Ok(Some(paths))) = picker.await {
@@ -4939,9 +5144,10 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 match result {
                     Ok(status) => {
-                        v.status = format!(
+                        v.status = rust_explorer::trf!(
                             "资源已更新：{} 个 SVG，{} 个已识别系统模块",
-                            status.svg_count, status.native_module_count
+                            status.svg_count,
+                            status.native_module_count
                         )
                     }
                     Err(error) => v.error = Some(error),
@@ -4965,16 +5171,16 @@ impl Explorer {
         let task = cx.background_executor().spawn(async move {
             use windows::{core::PCWSTR, Win32::{Foundation::HWND, UI::WindowsAndMessaging::*}};
             let message = if enable {
-                "将限时试用当前用户的普通文件夹和驱动器默认打开方式。Win+E、此电脑等虚拟页面保持系统行为。\n请先将程序放在固定位置，启用后不要移动或删除。\n未在 120 秒内确认保留，独立恢复进程会自动恢复原样，即使 RE 已退出。\n原始值及独立恢复程序位于本地应用数据目录 RustExplorer\\folder-association。\n是否开始试用？"
-            } else { "恢复启用前的文件夹和驱动器关联？若关联已被其他程序修改，会保留这些修改并报告冲突。" };
+                rust_explorer::i18n::text("将限时试用当前用户的普通文件夹和驱动器默认打开方式。Win+E、此电脑等虚拟页面保持系统行为。\n请先将程序放在固定位置，启用后不要移动或删除。\n未在 120 秒内确认保留，独立恢复进程会自动恢复原样，即使 RE 已退出。\n原始值及独立恢复程序位于本地应用数据目录 RustExplorer\\folder-association。\n是否开始试用？")
+            } else { rust_explorer::i18n::text("恢复启用前的文件夹和驱动器关联？若关联已被其他程序修改，会保留这些修改并报告冲突。") };
             let message: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
-            let title: Vec<u16> = "Rust Explorer — 文件夹关联".encode_utf16().chain(Some(0)).collect();
+            let title: Vec<u16> = rust_explorer::i18n::text("Rust Explorer — 文件夹关联").encode_utf16().chain(Some(0)).collect();
             let answer = unsafe { MessageBoxW(Some(HWND(hwnd as *mut _)), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
             if answer != IDYES { return Ok(false); }
             if enable {
                 rust_explorer::default_browser::enable().map_err(|e| format!("{e:#}"))?;
                 if rust_explorer::default_browser::trial_pending() {
-                    let keep: Vec<u16> = "临时接管已启用。请在 Windows 资源管理器中双击普通文件夹、驱动器，确认 RE 正常打开。\n是否保留此设置？\n选择“否”或 120 秒内未确认，会自动恢复原样。".encode_utf16().chain(Some(0)).collect();
+                    let keep: Vec<u16> = rust_explorer::i18n::text("临时接管已启用。请在 Windows 资源管理器中双击普通文件夹、驱动器，确认 RE 正常打开。\n是否保留此设置？\n选择“否”或 120 秒内未确认，会自动恢复原样。").encode_utf16().chain(Some(0)).collect();
                     let answer = unsafe { MessageBoxW(None, PCWSTR(keep.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) };
                     if answer == IDYES { rust_explorer::default_browser::confirm_trial().map_err(|e| format!("{e:#}"))?; }
                     else if rust_explorer::default_browser::trial_pending() { rust_explorer::default_browser::disable().map_err(|e| format!("{e:#}"))?; return Ok(false); }
@@ -4989,7 +5195,10 @@ impl Explorer {
                 v.association_busy = false;
                 match result {
                     Ok(true) => {
-                        v.status = "文件夹关联操作完成；恢复入口位于文件夹选项 → 高级".into()
+                        v.status = rust_explorer::i18n::text(
+                            "文件夹关联操作完成；恢复入口位于文件夹选项 → 高级",
+                        )
+                        .into()
                     }
                     Ok(false) => {}
                     Err(e) => v.error = Some(e),
@@ -5043,7 +5252,15 @@ impl Explorer {
             .gap_1()
             .border_b_1()
             .border_color(rgb(t.border));
-        for (index, label) in ["常规", "查看", "细节", "搜索", "高级"].iter().enumerate()
+        for (index, label) in [
+            rust_explorer::i18n::text("常规"),
+            rust_explorer::i18n::text("查看"),
+            rust_explorer::i18n::text("细节"),
+            rust_explorer::i18n::text("搜索"),
+            rust_explorer::i18n::text("高级"),
+        ]
+        .iter()
+        .enumerate()
         {
             tabs = tabs.child(
                 button(("option-tab", index), *label, t)
@@ -5067,11 +5284,49 @@ impl Explorer {
             .flex_col()
             .gap_2();
         if self.options_page == 0 {
-            body = body.child(
-                div()
-                    .py_2()
-                    .child(format!("当前软件版本：{}", env!("CARGO_PKG_VERSION"))),
+            let selected = rust_explorer::i18n::Language::from_tag(&settings.language);
+            let mut languages = div().flex().flex_col().gap_1().child(
+                button(
+                    "language-dropdown",
+                    SharedString::from(format!("{}  ▾", selected.native_name())),
+                    t,
+                )
+                .on_click(cx.listener(|v, _, _, cx| {
+                    v.language_menu_open = !v.language_menu_open;
+                    cx.notify();
+                })),
             );
+            if self.language_menu_open {
+                for language in [
+                    rust_explorer::i18n::Language::English,
+                    rust_explorer::i18n::Language::Chinese,
+                    rust_explorer::i18n::Language::Japanese,
+                    rust_explorer::i18n::Language::Korean,
+                ] {
+                    languages = languages.child(
+                        button(
+                            SharedString::from(format!("language-{}", language.tag())),
+                            language.native_name(),
+                            t,
+                        )
+                        .when(selected == language, |d| d.bg(rgb(t.selection)))
+                        .on_click(cx.listener(move |v, _, _, cx| {
+                            if let Some(settings) = &mut v.options {
+                                settings.language = language.tag().into();
+                            }
+                            v.language_menu_open = false;
+                            cx.notify();
+                        })),
+                    );
+                }
+            }
+            body = body
+                .child(div().py_2().child(rust_explorer::i18n::text("界面语言")))
+                .child(languages);
+            body = body.child(div().py_2().child(rust_explorer::trf!(
+                "当前软件版本：{}",
+                env!("CARGO_PKG_VERSION")
+            )));
         }
         if self.options_page == 0 {
             let mut startup = div()
@@ -5081,9 +5336,9 @@ impl Explorer {
                 .items_center()
                 .gap_2();
             for (page, label) in [
-                ("home", "主文件夹"),
-                ("this-pc", "此电脑"),
-                ("quick-access", "快速访问"),
+                ("home", rust_explorer::i18n::text("主文件夹")),
+                ("this-pc", rust_explorer::i18n::text("此电脑")),
+                ("quick-access", rust_explorer::i18n::text("快速访问")),
             ] {
                 let selected = settings.startup_page == page;
                 startup = startup.child(
@@ -5098,85 +5353,106 @@ impl Explorer {
                         })),
                 );
             }
-            body = body.child(div().py_2().child("启动时打开")).child(startup);
+            body = body
+                .child(div().py_2().child(rust_explorer::i18n::text("启动时打开")))
+                .child(startup);
         }
         let options: Vec<(&str, &str, bool)> = match self.options_page {
             0 => vec![
                 (
                     "single",
-                    "通过单击打开项目（指向时选定请使用复选框）",
+                    rust_explorer::i18n::text("通过单击打开项目（指向时选定请使用复选框）"),
                     settings.single_click,
                 ),
                 (
                     "separate",
-                    "在新窗口中打开文件夹",
+                    rust_explorer::i18n::text("在新窗口中打开文件夹"),
                     settings.separate_process,
                 ),
                 (
                     "remember",
-                    "记住每个文件夹的查看方式",
+                    rust_explorer::i18n::text("记住每个文件夹的查看方式"),
                     settings.remember_views,
                 ),
             ],
             1 => vec![
                 (
                     "extensions",
-                    "显示已知文件类型的扩展名",
+                    rust_explorer::i18n::text("显示已知文件类型的扩展名"),
                     settings.extensions,
                 ),
-                ("hidden", "显示隐藏的文件、文件夹和驱动器", settings.hidden),
-                ("protected", "显示受保护的操作系统文件", settings.protected),
-                ("checkboxes", "使用复选框以便选择项目", settings.checkboxes),
+                (
+                    "hidden",
+                    rust_explorer::i18n::text("显示隐藏的文件、文件夹和驱动器"),
+                    settings.hidden,
+                ),
+                (
+                    "protected",
+                    rust_explorer::i18n::text("显示受保护的操作系统文件"),
+                    settings.protected,
+                ),
+                (
+                    "checkboxes",
+                    rust_explorer::i18n::text("使用复选框以便选择项目"),
+                    settings.checkboxes,
+                ),
                 (
                     "thumbnails",
-                    "显示文件缩略图（中等图标及以上）",
+                    rust_explorer::i18n::text("显示文件缩略图（中等图标及以上）"),
                     settings.thumbnails,
                 ),
                 (
                     "compact",
-                    "减小项目之间的空间（紧凑视图）",
+                    rust_explorer::i18n::text("减小项目之间的空间（紧凑视图）"),
                     settings.compact,
                 ),
                 (
                     "full-system-menu",
-                    "右键直接显示完整系统菜单",
+                    rust_explorer::i18n::text("右键直接显示完整系统菜单"),
                     settings.full_system_menu,
                 ),
                 (
                     "full-path",
-                    "在窗口标题栏和标签页中显示完整路径",
+                    rust_explorer::i18n::text("在窗口标题栏和标签页中显示完整路径"),
                     settings.full_path,
                 ),
                 (
                     "preview",
-                    "显示预览窗格（文本、照片、视频帧、PDF）",
+                    rust_explorer::i18n::text("显示预览窗格（文本、照片、视频帧、PDF）"),
                     settings.preview,
                 ),
             ],
             2 => vec![
                 (
+                    "blank-double-click-up",
+                    rust_explorer::i18n::text("双击空白区域返回上级文件夹"),
+                    settings.blank_double_click_up,
+                ),
+                (
                     "quick-access-new-tab",
-                    "默认在新标签页中打开快速访问的文件夹",
+                    rust_explorer::i18n::text("默认在新标签页中打开快速访问的文件夹"),
                     settings.quick_access_new_tab,
                 ),
                 (
                     "new-tab-this-pc",
-                    "新标签页打开此电脑（关闭时打开当前目录）",
+                    rust_explorer::i18n::text("新标签页打开此电脑（关闭时打开当前目录）"),
                     settings.new_tab_this_pc,
                 ),
                 (
                     "shift-open-tab",
-                    "按住 Shift 打开文件夹时在新标签页中打开",
+                    rust_explorer::i18n::text("按住 Shift 打开文件夹时在新标签页中打开"),
                     settings.shift_open_tab,
                 ),
                 (
                     "folders-first",
-                    "始终将文件夹排列在文件前面",
+                    rust_explorer::i18n::text("始终将文件夹排列在文件前面"),
                     settings.folders_first,
                 ),
                 (
                     "focus-existing-tab",
-                    "在新标签页中打开文件夹时，若已有同一目录的标签页则直接切换过去",
+                    rust_explorer::i18n::text(
+                        "在新标签页中打开文件夹时，若已有同一目录的标签页则直接切换过去",
+                    ),
                     settings.focus_existing_tab,
                 ),
             ],
@@ -5187,7 +5463,7 @@ impl Explorer {
                 div()
                     .py_2()
                     .text_color(rgb(t.muted))
-                    .child("浏览文件夹与打开项目"),
+                    .child(rust_explorer::i18n::text("浏览文件夹与打开项目")),
             );
         }
         if self.options_page == 1 {
@@ -5197,9 +5473,12 @@ impl Explorer {
                 .flex_shrink_0()
                 .items_center()
                 .gap_2()
-                .child("外观");
-            for (id, label) in [("system", "跟随系统"), ("light", "亮色"), ("dark", "暗色")]
-            {
+                .child(rust_explorer::i18n::text("外观"));
+            for (id, label) in [
+                ("system", rust_explorer::i18n::text("跟随系统")),
+                ("light", rust_explorer::i18n::text("亮色")),
+                ("dark", rust_explorer::i18n::text("暗色")),
+            ] {
                 themes = themes.child(
                     button(SharedString::from(format!("theme-{id}")), label, t)
                         .when(settings.theme == id, |d| d.bg(rgb(t.selection)))
@@ -5214,89 +5493,112 @@ impl Explorer {
             body = body.child(themes);
         }
         if self.options_page == 2 {
-            body = body.child(div().py_2().text_color(rgb(t.muted)).child("标签页与排序"));
+            body = body.child(
+                div()
+                    .py_2()
+                    .text_color(rgb(t.muted))
+                    .child(rust_explorer::i18n::text("标签页与排序")),
+            );
         }
         if self.options_page == 4 {
+            body = body.child(
+                button(
+                    "thumbnail-cache-directory",
+                    rust_explorer::i18n::text("缩略图存储目录"),
+                    t,
+                )
+                .on_click(cx.listener(|v, _, w, cx| v.show_dialog(Dialog::ThumbnailCache, w, cx))),
+            );
             body = body
                 .child(
                     div()
                         .py_2()
                         .text_color(rgb(t.muted))
-                        .child("缓存与维护"),
+                        .child(rust_explorer::i18n::text("缓存与维护")),
                 )
-                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).child("清空图标、缩略图、文件夹大小和磁盘容量统计缓存；只删除本程序生成的文件。"))
+                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).child(rust_explorer::i18n::text("清空图标、缩略图、文件夹大小和磁盘容量统计缓存；只删除本程序生成的文件。")))
                 .child(div().flex().flex_wrap().flex_shrink_0().gap_2()
-                    .child(button("options-clear-cache", "清空缓存", t).on_click(cx.listener(|v, _, _, cx| v.clear_caches(cx)))));
+                    .child(button("options-clear-cache", rust_explorer::i18n::text("清空缓存"), t).on_click(cx.listener(|v, _, _, cx| v.clear_caches(cx)))));
             body = body.child(
                 div()
                     .py_2()
                     .text_color(rgb(t.muted))
-                    .child("默认文件夹（实验性）"),
+                    .child(rust_explorer::i18n::text("默认文件夹（实验性）")),
             );
             let status = rust_explorer::default_browser::status()
-                .unwrap_or_else(|e| format!("关联状态读取失败：{e:#}"));
-            body = body.child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().child(format!("默认文件夹浏览器（实验性）：{status}。仅普通文件夹和驱动器。先试用 120 秒，确认后保留，超时自动恢复；与下方“应用”独立。")))
+                .unwrap_or_else(|e| rust_explorer::trf!("关联状态读取失败：{e:#}"));
+            body = body.child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().child(rust_explorer::trf!("默认文件夹浏览器（实验性）：{status}。仅普通文件夹和驱动器。先试用 120 秒，确认后保留，超时自动恢复；与下方“应用”独立。")))
                 .child(div().flex().flex_wrap().gap_2()
-                    .child(button("association-enable", if self.association_busy { "操作中…" } else { "试用默认文件夹浏览器…" }, t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(true, w, cx))))
-                    .child(button("association-restore", "恢复原样…", t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(false, w, cx)))));
+                    .child(button("association-enable", if self.association_busy { rust_explorer::i18n::text("操作中…") } else { rust_explorer::i18n::text("试用默认文件夹浏览器…") }, t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(true, w, cx))))
+                    .child(button("association-restore", rust_explorer::i18n::text("恢复原样…"), t).on_click(cx.listener(|v, _, w, cx| v.change_folder_association(false, w, cx)))));
             body = body.child(
-                button("association-recovery-folder", "打开恢复文件夹", t).on_click(cx.listener(
-                    |v, _, _, cx| {
-                        match rust_explorer::default_browser::recovery_directory().and_then(
-                            |path| {
-                                std::fs::create_dir_all(&path)?;
-                                Ok(path)
-                            },
-                        ) {
-                            Ok(path) => {
-                                v.options = None;
-                                v.open_tab_path(path, cx);
-                            }
-                            Err(e) => v.error = Some(e.to_string()),
+                button(
+                    "association-recovery-folder",
+                    rust_explorer::i18n::text("打开恢复文件夹"),
+                    t,
+                )
+                .on_click(cx.listener(|v, _, _, cx| {
+                    match rust_explorer::default_browser::recovery_directory().and_then(|path| {
+                        std::fs::create_dir_all(&path)?;
+                        Ok(path)
+                    }) {
+                        Ok(path) => {
+                            v.options = None;
+                            v.open_tab_path(path, cx);
                         }
-                        cx.notify();
-                    },
-                )),
+                        Err(e) => v.error = Some(e.to_string()),
+                    }
+                    cx.notify();
+                })),
             );
             body = body
-                .child(div().py_2().text_color(rgb(t.muted)).child("性能"))
+                .child(
+                    div()
+                        .py_2()
+                        .text_color(rgb(t.muted))
+                        .child(rust_explorer::i18n::text("性能")),
+                )
                 .child(self.setting_row(
                     "high-performance",
-                    "高性能模式（一屏加缓冲；不适用于中等及以上图标）",
+                    rust_explorer::i18n::text("高性能模式（一屏加缓冲；不适用于中等及以上图标）"),
                     settings.high_performance,
                     cx,
                 ));
             let source = rust_explorer::fluent_icons::resource_status();
             body = body
-                .child(div().py_2().text_color(rgb(t.muted)).child("界面资源"))
-                .child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(format!(
+                .child(div().py_2().text_color(rgb(t.muted)).child(rust_explorer::i18n::text("界面资源")))
+                .child(div().w_full().min_w_0().flex_shrink_0().text_size(ui(12.)).whitespace_normal().child(rust_explorer::trf!(
                 "界面资源：{}（SVG {}，系统资源模块 {}）。仅引用本机文件，不复制到程序目录。",
-                source.source.map(|p| p.display().to_string()).unwrap_or_else(|| "当前系统".into()), source.svg_count, source.native_module_count
+                source.source.map(|p| p.display().to_string()).unwrap_or_else(|| rust_explorer::i18n::text("当前系统").into()), source.svg_count, source.native_module_count
             ))).child(div().w_full().min_w_0().flex().flex_wrap().flex_shrink_0().gap_2()
-                .child(button("resource-file", "选择 DLL / EXE / MUN", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(false, cx))))
-                .child(button("resource-folder", "选择资源目录", t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(true, cx))))
-                .child(button("resource-reset", "使用当前系统", t).on_click(cx.listener(|v, _, _, cx| v.load_resources(None, cx)))));
+                .child(button("resource-file", rust_explorer::i18n::text("选择 DLL / EXE / MUN"), t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(false, cx))))
+                .child(button("resource-folder", rust_explorer::i18n::text("选择资源目录"), t).on_click(cx.listener(|v, _, _, cx| v.choose_resources(true, cx))))
+                .child(button("resource-reset", rust_explorer::i18n::text("使用当前系统"), t).on_click(cx.listener(|v, _, _, cx| v.load_resources(None, cx)))));
         }
         for (id, label, checked) in options {
             body = body.child(self.setting_row(id, label, checked, cx));
         }
         if self.options_page == 1 {
             body = body.child(
-                button("restore-views", "重置所有文件夹的查看设置", t)
-                    .justify_start()
-                    .on_click(cx.listener(|v, _, _, cx| {
-                        if let Some(s) = &mut v.options {
-                            s.folder_views.clear();
-                            s.columns = Settings::default().columns;
-                        }
-                        cx.notify();
-                    })),
+                button(
+                    "restore-views",
+                    rust_explorer::i18n::text("重置所有文件夹的查看设置"),
+                    t,
+                )
+                .justify_start()
+                .on_click(cx.listener(|v, _, _, cx| {
+                    if let Some(s) = &mut v.options {
+                        s.folder_views.clear();
+                        s.columns = Settings::default().columns;
+                    }
+                    cx.notify();
+                })),
             );
         }
         if self.options_page == 3 {
             body = body
-                .child(div().w_full().min_w_0().flex_shrink_0().py_2().whitespace_normal().child("搜索引擎：Everything（已安装时自动调用）"))
-                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).line_height(ui(24.)).child("支持 Everything 查询语法。搜索框旁可切换当前文件夹 / 全盘范围。索引器不可用时，只筛选当前文件夹名称。目录内容、压缩包内容及系统索引服务集成未启用，避免后台扫描。"));
+                .child(div().w_full().min_w_0().flex_shrink_0().py_2().whitespace_normal().child(rust_explorer::i18n::text("搜索引擎：Everything（已安装时自动调用）")))
+                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).line_height(ui(24.)).child(rust_explorer::i18n::text("NTFS 目录使用 Everything；其他文件系统使用可取消的文件名搜索。搜索结果显示名称、类型、大小、修改日期和文件夹路径。")));
         }
         div()
             .absolute()
@@ -5342,7 +5644,7 @@ impl Explorer {
                             .flex()
                             .items_center()
                             .justify_between()
-                            .child(div().text_size(ui(18.)).child("文件夹选项"))
+                            .child(div().text_size(ui(18.)).child(rust_explorer::i18n::text("文件夹选项")))
                             .child(button("options-close", "×", t).on_click(cx.listener(
                                 |v, _, _, cx| {
                                     v.options = None;
@@ -5374,7 +5676,7 @@ impl Explorer {
                             .whitespace_normal()
                             .text_size(ui(12.))
                             .text_color(rgb(t.muted))
-                            .child("普通设置仅作用于 Rust Explorer；默认文件夹关联需单独确认，可通过“恢复原样”撤销。"),
+                            .child(rust_explorer::i18n::text("普通设置仅作用于 Rust Explorer；默认文件夹关联需单独确认，可通过“恢复原样”撤销。")),
                     )
                     .child(
                         div()
@@ -5383,7 +5685,7 @@ impl Explorer {
                             .flex_shrink_0()
                             .gap_2()
                             .justify_between()
-                            .child(button("options-defaults", "还原默认值", t).on_click(
+                            .child(button("options-defaults", rust_explorer::i18n::text("还原默认值"), t).on_click(
                                 cx.listener(|v, _, _, cx| {
                                     v.options = Some(Settings::default());
                                     cx.notify();
@@ -5395,7 +5697,7 @@ impl Explorer {
                                     .flex_wrap()
                                     .gap_2()
                                     .child(
-                                        button("options-ok", "确定", t)
+                                        button("options-ok", rust_explorer::i18n::text("确定"), t)
                                             .bg(rgb(t.selection))
                                             .on_click(
                                                 cx.listener(|v, _, _, cx| {
@@ -5403,13 +5705,13 @@ impl Explorer {
                                                 }),
                                             ),
                                     )
-                                    .child(button("options-cancel", "取消", t).on_click(
+                                    .child(button("options-cancel", rust_explorer::i18n::text("取消"), t).on_click(
                                         cx.listener(|v, _, _, cx| {
                                             v.options = None;
                                             cx.notify();
                                         }),
                                     ))
-                                    .child(button("options-apply", "应用", t).on_click(
+                                    .child(button("options-apply", rust_explorer::i18n::text("应用"), t).on_click(
                                         cx.listener(|v, _, _, cx| v.apply_options(false, cx)),
                                     )),
                             ),
@@ -5423,6 +5725,7 @@ fn toggle_option(settings: &mut Settings, id: &str) {
     match id {
         "quick-access-new-tab" => settings.quick_access_new_tab = !settings.quick_access_new_tab,
         "new-tab-this-pc" => settings.new_tab_this_pc = !settings.new_tab_this_pc,
+        "blank-double-click-up" => settings.blank_double_click_up = !settings.blank_double_click_up,
         "single" => settings.single_click = !settings.single_click,
         "shift-open-tab" => settings.shift_open_tab = !settings.shift_open_tab,
         "separate" => settings.separate_process = !settings.separate_process,

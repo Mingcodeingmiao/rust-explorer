@@ -10,6 +10,41 @@ use windows::{
 };
 const PRIVATE: GUID = GUID::from_u128(0xc139c040_532d_451b_80ca_44d1f0839d2a);
 const SPECIFIC: GUID = GUID::from_u128(0x1a0391bf_9564_4294_b0a4_06c298929ef9);
+const SHARING: GUID = GUID::from_u128(0x99d353bc_c813_41ec_8f28_eae61e702e57);
+
+pub(super) fn is_root(path: &Path) -> bool {
+    path.is_absolute() && path.has_root() && path.parent().is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn sharing_distinguishes_roots_from_child_directories() {
+        for root in [r"C:\", r"D:\", r"\\server\share\", r"\\?\C:\"] {
+            assert!(is_root(Path::new(root)), "{root}");
+        }
+        for child in [
+            r"C:\Users",
+            r"C:\Users\test",
+            r"\\server\share\folder",
+            "relative",
+        ] {
+            assert!(!is_root(Path::new(child)), "{child}");
+        }
+    }
+}
+
+pub(super) fn parent_title(path: &Path) -> Result<String> {
+    unsafe {
+        let items = selection(path)?;
+        let command: IExplorerCommand = CoCreateInstance(&SHARING, None, CLSCTX_INPROC_SERVER)?;
+        let value = command.GetTitle(&items)?;
+        let title = value.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(value.0 as _));
+        Ok(title)
+    }
+}
 
 unsafe fn command(remove: bool) -> Result<IExplorerCommand> {
     Ok(unsafe {

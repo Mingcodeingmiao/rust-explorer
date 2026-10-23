@@ -11,6 +11,7 @@ function Invoke-CargoChecked {
 Push-Location $projectRoot
 try {
     Invoke-CargoChecked @('fmt', '--all', '--', '--check')
+    Invoke-CargoChecked @('fmt', '--manifest-path', 'crates/i18n-macros/Cargo.toml', '--', '--check')
     # Win32 IPC tests share OS message timing; serialize them for reproducible checks.
     Invoke-CargoChecked @('test', '--locked', '--lib', '--no-default-features', '--', '--test-threads=1')
     # The Shell-link test initializes a COM apartment, so it runs in its own process;

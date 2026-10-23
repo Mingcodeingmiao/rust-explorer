@@ -272,6 +272,7 @@ fn cache_root() -> PathBuf {
 }
 /// Remove only this application's generated native PNGs; never follow links.
 pub fn clear_disk_cache() -> Result<(usize, usize)> {
+    crate::thumbnail_store::clear()?;
     clear_cache_at(&cache_root())
 }
 fn clear_cache_at(root: &Path) -> Result<(usize, usize)> {
@@ -354,11 +355,9 @@ fn thumbnail_root() -> PathBuf {
 
 /// Stable per-item name for the index, derived from the thumbnail key only.
 fn thumbnail_index_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
-    let root = thumbnail_root();
-    std::fs::create_dir_all(&root)?;
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hash);
-    Ok(root.join(format!("{:016x}.json", hash.finish())))
+    // Include the cache schema/provider revision in a stable SHA-256 key.
+    let bytes = serde_json::to_vec(&(8u32, key))?;
+    Ok(crate::thumbnail_store::directory().join(format!("{}.json", sha256_hex(&bytes))))
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -373,49 +372,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
     text
 }
 
-fn load_thumbnail(index: &Path) -> Option<ThumbnailAsset> {
-    let bytes = std::fs::read(index).ok()?;
-    let asset: ThumbnailAsset = serde_json::from_slice(&bytes).ok()?;
-    asset.image.is_file().then_some(asset)
-}
-
-/// A provider that reported "no thumbnail" for this exact key is remembered next
-/// to the index, so reopening the folder (or restarting the application) does not
-/// pay the same Shell round trip again. The key already contains size and mtime.
-const MISS_TTL: Duration = Duration::from_secs(7 * 24 * 60 * 60);
-fn miss_path(index: &Path) -> PathBuf {
-    index.with_extension("miss")
+fn load_thumbnail(index: &Path, runtime: &Path) -> Option<ThumbnailAsset> {
+    crate::thumbnail_store::load(index, runtime).ok().flatten()
 }
 fn missing_thumbnail(index: &Path) -> bool {
-    let Ok(text) = std::fs::read_to_string(miss_path(index)) else {
-        return false;
-    };
-    let Ok(seconds) = text.trim().parse::<u64>() else {
-        return false;
-    };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    now.saturating_sub(seconds) < MISS_TTL.as_secs() && seconds <= now
+    crate::thumbnail_store::missing(index)
 }
 pub fn remember_missing_thumbnail(key: &crate::thumbnails::Key) {
-    let Ok(index) = thumbnail_index_path(key) else {
-        return;
-    };
-    let seconds = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let _ = std::fs::write(miss_path(&index), seconds.to_string());
-}
-
-fn save_thumbnail_index(index: &Path, asset: &ThumbnailAsset) -> Result<()> {
-    let temporary = index.with_extension(format!("{}.tmp", std::process::id()));
-    std::fs::write(&temporary, serde_json::to_vec(asset)?)?;
-    if std::fs::rename(&temporary, index).is_err() {
-        let _ = std::fs::remove_file(&temporary);
+    if let Ok(index) = thumbnail_index_path(key) {
+        crate::thumbnail_store::remember_missing(&index);
     }
+}
+fn save_thumbnail_index(index: &Path, asset: &ThumbnailAsset) -> Result<()> {
+    // Cache failures never prevent a freshly generated image from being displayed.
+    let _ = crate::thumbnail_store::save(index, asset);
     Ok(())
 }
 
@@ -553,6 +523,7 @@ fn icon_cache_path(item: &IconRequest) -> Result<PathBuf> {
 /// Identical thumbnails (stock folder art, the same document copied around, a
 /// generic file icon) therefore occupy one file.
 fn store_image(dir: &Path, width: u32, height: u32, rgba: &[u8]) -> Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
     anyhow::ensure!(
         width > 0 && height > 0 && width <= 4096 && height <= 4096,
         "原生图像尺寸无效"
@@ -730,7 +701,7 @@ pub fn serve(json: &str) -> Result<()> {
                 };
             }
             let index = thumbnail_index_path(&item)?;
-            if let Some(asset) = load_thumbnail(&index) {
+            if let Some(asset) = load_thumbnail(&index, &thumbnail_root()) {
                 Response::Thumbnail(asset)
             } else {
                 let image_root = thumbnail_root();
@@ -1060,7 +1031,7 @@ pub fn thumbnail(key: &crate::thumbnails::Key, cancel: &Arc<AtomicBool>) -> Resu
     }
     // The index name already contains the whole key (including the shortcut
     // epoch), so reading it cannot return artwork for a different key.
-    if let Some(asset) = load_thumbnail(&index) {
+    if let Some(asset) = load_thumbnail(&index, &thumbnail_root()) {
         return Ok(asset);
     }
     match call(
@@ -1183,7 +1154,7 @@ impl ThumbnailSession {
         }
         // The index name contains the whole key (epoch included), so a hit always
         // belongs to this key: no helper round trip for cached folders.
-        if let Some(asset) = load_thumbnail(&index) {
+        if let Some(asset) = load_thumbnail(&index, &thumbnail_root()) {
             crate::shell::menu_trace("thumbnail: disk hit");
             return Ok(asset);
         }
@@ -1210,8 +1181,11 @@ impl ThumbnailSession {
                 match process.replies.recv_timeout(Duration::from_millis(10)) {
                     Ok(line) => match serde_json::from_str::<Response>(&line) {
                         Ok(Response::Thumbnail(asset)) => return Ok(asset),
-                        Ok(Response::ThumbnailError(_)) => {
-                            return Err(anyhow::anyhow!("文件不支持缩略图"));
+                        Ok(Response::ThumbnailError(error)) => {
+                            // Only a genuine unsupported-provider result is a
+                            // negative cache entry. Disk/SQLite/codec errors may
+                            // succeed on retry and must keep their real cause.
+                            return Err(anyhow::anyhow!(error));
                         }
                         _ => bail!("无效缩略图响应"),
                     },
@@ -1355,28 +1329,6 @@ mod cache_tests {
         assert!(cache.cache.is_empty());
     }
     #[test]
-    fn provider_negative_results_expire_instead_of_being_retried_every_session() {
-        let root = temp_root("miss");
-        let index = root.join("0123456789abcdef.json");
-        assert!(!super::missing_thumbnail(&index));
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        std::fs::write(super::miss_path(&index), now.to_string()).unwrap();
-        assert!(super::missing_thumbnail(&index));
-        // A stale marker is ignored so a newly installed codec gets a chance.
-        let stale = (std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as f64
-            - super::MISS_TTL.as_secs() as f64
-            - 60.) as u64;
-        std::fs::write(super::miss_path(&index), stale.to_string()).unwrap();
-        assert!(!super::missing_thumbnail(&index));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-    #[test]
     fn cache_images_are_named_by_the_sha256_of_their_bytes() {
         assert_eq!(
             super::sha256_hex(b"abc"),
@@ -1416,14 +1368,15 @@ mod cache_tests {
             },
         };
         super::save_thumbnail_index(&index, &asset).unwrap();
-        let loaded = super::load_thumbnail(&index).unwrap();
+        let loaded = super::load_thumbnail(&index, &root).unwrap();
         assert_eq!(loaded.image, first);
         assert!(loaded.presentation.directory);
         assert!(!loaded.presentation.shortcut);
         assert_eq!(loaded.presentation.width, 4);
-        // A pruned image turns the entry into a miss instead of a broken path.
+        // A pruned render file is rebuilt from the persistent SQLite blob.
         std::fs::remove_file(&first).unwrap();
-        assert!(super::load_thumbnail(&index).is_none());
+        assert!(super::load_thumbnail(&index, &root).is_some());
+        crate::thumbnail_store::close_thread_connection();
         std::fs::remove_dir_all(&root).unwrap();
     }
     #[test]

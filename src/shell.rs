@@ -2228,6 +2228,101 @@ fn normalized_menu_title(value: &str) -> String {
         .filter(|c| !matches!(c, '&' | '.' | '…') && !c.is_whitespace())
         .collect()
 }
+/// Inspect already populated submenu handles only. No WM_INITMENUPOPUP here:
+/// selecting an unrelated command must not cold-load every Shell extension.
+fn selected_menu_label(popup: HMENU, command: u32, depth: u8) -> Option<String> {
+    if depth > 5 {
+        return None;
+    }
+    unsafe {
+        for index in 0..GetMenuItemCount(Some(popup)).clamp(0, 256) {
+            let mut text = [0u16; 1024];
+            let mut item = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING | MIIM_SUBMENU,
+                dwTypeData: windows::core::PWSTR(text.as_mut_ptr()),
+                cch: text.len() as u32,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(popup, index as u32, true, &mut item).is_err() {
+                continue;
+            }
+            if item.wID == command {
+                return Some(String::from_utf16_lossy(
+                    &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+                ));
+            }
+            if !item.hSubMenu.is_invalid() {
+                if let Some(label) = selected_menu_label(item.hSubMenu, command, depth + 1) {
+                    return Some(label);
+                }
+            }
+        }
+    }
+    None
+}
+/// Shell's background Sharing submenu expects Explorer's IShellView site.
+/// Keep the system's parent label, but give its context-appropriate commands application
+/// routing. No extension submenu is initialized just to construct this menu.
+unsafe fn bridge_sharing_submenu(
+    popup: HMENU,
+    path: &Path,
+    commands: &mut Vec<String>,
+) -> Result<Option<Popup>> {
+    let title = sharing_native::parent_title(path)?;
+    unsafe {
+        for position in 0..GetMenuItemCount(Some(popup)).clamp(0, 256) {
+            let mut text = [0u16; 1024];
+            let mut item = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_STRING | MIIM_SUBMENU,
+                dwTypeData: windows::core::PWSTR(text.as_mut_ptr()),
+                cch: text.len() as u32,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(popup, position as u32, true, &mut item).is_err()
+                || item.hSubMenu.is_invalid()
+            {
+                continue;
+            }
+            let label = String::from_utf16_lossy(
+                &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+            );
+            if normalized_menu_title(&label) != normalized_menu_title(&title) {
+                continue;
+            }
+            let titles = if sharing_native::is_root(path) {
+                vec![(crate::i18n::text("高级共享…").to_owned(), "advanced-share")]
+            } else {
+                vec![
+                    (sharing_native::title(path, true)?, "remove-access"),
+                    (sharing_native::title(path, false)?, "grant-access"),
+                ]
+            };
+            let replacement = CreatePopupMenu()?;
+            for (text, action) in titles {
+                let text: Vec<u16> = text.encode_utf16().chain(Some(0)).collect();
+                let id = 0x9000 + commands.len();
+                if let Err(error) = AppendMenuW(replacement, MF_STRING, id, PCWSTR(text.as_ptr())) {
+                    let _ = DestroyMenu(replacement);
+                    return Err(error.into());
+                }
+                commands.push(action.into());
+            }
+            let old = item.hSubMenu;
+            item.fMask = MIIM_SUBMENU;
+            item.hSubMenu = replacement;
+            if let Err(error) = SetMenuItemInfoW(popup, position as u32, true, &item) {
+                let _ = DestroyMenu(replacement);
+                return Err(error.into());
+            }
+            // The root owns the replacement; retain the detached old handle only
+            // until this menu closes, then release it on the same STA.
+            return Ok(Some(Popup(old)));
+        }
+    }
+    Ok(None)
+}
 fn invoke_sharing_menu(path: &Path, remove: bool) -> Result<()> {
     unsafe {
         let module = windows::Win32::System::LibraryLoader::GetModuleHandleW(None)?;
@@ -2272,16 +2367,62 @@ fn invoke_sharing_menu(path: &Path, remove: bool) -> Result<()> {
         // requires Explorer site state for GetState/Invoke, so invoke the same
         // command through the fully initialized Shell context menu instead.
         let title = normalized_menu_title(&sharing_native::title(path, remove)?);
-        let entries = menu_entries(&menu, popup.0, 0);
-        let target = entries
-            .iter()
-            .find(|entry| entry.verb == "windows.share")
-            .and_then(|entry| {
-                entry
-                    .children
-                    .iter()
-                    .find(|child| normalized_menu_title(&child.label) == title)
-            });
+        // Only initialize the installed Sharing submenu. Enumerating every
+        // extension's submenu here can block on unrelated providers.
+        let parent_title = sharing_native::parent_title(path).unwrap_or_default();
+        let mut entries = Vec::new();
+        for index in 0..GetMenuItemCount(Some(popup.0)).clamp(0, 256) {
+            let mut text = [0u16; 1024];
+            let mut item = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING | MIIM_SUBMENU,
+                dwTypeData: windows::core::PWSTR(text.as_mut_ptr()),
+                cch: text.len() as u32,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(popup.0, index as u32, true, &mut item).is_err()
+                || item.hSubMenu.is_invalid()
+            {
+                continue;
+            }
+            let label = String::from_utf16_lossy(
+                &text[..text.iter().position(|n| *n == 0).unwrap_or(text.len())],
+            );
+            let verb = canonical_verb(&menu, item.wID);
+            if verb == "windows.share"
+                || (!parent_title.is_empty()
+                    && normalized_menu_title(&label) == normalized_menu_title(&parent_title))
+            {
+                if let Ok(extension) = menu.cast::<IContextMenu3>() {
+                    let _ = extension.HandleMenuMsg2(
+                        WM_INITMENUPOPUP,
+                        WPARAM(item.hSubMenu.0 as usize),
+                        LPARAM(index as isize),
+                        None,
+                    );
+                } else if let Ok(extension) = menu.cast::<IContextMenu2>() {
+                    let _ = extension.HandleMenuMsg(
+                        WM_INITMENUPOPUP,
+                        WPARAM(item.hSubMenu.0 as usize),
+                        LPARAM(index as isize),
+                    );
+                }
+                entries = menu_entries(&menu, item.hSubMenu, 1);
+                break;
+            }
+        }
+        fn find<'a>(entries: &'a [MenuEntry], title: &str) -> Option<&'a MenuEntry> {
+            entries.iter().find_map(|entry| {
+                if normalized_menu_title(&entry.label) == title {
+                    Some(entry)
+                } else {
+                    find(&entry.children, title)
+                }
+            })
+        }
+        // Canonical parent verbs vary across Windows versions; match the title
+        // supplied by the installed command, including cascaded submenu entries.
+        let target = find(&entries, &title);
         let target = target.context("系统共享菜单没有提供对应的访问权限操作")?;
         anyhow::ensure!(
             target.enabled && target.id > 0 && target.id <= 0x6fff,
@@ -2635,7 +2776,7 @@ fn context_menu_options(
                 0
             };
         }
-        let commands = if let Some(options) = &options {
+        let mut commands = if let Some(options) = &options {
             // Shell view commands need our own IShellView state; keep all other
             // provider commands, including the real New and sharing submenus.
             for position in (0..GetMenuItemCount(Some(popup.0))).rev() {
@@ -2654,6 +2795,17 @@ fn context_menu_options(
         } else {
             Vec::new()
         };
+        let sharing_path = if paths.len() == 1 { &paths[0] } else { folder };
+        let _detached_sharing =
+            if app_owner.is_some() && !computer && paths.len() <= 1 && sharing_path.is_dir() {
+                // Failure to find/install this optional bridge leaves the original
+                // menu intact; owner/STA/message-pump lifecycle remains unchanged.
+                bridge_sharing_submenu(popup.0, sharing_path, &mut commands)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
         if quick_access_pinned {
             // The file-system folder menu always exposes `pintohome`, even for a
             // folder that is already pinned. Present the truthful action instead;
@@ -2702,7 +2854,7 @@ fn context_menu_options(
                     3,
                     MF_BYPOSITION | MF_STRING,
                     0x8003,
-                    w!("固定到快速访问"),
+                    crate::i18n::wide("固定到快速访问"),
                 )?;
             }
             // Guarantee a rename entry: the window owns the name and shows its
@@ -2715,7 +2867,7 @@ fn context_menu_options(
                     3,
                     MF_BYPOSITION | MF_STRING,
                     0x8005,
-                    w!("重命名(&M)"),
+                    crate::i18n::wide("重命名(&M)"),
                 )?;
             }
             InsertMenuW(
@@ -2725,7 +2877,12 @@ fn context_menu_options(
                 0,
                 PCWSTR::null(),
             )?;
-            AppendMenuW(popup.0, MF_STRING, 0x8004, w!("添加网络位置(&L)…"))?;
+            AppendMenuW(
+                popup.0,
+                MF_STRING,
+                0x8004,
+                crate::i18n::wide("添加网络位置(&L)…"),
+            )?;
         }
         if !wait_for_context_gesture(hwnd, x, y) {
             return Ok(output);
@@ -2750,6 +2907,12 @@ fn context_menu_options(
         // One shot: the gesture is already debounced (wait for the release, 12 px of
         // press-to-release travel) and the menu is shown in-process, so it no longer
         // needs the old "re-show when it vanishes too fast" retry loop.
+        // Shell extensions can alter the process menu theme while constructing
+        // a file menu. Reapply after QueryContextMenu, immediately before showing
+        // it, just as for folder/background menus. Preserve the same owner/STA.
+        if let Some(dark) = dark {
+            native_menu::configure_theme(hwnd, dark);
+        }
         let started = std::time::Instant::now();
         let command = TrackPopupMenuEx(
             popup.0,
@@ -2793,6 +2956,26 @@ fn context_menu_options(
         }
         if command > 0 {
             let verb = verbs.verb(command as u32);
+            // Sharing submenu children do not consistently provide canonical
+            // verbs. Resolve only the selected item's existing label, after the
+            // popup closes; never eagerly load submenus before displaying it.
+            let sharing_path = if paths.len() == 1 { &paths[0] } else { folder };
+            if app_owner.is_some()
+                && paths.len() <= 1
+                && (verb.is_empty() || verb.contains("share"))
+                && sharing_path.is_dir()
+            {
+                if let Some(label) = selected_menu_label(popup.0, command as u32, 0) {
+                    for (remove, action) in [(false, "grant-access"), (true, "remove-access")] {
+                        if sharing_native::title(sharing_path, remove).is_ok_and(|title| {
+                            normalized_menu_title(&title) == normalized_menu_title(&label)
+                        }) {
+                            emit!("command:{action}");
+                            return Ok(output);
+                        }
+                    }
+                }
+            }
             menu_trace(format!(
                 "menu: chosen verb {verb:?} command={command} paths={}",
                 paths.len()

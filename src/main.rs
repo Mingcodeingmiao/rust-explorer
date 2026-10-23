@@ -2,6 +2,7 @@
 use anyhow::Context;
 
 fn main() {
+    rust_explorer::i18n::set_language(&rust_explorer::settings::Settings::load().language);
     let args: Vec<String> = std::env::args().collect();
     let result = match args.get(1).map(String::as_str) {
         Some("--open-folder") => args

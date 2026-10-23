@@ -2,35 +2,66 @@
 //! The private Windows theme entry points are optional, version guarded and
 //! never loaded from a user-supplied resource module.
 use anyhow::Result;
-use std::mem::size_of;
 use windows::{
     Win32::{
         Foundation::*,
-        System::{LibraryLoader::*, SystemInformation::*},
+        System::LibraryLoader::*,
         UI::{Controls::SetWindowTheme, WindowsAndMessaging::*},
     },
     core::{PCSTR, PCWSTR, w},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThemeApi {
+    Legacy1809,
+    Preferred,
+}
+
+fn theme_api(major: u32, build: u32) -> Option<ThemeApi> {
+    match (major, build) {
+        (10, 17763) => Some(ThemeApi::Legacy1809),
+        (10, 18362..) => Some(ThemeApi::Preferred),
+        _ => None,
+    }
+}
+
+fn installed_theme_api() -> Option<ThemeApi> {
+    use std::sync::OnceLock;
+    static API: OnceLock<Option<ThemeApi>> = OnceLock::new();
+    *API.get_or_init(|| unsafe {
+        // GetVersionExW may return a compatibility-manifest version. Never use
+        // it to select the ABI of undocumented ordinal 135 (1809 uses bool).
+        let ntdll = GetModuleHandleW(w!("ntdll.dll")).ok()?;
+        let entry = GetProcAddress(ntdll, windows::core::s!("RtlGetNtVersionNumbers"))?;
+        let version: unsafe extern "system" fn(*mut u32, *mut u32, *mut u32) =
+            std::mem::transmute(entry);
+        let (mut major, mut minor, mut build) = (0, 0, 0);
+        version(&mut major, &mut minor, &mut build);
+        theme_api(major, build & 0x0fff_ffff)
+    })
+}
+
 pub(super) fn configure_theme(hwnd: HWND, dark: bool) {
+    let Some(api) = installed_theme_api() else {
+        return;
+    };
     unsafe {
-        let mut version = OSVERSIONINFOW {
-            dwOSVersionInfoSize: size_of::<OSVERSIONINFOW>() as u32,
-            ..Default::default()
-        };
-        if GetVersionExW(&mut version).is_err()
-            || version.dwMajorVersion < 10
-            || version.dwBuildNumber < 18362
-        {
-            return;
-        }
         let Ok(module) = LoadLibraryExW(w!("uxtheme.dll"), None, LOAD_LIBRARY_SEARCH_SYSTEM32)
         else {
             return;
         };
         if let Some(entry) = GetProcAddress(module, PCSTR(135usize as *const u8)) {
-            let set_mode: unsafe extern "system" fn(i32) -> i32 = std::mem::transmute(entry);
-            set_mode(if dark { 2 } else { 3 });
+            match api {
+                ThemeApi::Legacy1809 => {
+                    let allow: unsafe extern "system" fn(bool) -> bool = std::mem::transmute(entry);
+                    allow(dark);
+                }
+                ThemeApi::Preferred => {
+                    let set_mode: unsafe extern "system" fn(i32) -> i32 =
+                        std::mem::transmute(entry);
+                    set_mode(if dark { 2 } else { 3 });
+                }
+            }
         }
         if let Some(entry) = GetProcAddress(module, PCSTR(133usize as *const u8)) {
             let allow: unsafe extern "system" fn(HWND, bool) -> bool = std::mem::transmute(entry);
@@ -50,6 +81,21 @@ pub(super) fn configure_theme(hwnd: HWND, dark: bool) {
             flush();
         }
         let _ = FreeLibrary(module);
+    }
+}
+
+#[cfg(test)]
+mod theme_tests {
+    use super::*;
+    #[test]
+    fn theme_ordinal_abi_is_selected_by_real_windows_build() {
+        assert_eq!(theme_api(10, 17763), Some(ThemeApi::Legacy1809));
+        for build in [18362, 19045, 22000, 26300] {
+            assert_eq!(theme_api(10, build), Some(ThemeApi::Preferred));
+        }
+        for (major, build) in [(6, 9600), (10, 17134), (10, 18300), (11, 1)] {
+            assert_eq!(theme_api(major, build), None);
+        }
     }
 }
 
@@ -144,8 +190,20 @@ pub(super) unsafe fn augment(
         let mut position = 0;
         if !background && options.folder {
             let start = options.folder_insert;
-            builder.root(menu, start, "在新标签页中打开", "open-new-tab", true)?;
-            builder.root(menu, start + 1, "在新窗口中打开", "open-new-window", true)?;
+            builder.root(
+                menu,
+                start,
+                crate::i18n::text("在新标签页中打开"),
+                "open-new-tab",
+                true,
+            )?;
+            builder.root(
+                menu,
+                start + 1,
+                crate::i18n::text("在新窗口中打开"),
+                "open-new-window",
+                true,
+            )?;
             InsertMenuW(
                 menu,
                 start + 2,
@@ -156,17 +214,17 @@ pub(super) unsafe fn augment(
             position = start + 3;
         }
         if background {
-            let views = Builder::submenu(menu, position, "查看(&V)")?;
+            let views = Builder::submenu(menu, position, crate::i18n::text("查看(&V)"))?;
             position += 1;
             for (index, label) in [
-                "超大图标",
-                "大图标",
-                "中等图标",
-                "小图标",
-                "列表",
-                "详细信息",
-                "平铺",
-                "内容",
+                crate::i18n::text("超大图标"),
+                crate::i18n::text("大图标"),
+                crate::i18n::text("中等图标"),
+                crate::i18n::text("小图标"),
+                crate::i18n::text("列表"),
+                crate::i18n::text("详细信息"),
+                crate::i18n::text("平铺"),
+                crate::i18n::text("内容"),
             ]
             .iter()
             .enumerate()
@@ -179,14 +237,14 @@ pub(super) unsafe fn augment(
                     true,
                 )?;
             }
-            let sort = Builder::submenu(menu, position, "排序方式(&O)")?;
+            let sort = Builder::submenu(menu, position, crate::i18n::text("排序方式(&O)"))?;
             position += 1;
             for (key, label) in [
-                ("name", "名称"),
-                ("modified", "修改日期"),
-                ("kind", "类型"),
-                ("size", "大小"),
-                ("created", "创建日期"),
+                ("name", crate::i18n::text("名称")),
+                ("modified", crate::i18n::text("修改日期")),
+                ("kind", crate::i18n::text("类型")),
+                ("size", crate::i18n::text("大小")),
+                ("created", crate::i18n::text("创建日期")),
             ] {
                 builder.item(
                     sort,
@@ -197,17 +255,29 @@ pub(super) unsafe fn augment(
                 )?;
             }
             AppendMenuW(sort, MF_SEPARATOR, 0, PCWSTR::null())?;
-            builder.item(sort, "递增", "ascending", !options.descending, true)?;
-            builder.item(sort, "递减", "descending", options.descending, true)?;
-            let groups = Builder::submenu(menu, position, "分组依据(&P)")?;
+            builder.item(
+                sort,
+                crate::i18n::text("递增"),
+                "ascending",
+                !options.descending,
+                true,
+            )?;
+            builder.item(
+                sort,
+                crate::i18n::text("递减"),
+                "descending",
+                options.descending,
+                true,
+            )?;
+            let groups = Builder::submenu(menu, position, crate::i18n::text("分组依据(&P)"))?;
             position += 1;
             for (key, label) in [
-                ("", "（无）"),
-                ("name", "名称"),
-                ("modified", "修改日期"),
-                ("kind", "类型"),
-                ("size", "大小"),
-                ("created", "创建日期"),
+                ("", crate::i18n::text("（无）")),
+                ("name", crate::i18n::text("名称")),
+                ("modified", crate::i18n::text("修改日期")),
+                ("kind", crate::i18n::text("类型")),
+                ("size", crate::i18n::text("大小")),
+                ("created", crate::i18n::text("创建日期")),
             ] {
                 builder.item(
                     groups,
@@ -217,21 +287,39 @@ pub(super) unsafe fn augment(
                     true,
                 )?;
             }
-            builder.root(menu, position, "刷新(&E)", "refresh-folder", true)?;
+            builder.root(
+                menu,
+                position,
+                crate::i18n::text("刷新(&E)"),
+                "refresh-folder",
+                true,
+            )?;
             position += 1;
             builder.root(
                 menu,
                 position,
-                "粘贴(&P)\tCtrl+V",
+                crate::i18n::text("粘贴(&P)\tCtrl+V"),
                 "paste",
                 options.can_paste,
             )?;
             position += 1;
         }
         if background || options.undo || options.redo {
-            builder.root(menu, position, "撤销(&U)\tCtrl+Z", "undo", options.undo)?;
+            builder.root(
+                menu,
+                position,
+                crate::i18n::text("撤销(&U)\tCtrl+Z"),
+                "undo",
+                options.undo,
+            )?;
             position += 1;
-            builder.root(menu, position, "重做(&R)\tCtrl+Y", "redo", options.redo)?;
+            builder.root(
+                menu,
+                position,
+                crate::i18n::text("重做(&R)\tCtrl+Y"),
+                "redo",
+                options.redo,
+            )?;
             position += 1;
             InsertMenuW(
                 menu,

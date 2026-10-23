@@ -1,9 +1,18 @@
-param([string]$BuildDirectory = 'dist\RustExplorer-windows-x64-native')
+param(
+    [string]$BuildDirectory = 'dist\RustExplorer-windows-x64-native',
+    [string]$ReleaseLabel = ''
+)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 $manifest = Get-Content -LiteralPath (Join-Path $projectRoot 'Cargo.toml') -Raw
 if ($manifest -notmatch '(?m)^version\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"') { throw 'Cannot determine package version.' }
 $version = $Matches[1]
+if ($ReleaseLabel) {
+    if ($ReleaseLabel -notmatch ('^' + [regex]::Escape($version) + '-part[0-9]+$')) {
+        throw 'ReleaseLabel must match the package version followed by -partN.'
+    }
+    $version = $ReleaseLabel
+}
 $source = if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $projectRoot $BuildDirectory }
 if (-not (Test-Path -LiteralPath (Join-Path $source 'rust-explorer.exe'))) { throw 'Build the application first.' }
 $outputRoot = Join-Path $projectRoot 'artifacts'
@@ -18,6 +27,7 @@ foreach ($name in @('README.md', 'README.en.md', 'LICENSE', 'NOTICE', 'THIRD_PAR
     Copy-Item -LiteralPath (Join-Path $projectRoot $name) -Destination $staging
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\pinyin-LICENSE.txt') -Destination $staging
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\rusqlite-MIT.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\files-MIT.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\LICENSE') -Destination (Join-Path $staging 'FluentUI-System-Icons-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\SOURCES.json') -Destination (Join-Path $staging 'FluentUI-System-Icons-SOURCES.json')
@@ -27,7 +37,9 @@ if (Test-Path -LiteralPath (Join-Path $staging 'Everything64.dll')) {
 Copy-Item -LiteralPath (Join-Path $projectRoot 'docs') -Destination $staging -Recurse
 New-Item -ItemType Directory -Path (Join-Path $staging 'resources') | Out-Null
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\app-icon') -Destination (Join-Path $staging 'resources') -Recurse
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\locales') -Destination (Join-Path $staging 'resources') -Recurse
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\pinyin-LICENSE.txt') -Destination (Join-Path $staging 'resources')
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\rusqlite-MIT.txt') -Destination (Join-Path $staging 'resources')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\Everything-SDK-License.txt') -Destination (Join-Path $staging 'resources')
 if ((Test-Path -LiteralPath (Join-Path $staging 'libgcc_s_seh-1.dll')) -or (Test-Path -LiteralPath (Join-Path $staging 'libwinpthread-1.dll'))) {
     Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\licenses') -Destination $staging -Recurse

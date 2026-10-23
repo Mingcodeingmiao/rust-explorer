@@ -9,9 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.7.7。** 合并 PR #33：导航时恢复滚动位置和选中项，支持鼠标侧键、空白双击向上及标签页去重；整理“细节/高级”设置页、原地重命名驱动器和此电脑，优化大目录列举、图标及缩略图缓存。右键菜单继续保留进程内独立 STA 和 owner 约束。详见 [0.7.7 更新说明](docs/v0.7.7.md)及[已知边界](KNOWN_ISSUES.md)。
+**当前版本为 0.7.7 part1。** 新增中英日韩语言下拉选择（默认英文）、SQLite 缩略图缓存及目录设置，修复快速连续双击进入目录，优化搜索结果路径展示，并区分根目录与子目录的共享菜单。详见 [part1 更新说明](docs/v0.7.7-part1.md)。
 
-最新已发布下载：[Rust Explorer 0.7.7](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
+> [!WARNING]
+> **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
+
+最新已发布下载：[Rust Explorer 0.7.7 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.7-part1)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 

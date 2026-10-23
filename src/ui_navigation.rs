@@ -1,7 +1,7 @@
 use super::*;
 fn computer_name_cache() -> &'static std::sync::RwLock<String> {
     static CACHE: std::sync::OnceLock<std::sync::RwLock<String>> = std::sync::OnceLock::new();
-    CACHE.get_or_init(|| std::sync::RwLock::new("此电脑".into()))
+    CACHE.get_or_init(|| std::sync::RwLock::new(rust_explorer::i18n::text("此电脑").into()))
 }
 pub(super) fn computer_name() -> String {
     computer_name_cache().read().unwrap().clone()
@@ -36,9 +36,9 @@ pub(super) fn is_virtual(path: &std::path::Path) -> bool {
 pub(super) fn location_name(path: &std::path::Path) -> String {
     match path.to_string_lossy().as_ref() {
         "::ThisPC" => computer_name(),
-        "::Network" => "网络".into(),
-        "::Libraries" => "库".into(),
-        "::QuickAccess" => "快速访问".into(),
+        "::Network" => rust_explorer::i18n::text("网络").into(),
+        "::Libraries" => rust_explorer::i18n::text("库").into(),
+        "::QuickAccess" => rust_explorer::i18n::text("快速访问").into(),
         _ => path
             .file_name()
             .unwrap_or(path.as_os_str())
@@ -48,13 +48,13 @@ pub(super) fn location_name(path: &std::path::Path) -> String {
 }
 fn volume_type(volume: &Volume) -> &'static str {
     match volume.kind {
-        2 => "可移动磁盘",
-        4 => "网络驱动器",
-        5 => "光盘驱动器",
-        6 => "RAM 磁盘",
-        7 => "便携设备",
-        8 => "便携设备存储",
-        _ => "本地磁盘",
+        2 => rust_explorer::i18n::text("可移动磁盘"),
+        4 => rust_explorer::i18n::text("网络驱动器"),
+        5 => rust_explorer::i18n::text("光盘驱动器"),
+        6 => rust_explorer::i18n::text("RAM 磁盘"),
+        7 => rust_explorer::i18n::text("便携设备"),
+        8 => rust_explorer::i18n::text("便携设备存储"),
+        _ => rust_explorer::i18n::text("本地磁盘"),
     }
 }
 impl Explorer {
@@ -162,6 +162,7 @@ impl Explorer {
                         Sort::Name => "name",
                         Sort::Modified => "modified",
                         Sort::Created => "created",
+                        Sort::Location => "location",
                         Sort::Original => "original",
                         Sort::Deleted => "deleted",
                         Sort::Kind => "kind",
@@ -350,7 +351,9 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 v.quick_access_busy = false;
                 if result.is_err() && v.dir() == PathBuf::from("::QuickAccess") {
-                    v.status = "快速访问读取失败，保留已有列表 · F5 重试".into();
+                    v.status =
+                        rust_explorer::i18n::text("快速访问读取失败，保留已有列表 · F5 重试")
+                            .into();
                     cx.notify();
                 }
                 if let Ok(items) = result {
@@ -476,7 +479,7 @@ impl Explorer {
                     free: None,
                     modified: None,
                     created: None,
-                    kind: "文件夹".into(),
+                    kind: rust_explorer::i18n::text("文件夹").into(),
                 })
                 .collect()
         } else if self.dir() == PathBuf::from("::Libraries") {
@@ -496,7 +499,7 @@ impl Explorer {
                     free: None,
                     modified: None,
                     created: None,
-                    kind: "库文件夹".into(),
+                    kind: rust_explorer::i18n::text("库文件夹").into(),
                 })
                 .collect()
         } else {
@@ -524,9 +527,9 @@ impl Explorer {
                     modified: None,
                     created: None,
                     kind: match volume.kind {
-                        4 => "网络位置",
-                        7 => "便携设备",
-                        _ => "驱动器",
+                        4 => rust_explorer::i18n::text("网络位置"),
+                        7 => rust_explorer::i18n::text("便携设备"),
+                        _ => rust_explorer::i18n::text("驱动器"),
                     }
                     .into(),
                 })
@@ -557,7 +560,7 @@ impl Explorer {
             .enumerate()
             .filter_map(|(i, e)| selected.contains(&e.path).then_some(i))
             .collect();
-        self.status = format!("{} 个项目", self.entries.len());
+        self.status = rust_explorer::trf!("{} 个项目", self.entries.len());
         self.rebuild_rows();
     }
     fn tree_is_open(&self, path: &std::path::Path) -> bool {
@@ -709,7 +712,7 @@ impl Explorer {
                     }
                 }
                 Err(_) => out.push(NavRow {
-                    label: "无法读取或超时（折叠后可重试）".into(),
+                    label: rust_explorer::i18n::text("无法读取或超时（折叠后可重试）").into(),
                     path: PathBuf::new(),
                     depth: depth + 1,
                     expandable: false,
@@ -719,7 +722,7 @@ impl Explorer {
             }
         } else if self.tree_loading.contains(path) {
             out.push(NavRow {
-                label: "正在加载…".into(),
+                label: rust_explorer::i18n::text("正在加载…").into(),
                 path: PathBuf::new(),
                 depth: depth + 1,
                 expandable: false,
@@ -741,25 +744,25 @@ impl Explorer {
             })
         };
         add(
-            "主文件夹",
+            rust_explorer::i18n::text("主文件夹"),
             shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Profile)
                 .unwrap_or_else(|| PathBuf::from("C:\\")),
             "home",
         );
         add(
-            "图库",
+            rust_explorer::i18n::text("图库"),
             shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Pictures)
                 .unwrap_or_else(|| PathBuf::from("C:\\")),
             "pictures",
         );
         add(
-            "回收站",
+            rust_explorer::i18n::text("回收站"),
             PathBuf::from("shell:RecycleBinFolder"),
             "recycle-bin",
         );
         add("", PathBuf::new(), "");
         rows.push(NavRow {
-            label: "快速访问".into(),
+            label: rust_explorer::i18n::text("快速访问").into(),
             path: PathBuf::from("::QuickAccess"),
             depth: 0,
             expandable: true,
@@ -787,7 +790,15 @@ impl Explorer {
                     _ => "folder",
                 };
                 rows.push(NavRow {
-                    label: name,
+                    label: if self
+                        .places
+                        .iter()
+                        .any(|(label, known_path)| known_path == &path && label == &name)
+                    {
+                        rust_explorer::i18n::text(&name).to_owned()
+                    } else {
+                        name
+                    },
                     path: path.clone(),
                     depth: 1,
                     expandable: false,
@@ -810,7 +821,13 @@ impl Explorer {
         });
         if self.settings.show_all_folders {
             if let Some(path) = shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Desktop) {
-                self.append_tree(&path, "桌面".into(), 0, "desktop", &mut rows);
+                self.append_tree(
+                    &path,
+                    rust_explorer::i18n::text("桌面").into(),
+                    0,
+                    "desktop",
+                    &mut rows,
+                );
             }
         }
         if self.settings.show_computer {
@@ -830,7 +847,7 @@ impl Explorer {
         }
         if self.settings.show_libraries {
             rows.push(NavRow {
-                label: "库".into(),
+                label: rust_explorer::i18n::text("库").into(),
                 path: PathBuf::from("::Libraries"),
                 depth: 0,
                 expandable: true,
@@ -840,14 +857,20 @@ impl Explorer {
             if self.tree_open.contains(&PathBuf::from("::Libraries")) {
                 for (name, path) in &self.places {
                     if matches!(name.as_str(), "文档" | "图片" | "音乐" | "视频") {
-                        self.append_tree(path, name.clone(), 1, "folder", &mut rows);
+                        self.append_tree(
+                            path,
+                            rust_explorer::i18n::text(name).to_owned(),
+                            1,
+                            "folder",
+                            &mut rows,
+                        );
                     }
                 }
             }
         }
         if self.settings.show_network {
             rows.push(NavRow {
-                label: "网络".into(),
+                label: rust_explorer::i18n::text("网络").into(),
                 path: PathBuf::from("::Network"),
                 depth: 0,
                 expandable: true,
@@ -1185,19 +1208,21 @@ impl Explorer {
             && volume.free.is_some_and(|free| free > 0);
         let space = match (volume.total, volume.free, volume.kind) {
             (Some(total), Some(free), 5) if free == 0 => {
-                format!("光盘 · 共 {}", fs::size_label(total))
+                rust_explorer::trf!("光盘 · 共 {}", fs::size_label(total))
             }
-            (Some(total), Some(free), _) if free > 0 => format!(
+            (Some(total), Some(free), _) if free > 0 => rust_explorer::trf!(
                 "{} 可用，共 {}",
                 fs::size_label(free),
                 fs::size_label(total)
             ),
-            (Some(total), Some(_), _) => format!("0 字节可用，共 {}", fs::size_label(total)),
-            _ if volume.kind == 7 => "便携设备 / MTP".into(),
+            (Some(total), Some(_), _) => {
+                rust_explorer::trf!("0 字节可用，共 {}", fs::size_label(total))
+            }
+            _ if volume.kind == 7 => rust_explorer::i18n::text("便携设备 / MTP").into(),
             _ => volume
                 .remote
                 .clone()
-                .unwrap_or_else(|| "空间信息不可用".into()),
+                .unwrap_or_else(|| rust_explorer::i18n::text("空间信息不可用").into()),
         };
         let label = |value: String| {
             div()
@@ -1342,7 +1367,9 @@ impl Explorer {
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
                     v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
-                    if e.click_count == 2 || v.settings.single_click {
+                    if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                        || v.settings.single_click
+                    {
                         v.navigate_with_modifiers(path.clone(), e.modifiers, cx);
                     }
                 }),
@@ -1520,9 +1547,9 @@ impl Explorer {
             };
             let title = match self.group.as_str() {
                 "kind" => match volume.kind {
-                    4 => "网络位置".into(),
-                    7 => "便携设备".into(),
-                    _ => "设备和驱动器".into(),
+                    4 => rust_explorer::i18n::text("网络位置").into(),
+                    7 => rust_explorer::i18n::text("便携设备").into(),
+                    _ => rust_explorer::i18n::text("设备和驱动器").into(),
                 },
                 "name" => volume
                     .label
@@ -1532,9 +1559,9 @@ impl Explorer {
                     .unwrap_or_default(),
                 "size" => {
                     if volume.total.unwrap_or(0) >= 1024 * 1024 * 1024 * 1024 {
-                        "1 TB 及以上".into()
+                        rust_explorer::i18n::text("1 TB 及以上").into()
                     } else {
-                        "小于 1 TB".into()
+                        rust_explorer::i18n::text("小于 1 TB").into()
                     }
                 }
                 _ => String::new(),
@@ -1745,9 +1772,9 @@ impl Explorer {
                     .p_4()
                     .text_color(rgb(t.muted))
                     .child(if self.volume_busy {
-                        "正在更新设备…"
+                        rust_explorer::i18n::text("正在更新设备…")
                     } else {
-                        "没有可显示的存储设备或映射网络位置"
+                        rust_explorer::i18n::text("没有可显示的存储设备或映射网络位置")
                     }),
             );
         }
@@ -1899,7 +1926,9 @@ impl Explorer {
                             cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                                 cx.stop_propagation();
                                 v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
-                                if e.click_count == 2 || v.settings.single_click {
+                                if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
+                                    || v.settings.single_click
+                                {
                                     v.open_selected(cx);
                                 }
                             }),
@@ -1920,7 +1949,7 @@ impl Explorer {
                 .child(
                     div()
                         .py_2()
-                        .child(format!("常用文件夹 ({})", self.entries.len())),
+                        .child(rust_explorer::trf!("常用文件夹 ({})", self.entries.len())),
                 )
                 .child(cards)
                 .into_any_element();

@@ -99,8 +99,24 @@ pub fn ensure_running(cancel: &Arc<AtomicBool>) -> Result<bool> {
     Ok(false)
 }
 
-// A stuck SDK query must not retain a UI task or a forever-blocked worker.
 pub fn query(
+    query: &str,
+    folder: &Path,
+    global: bool,
+    cancel: &Arc<AtomicBool>,
+) -> Result<SearchResult> {
+    if !supports_everything(folder) {
+        return recursive_names(query, folder, cancel);
+    }
+    match indexed_query(query, folder, global, cancel) {
+        Ok(result) => Ok(result),
+        Err(_) if !cancel.load(Ordering::Relaxed) => recursive_names(query, folder, cancel),
+        Err(error) => Err(error),
+    }
+}
+
+// A stuck SDK query must not retain a UI task or a forever-blocked worker.
+fn indexed_query(
     query: &str,
     folder: &Path,
     global: bool,
@@ -148,6 +164,75 @@ pub fn query(
         }
         std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Everything's index is used only for a confirmed local NTFS volume. Unknown,
+/// network, FAT/exFAT and other providers use cancellable filesystem traversal.
+pub fn supports_everything(folder: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::{
+        Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW},
+        core::PCWSTR,
+    };
+    if folder.to_string_lossy().starts_with("\\\\") {
+        return false;
+    }
+    let input: Vec<u16> = folder.as_os_str().encode_wide().chain(Some(0)).collect();
+    let mut root = [0u16; 32768];
+    let mut fs = [0u16; 32];
+    unsafe {
+        if GetVolumePathNameW(PCWSTR(input.as_ptr()), &mut root).is_err() {
+            return false;
+        }
+        if GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut fs))
+            .is_err()
+        {
+            return false;
+        }
+    }
+    let end = fs.iter().position(|n| *n == 0).unwrap_or(fs.len());
+    String::from_utf16_lossy(&fs[..end]).eq_ignore_ascii_case("NTFS")
+}
+fn recursive_names(query: &str, folder: &Path, cancel: &Arc<AtomicBool>) -> Result<SearchResult> {
+    let mut queue = std::collections::VecDeque::from([folder.to_owned()]);
+    let mut entries = Vec::new();
+    let needle = query.to_lowercase();
+    while let Some(folder) = queue.pop_front() {
+        if cancel.load(Ordering::Relaxed) {
+            bail!("搜索已取消");
+        }
+        let Ok(children) = std::fs::read_dir(&folder) else {
+            continue;
+        };
+        for child in children.flatten() {
+            if cancel.load(Ordering::Relaxed) {
+                bail!("搜索已取消");
+            }
+            let Ok(entry) = Entry::from_path(child.path()) else {
+                continue;
+            };
+            if entry.directory && !entry.link {
+                use std::os::windows::fs::MetadataExt;
+                if std::fs::symlink_metadata(&entry.path)
+                    .is_ok_and(|m| m.file_attributes() & 0x400 == 0)
+                {
+                    queue.push_back(entry.path.clone());
+                }
+            }
+            if entry.name.to_lowercase().contains(&needle) {
+                entries.push(entry);
+            }
+            if entries.len() >= RESULT_LIMIT as usize {
+                queue.clear();
+                break;
+            }
+        }
+    }
+    Ok(SearchResult {
+        total: entries.len() as u32,
+        entries,
+        engine: crate::i18n::text("文件系统名称搜索").into(),
+    })
 }
 
 pub fn sdk_query(query: &str) -> Result<SearchResult> {
@@ -364,6 +449,20 @@ fn fallback(query: &str, folder: &Path, cancel: &Arc<AtomicBool>) -> Result<Sear
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unindexed_search_finds_nested_names_and_honors_cancellation() {
+        let root = std::env::temp_dir().join(format!("re-recursive-search-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a/b")).unwrap();
+        std::fs::write(root.join("a/b/needle.txt"), b"fixture").unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = recursive_names("needle", &root, &cancel).unwrap();
+        assert_eq!(result.entries.len(), 1);
+        assert_eq!(result.entries[0].path, root.join("a/b/needle.txt"));
+        cancel.store(true, Ordering::Relaxed);
+        assert!(recursive_names("needle", &root, &cancel).is_err());
+        assert!(!supports_everything(Path::new("\\\\server\\share")));
+        std::fs::remove_dir_all(root).unwrap();
+    }
     #[test]
     fn scope_preserves_everything_syntax() {
         assert_eq!(
