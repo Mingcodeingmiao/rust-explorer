@@ -439,6 +439,11 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         if self.options.is_some() || self.dialog.is_some() || self.busy {
             return;
         }
@@ -1204,6 +1209,11 @@ impl Explorer {
         ));
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         if self.settings.remember_views {
             self.view = resolved_view(&self.settings, &path);
             view_trace(format!(
@@ -1574,6 +1584,11 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         let order = self.visible_file_order();
         if !order.contains(&index) {
             return;
@@ -4547,6 +4562,16 @@ impl Render for Explorer {
             } else {
                 button(id, "", t).child(visual::icon(id, t.text))
             };
+            let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let paint_bounds = button_bounds.clone();
+            let command = command.child(
+                canvas(
+                    move |bounds, _, _| paint_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
             let enabled = match id {
                 "new-folder" => !navigation::is_virtual(&self.dir()),
                 "paste" => self.can_paste(),
@@ -4580,10 +4605,19 @@ impl Render for Explorer {
                         }
                         match id {
                             "new-folder" => {
-                                v.popup = Some((
-                                    "new-menu".into(),
-                                    point(px(12. * v.zoom), px(132. * v.zoom)),
-                                ));
+                                if v.popup.as_ref().is_some_and(|(kind, _)| kind == "new-menu") {
+                                    v.popup = None;
+                                    v.submenu = None;
+                                    v.nested_submenu = None;
+                                } else {
+                                    let bounds = button_bounds.get();
+                                    v.popup = Some((
+                                        "new-menu".into(),
+                                        point(bounds.left(), bounds.bottom() + px(2. * v.zoom)),
+                                    ));
+                                    v.submenu = None;
+                                    v.nested_submenu = None;
+                                }
                                 cx.notify();
                             }
                             "cut" => v.copy(true, cx),
@@ -4626,32 +4660,52 @@ impl Render for Explorer {
             if id == "more-menu" {
                 toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
             }
-            toolbar = toolbar.child(
-                button(id, "", t)
-                    .w(ui(if id == "more-menu" { 40. } else { 96. }))
-                    .flex_shrink_0()
-                    .child(visual::icon(
-                        match id {
-                            "sort-menu" => "sort",
-                            "view-menu" => "view",
-                            _ => "more",
-                        },
-                        t.text,
-                    ))
-                    .when(!label.is_empty(), |d| {
-                        d.child(label).child(visual::icon("chevron-down", t.muted))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |v, event: &MouseDownEvent, _, cx| {
-                            v.popup = Some((
-                                id.into(),
-                                point(event.position.x, event.position.y + px(23. * v.zoom)),
-                            ));
-                            cx.notify();
-                        }),
-                    ),
-            );
+            let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let paint_bounds = button_bounds.clone();
+            let command = button(id, "", t)
+                .w(ui(if id == "more-menu" { 40. } else { 96. }))
+                .flex_shrink_0()
+                .child(visual::icon(
+                    match id {
+                        "sort-menu" => "sort",
+                        "view-menu" => "view",
+                        _ => "more",
+                    },
+                    t.text,
+                ))
+                .when(!label.is_empty(), |d| {
+                    d.child(label).child(visual::icon("chevron-down", t.muted))
+                })
+                .child(
+                    canvas(
+                        move |bounds, _, _| paint_bounds.set(bounds),
+                        |_, _, _, _| {},
+                    )
+                    .absolute()
+                    .inset_0(),
+                );
+            toolbar = toolbar.child(command.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |v, _event: &MouseDownEvent, _, cx| {
+                    if v.popup.as_ref().is_some_and(|(kind, _)| kind == id) {
+                        v.popup = None;
+                        v.submenu = None;
+                        v.nested_submenu = None;
+                    } else {
+                        let bounds = button_bounds.get();
+                        let menu_width = px(260. * v.zoom);
+                        let x = if id == "more-menu" {
+                            bounds.right() - menu_width
+                        } else {
+                            bounds.center().x - menu_width / 2.
+                        };
+                        v.popup = Some((id.into(), point(x, bounds.bottom() + px(2. * v.zoom))));
+                        v.submenu = None;
+                        v.nested_submenu = None;
+                    }
+                    cx.notify();
+                }),
+            ));
         }
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
             toolbar = toolbar.child(
