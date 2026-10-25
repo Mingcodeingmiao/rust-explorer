@@ -6,7 +6,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::mpsc,
+    sync::{Arc, mpsc},
 };
 
 pub fn ui(pixels: f32) -> Rems {
@@ -72,16 +72,16 @@ impl ImageCache for ThumbnailImages {
     }
 }
 struct Icons {
-    images: HashMap<IconRequest, Option<PathBuf>>,
+    images: HashMap<IconRequest, Option<Arc<Image>>>,
     /// Last resolved picture per (path, directory, pixels). A volume refresh bumps
     /// the drive-key epoch, and without this the item would fall back to the drawn
     /// folder glyph for a frame or two until the refreshed icon arrives.
-    last: HashMap<(PathBuf, bool, u32), PathBuf>,
+    last: HashMap<(PathBuf, bool, u32), Arc<Image>>,
     failures: HashMap<IconRequest, (std::time::Instant, u8)>,
     retrying: std::collections::HashSet<IconRequest>,
     requests: mpsc::Sender<IconRequest>,
     priority: mpsc::Sender<IconRequest>,
-    results: mpsc::Receiver<(IconRequest, Option<PathBuf>)>,
+    results: mpsc::Receiver<(IconRequest, Option<Vec<u8>>)>,
     pixels: u32,
     dark: bool,
     generation: u64,
@@ -139,7 +139,7 @@ impl Icons {
             generation: 0,
         }
     }
-    fn get(&mut self, mut key: IconRequest) -> Option<PathBuf> {
+    fn get(&mut self, mut key: IconRequest) -> Option<Arc<Image>> {
         key.epoch = key.epoch.wrapping_add(self.generation << 32);
         if self.images.len() >= 2048 && !self.images.contains_key(&key) {
             self.images.clear();
@@ -220,13 +220,38 @@ pub fn initialize_image_cache(cx: &mut App) {
 pub fn reset_image_cache(cx: &mut App) {
     ICON_IMAGES.with(|cache| *cache.borrow_mut() = Some(ThumbnailImages::new(cx)));
 }
-fn icon_image(path: PathBuf) -> Img {
-    let image = img(path);
-    if let Some(cache) = ICON_IMAGES.with(|cache| cache.borrow().clone()) {
-        image.image_cache(&cache)
-    } else {
-        image
+pub fn png_image(bytes: &[u8]) -> Option<Arc<Image>> {
+    if !bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        return None;
     }
+    Some(Arc::new(Image::from_bytes(
+        ImageFormat::Png,
+        bytes.to_vec(),
+    )))
+}
+thread_local! {
+    static THUMB_IMAGES: RefCell<HashMap<rust_explorer::thumbnails::Key, Arc<Image>>> =
+        RefCell::new(HashMap::new());
+}
+pub fn thumbnail_image(
+    key: &rust_explorer::thumbnails::Key,
+    bytes: &Arc<[u8]>,
+) -> Option<Arc<Image>> {
+    THUMB_IMAGES.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        if let Some(image) = cache.get(key) {
+            return Some(image.clone());
+        }
+        let image = png_image(bytes)?;
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(key.clone(), image.clone());
+        Some(image)
+    })
+}
+fn icon_image(image: Arc<Image>) -> Img {
+    img(image)
 }
 pub fn clear_cache() {
     native_assets::clear_folder_artwork();
@@ -238,6 +263,7 @@ pub fn clear_cache() {
         icons.retrying.clear();
         icons.generation = icons.generation.wrapping_add(1);
     });
+    THUMB_IMAGES.with(|cache| cache.borrow_mut().clear());
 }
 /// Resolve these icons in the background. Visible rows still jump the queue, but a
 /// folder's executables and shortcuts are ready before they are scrolled to.
@@ -272,7 +298,8 @@ pub fn drain() -> bool {
         let changed = results.iter().any(|(_, p)| p.is_some());
         for (k, p) in results {
             v.retrying.remove(&k);
-            if p.is_none() {
+            let image = p.as_deref().and_then(png_image);
+            if image.is_none() {
                 let count = v
                     .failures
                     .get(&k)
@@ -282,14 +309,14 @@ pub fn drain() -> bool {
             } else {
                 v.failures.remove(&k);
             }
-            if let Some(path) = &p {
+            if let Some(image) = &image {
                 v.last
-                    .insert((k.path.clone(), k.directory, k.pixels), path.clone());
+                    .insert((k.path.clone(), k.directory, k.pixels), image.clone());
                 if v.last.len() > 4096 {
                     v.last.clear();
                 }
             }
-            v.images.insert(k, p);
+            v.images.insert(k, image);
         }
         let retry: Vec<_> = v
             .failures
@@ -379,7 +406,15 @@ pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
         let key = IconRequest::ui(name, (v.pixels as f32 * logical / 16.).ceil() as u32);
         v.get(key)
     });
-    picture_or_draw_sized(path, name, color, logical)
+    if let Some(image) = path {
+        img(image)
+            .size(ui(logical))
+            .flex_shrink_0()
+            .object_fit(ObjectFit::Contain)
+            .into_any_element()
+    } else {
+        drawn_icon_sized(name, color, logical)
+    }
 }
 pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
     file_icon_sized(path, directory, color, 16.)
@@ -443,11 +478,11 @@ pub fn thumbnail_or_icon(
     directory: bool,
     color: u32,
     logical: f32,
-    thumbnail: Option<PathBuf>,
+    thumbnail: Option<Arc<Image>>,
     dimensions: (u32, u32),
     folder_thumbnail: bool,
-    cache: &Entity<ThumbnailImages>,
-    cx: &mut App,
+    _cache: &Entity<ThumbnailImages>,
+    _cx: &mut App,
 ) -> AnyElement {
     if let Some(thumbnail) = thumbnail {
         let scale = ICONS.with(|v| v.borrow().pixels as f32 / 16.);
@@ -467,14 +502,6 @@ pub fn thumbnail_or_icon(
         } else {
             (edge, edge)
         };
-        let resource = Resource::from(thumbnail.clone());
-        let pixels = thumbnail_pixels(logical) as usize;
-        cache.update(cx, |cache, _| {
-            cache
-                .used
-                .entry(resource)
-                .or_insert((cache.clock, pixels * pixels * 4));
-        });
         div()
             .size(ui(logical))
             .flex_shrink_0()
@@ -493,7 +520,6 @@ pub fn thumbnail_or_icon(
                     })
                     .child(
                         img(thumbnail)
-                            .image_cache(cache)
                             .w(ui(image_width))
                             .h(ui(image_height))
                             .flex_shrink_0()
@@ -626,22 +652,6 @@ pub fn associated_app_icon(path: &Path, color: u32, logical: f32) -> AnyElement 
             d.child(file_icon_sized(path, false, color, logical))
         })
         .into_any_element()
-}
-fn picture_or_draw_sized(
-    path: Option<PathBuf>,
-    name: &str,
-    color: u32,
-    logical: f32,
-) -> AnyElement {
-    if let Some(path) = path {
-        icon_image(path)
-            .size(ui(logical))
-            .flex_shrink_0()
-            .object_fit(ObjectFit::Contain)
-            .into_any_element()
-    } else {
-        drawn_icon_sized(name, color, logical)
-    }
 }
 fn drawn_icon(name: &str, color: u32) -> AnyElement {
     drawn_icon_sized(name, color, 16.)

@@ -116,6 +116,8 @@ struct Tab {
     query: String,
     global: bool,
     reveal_targets: Vec<PathBuf>,
+    /// Presentation remembered while this tab is inactive.
+    view: ViewMode,
 }
 #[derive(Clone)]
 struct DragFiles {
@@ -151,9 +153,9 @@ enum Preview {
     Loading,
     Text(Arc<Vec<String>>, bool, &'static str),
     Image(PathBuf),
-    Video(PathBuf),
+    Picture(Arc<Image>),
     Pdf {
-        path: PathBuf,
+        image: Arc<Image>,
         page: u32,
         pages: u32,
     },
@@ -430,6 +432,7 @@ fn built_in_view(path: &std::path::Path) -> ViewMode {
 fn view_trace(message: impl std::fmt::Display) {
     rust_explorer::shell::menu_trace(format!("view: {message}"));
 }
+const DRIVE_LABEL_LINE_CHARS: usize = 23;
 
 impl Explorer {
     pub(super) fn begin_marquee(
@@ -438,6 +441,11 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         if self.options.is_some() || self.dialog.is_some() || self.busy {
             return;
         }
@@ -521,6 +529,13 @@ impl Explorer {
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
         let mut settings = Settings::load();
+        if !Settings::exists() {
+            // First launch: follow the Windows UI language. Chinese locales all
+            // collapse to the Simplified Chinese catalog; unsupported languages
+            // fall back to English inside `Language::system`.
+            settings.language = rust_explorer::i18n::Language::system().tag().into();
+            settings.save();
+        }
         rust_explorer::i18n::set_language(&settings.language);
         let initial = launch
             .as_ref()
@@ -868,7 +883,9 @@ impl Explorer {
             tab_drag: None,
             tab_tip: None,
             tab_tip_scale: 1.0,
-            volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
+            // Do not paint the cheap `basic` labels first: mapped drives would
+            // briefly show their UNC path and then overlap the real Shell name.
+            volumes: Vec::new(),
             storage_volumes: Vec::new(),
             volume_busy: false,
             volume_tick: Instant::now() - Duration::from_secs(10),
@@ -899,6 +916,7 @@ impl Explorer {
                 query: String::new(),
                 global: false,
                 reveal_targets: launch.map(|r| r.select).unwrap_or_default(),
+                view,
             }],
             active: 0,
             entries: Arc::new(vec![]),
@@ -1152,12 +1170,15 @@ impl Explorer {
                 .map(|(i, t)| (i, t.history.current(), t.reveal_targets.as_slice())),
         );
         let index = index.unwrap_or_else(|| {
+            let folder = request.folder.clone();
+            let view = resolved_view(&self.settings, &folder);
             self.tabs.push(Tab {
                 id: next_tab_id(),
                 history: History::new(request.folder),
                 query: String::new(),
                 global: false,
                 reveal_targets: Vec::new(),
+                view,
             });
             self.tabs.len() - 1
         });
@@ -1201,6 +1222,11 @@ impl Explorer {
         ));
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         if self.settings.remember_views {
             self.view = resolved_view(&self.settings, &path);
             view_trace(format!(
@@ -1571,6 +1597,11 @@ impl Explorer {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.popup.is_some() {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+        }
         let order = self.visible_file_order();
         if !order.contains(&index) {
             return;
@@ -1666,7 +1697,12 @@ impl Explorer {
                             640,
                             &cancel,
                         ) {
-                            Ok(asset) => Preview::Video(asset.path),
+                            Ok(asset) => match visual::png_image(&asset.image) {
+                                Some(image) => Preview::Picture(image),
+                                None => Preview::Message(
+                                    rust_explorer::i18n::text("视频预览图像无效").into(),
+                                ),
+                            },
                             Err(_) => Preview::Message(
                                 rust_explorer::i18n::text("此视频暂无可快速获取的系统单帧缩略图")
                                     .into(),
@@ -1682,7 +1718,8 @@ impl Explorer {
                             &cancel,
                         )?;
                         Preview::Pdf {
-                            path: asset.path,
+                            image: visual::png_image(&asset.image)
+                                .ok_or_else(|| anyhow::anyhow!("PDF 预览图像无效"))?,
                             page,
                             pages: asset.pages,
                         }
@@ -1695,7 +1732,10 @@ impl Explorer {
                             960,
                             &cancel,
                         )?;
-                        Preview::Image(asset.path)
+                        Preview::Picture(
+                            visual::png_image(&asset.image)
+                                .ok_or_else(|| anyhow::anyhow!("字体预览图像无效"))?,
+                        )
                     }
                     Kind::Unsupported => Preview::Message(
                         rust_explorer::i18n::text(
@@ -1780,12 +1820,14 @@ impl Explorer {
         if self.focus_existing_tab(&path, cx) {
             return;
         }
+        let view = resolved_view(&self.settings, &path);
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view,
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
@@ -1829,6 +1871,7 @@ impl Explorer {
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view: resolved_view(&self.settings, &path),
         };
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
@@ -2835,19 +2878,84 @@ impl Explorer {
     /// Anchored inline editor for labels outside the file list (navigation rows and
     /// drive tiles). It mirrors the list's rename overlay: an accent-bordered box
     /// drawn over the label, so a long name cannot relayout the row or the tile.
-    fn inline_rename_overlay(&self, id: (&'static str, usize), width: f32) -> AnyElement {
+    fn inline_rename_overlay(
+        &self,
+        id: (&'static str, usize),
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let max_width = width.clamp(80., 360.);
+        let is_volume = matches!(self.dialog, Some(Dialog::RenameVolume { .. }));
+        let is_file = matches!(self.dialog, Some(Dialog::Rename(_)));
+        let value = self.dialog_input.read(cx).value();
+        if is_volume || is_file {
+            self.dialog_input.update(cx, |input, _| {
+                input.compact = true;
+                // Hard-wrap the display in 23-character chunks. The value itself
+                // stays free of newlines because GPUI rejects them in shape_text.
+                input.wrap_chars = Some(DRIVE_LABEL_LINE_CHARS);
+                input.wrap_width = None;
+                input.single_line_scroll = false;
+            });
+        } else {
+            self.dialog_input.update(cx, |input, _| {
+                input.wrap_chars = None;
+                input.wrap_width = None;
+            });
+        }
+        let lines = if is_volume || is_file {
+            let chars = value.chars().count();
+            chars.div_ceil(DRIVE_LABEL_LINE_CHARS).clamp(1, 12)
+        } else {
+            1
+        };
+        let height = 24. + (lines.saturating_sub(1) as f32) * 18.;
+        // The editor box follows the longest 23-character line plus one
+        // character of breathing room, capped by the tile/list label width.
+        let width = if is_volume {
+            let measure = |text: &str| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font("Microsoft YaHei UI"),
+                    color: rgb(self.theme.text).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(
+                            SharedString::from(text.to_string()),
+                            px(13. * self.zoom),
+                            &[run],
+                            None,
+                        )
+                        .width,
+                ) / self.zoom
+            };
+            let chars: Vec<char> = value.chars().collect();
+            let text_width = chars
+                .chunks(DRIVE_LABEL_LINE_CHARS)
+                .map(|chunk| measure(&chunk.iter().collect::<String>()))
+                .fold(0.0_f32, f32::max);
+            (text_width + measure("W") + 12.).clamp(60., max_width)
+        } else {
+            max_width
+        };
         div()
             .relative()
             .w(ui(width.max(24.)))
-            .h(ui(22.))
+            .h(ui(height))
             .flex_shrink_0()
             .child(
                 gpui::deferred(
                     gpui::anchored().snap_to_window().child(
                         div()
                             .id(id)
-                            .w(ui(width.clamp(80., 360.)))
-                            .h(ui(24.))
+                            .w(ui(width))
+                            .h(ui(height))
                             .bg(rgb(self.theme.input))
                             .border_1()
                             .border_color(rgb(self.theme.accent))
@@ -2945,28 +3053,41 @@ impl Explorer {
         }
     }
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let path = if self.settings.new_tab_this_pc {
+            PathBuf::from("::ThisPC")
+        } else {
+            self.dir()
+        };
+        let view = resolved_view(&self.settings, &path);
         self.tabs.push(Tab {
             id: next_tab_id(),
-            history: History::new(if self.settings.new_tab_this_pc {
-                PathBuf::from("::ThisPC")
-            } else {
-                self.dir()
-            }),
+            history: History::new(path),
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view,
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
     fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        // Save the outgoing tab before changing `dir()`/`active`.
+        self.remember_history_state();
+        self.tabs[self.active].view = self.view;
+        self.activate_tab(index, cx);
+    }
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
         let was_computer = volumes::is_computer(&self.dir());
         self.active = index;
         self.external_reveal = self.tabs[index].reveal_targets.clone();
         self.reveal_pending = !self.external_reveal.is_empty();
         self.reveal_scroll = None;
-        if self.settings.remember_views {
-            self.view = resolved_view(&self.settings, &self.dir());
-        }
+        self.view = self.tabs[index].view;
         if !was_computer && volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
         } else if was_computer && !volumes::is_computer(&self.dir()) {
@@ -2975,6 +3096,17 @@ impl Explorer {
         self.tab_scroll.scroll_to_item(index);
         let query = self.tabs[index].query.clone();
         self.search.update(cx, |v, cx| v.set_value(query, cx));
+        self.apply_remembered_state();
+        if self
+            .pending_restore
+            .as_ref()
+            .is_none_or(|state| state.selection.is_empty() && state.row <= 0.)
+        {
+            self.list_scroll.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
         self.reload(cx);
     }
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -2986,12 +3118,17 @@ impl Explorer {
             }
             return;
         }
+        let closed_active = index == self.active;
         self.tabs.remove(index);
         if index < self.active {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len() - 1);
-        self.switch_tab(self.active, cx);
+        if closed_active {
+            self.activate_tab(self.active, cx);
+        } else {
+            self.switch_tab(self.active, cx);
+        }
     }
     fn key_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.key_navigate(NavigationStep::Vertical(delta), false, false, window, cx);
@@ -3239,6 +3376,10 @@ impl Explorer {
     fn go_back(&mut self, cx: &mut Context<Self>) {
         self.remember_history_state();
         if self.tabs[self.active].history.back() {
+            // The destination owns its presentation: resolve it from saved
+            // folder views, then the built-in default. Never inherit the view
+            // of the folder we are leaving.
+            self.apply_listing_defaults(&self.dir());
             self.apply_remembered_state();
             self.reload(cx);
         }
@@ -3246,6 +3387,7 @@ impl Explorer {
     fn go_forward(&mut self, cx: &mut Context<Self>) {
         self.remember_history_state();
         if self.tabs[self.active].history.forward() {
+            self.apply_listing_defaults(&self.dir());
             self.apply_remembered_state();
             self.reload(cx);
         }
@@ -3538,6 +3680,23 @@ fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, t: Theme) ->
             })
         })
         .when(!symbolic, |d| d.child(label))
+}
+
+/// Icon-only toolbar button. Unlike `button`, it has no text child, gap or
+/// horizontal padding, so the 16px glyph sits at the exact centre of a square.
+fn icon_button(id: impl Into<ElementId>, icon: &str, t: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(ui(32.))
+        .h(ui(32.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(ui(4.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(t.hover)))
+        .child(visual::icon(icon, t.text))
 }
 
 impl Render for Explorer {
@@ -4017,6 +4176,7 @@ impl Render for Explorer {
                         query: String::new(),
                         global: false,
                         reveal_targets: Vec::new(),
+                        view: v.view,
                     }),
                     cx,
                 );
@@ -4463,8 +4623,18 @@ impl Render for Explorer {
             let command = if id == "new-folder" {
                 button(id, label, t).child(visual::icon("chevron-down", t.muted))
             } else {
-                button(id, "", t).child(visual::icon(id, t.text))
+                icon_button(id, id, t)
             };
+            let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let paint_bounds = button_bounds.clone();
+            let command = command.child(
+                canvas(
+                    move |bounds, _, _| paint_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
             let enabled = match id {
                 "new-folder" => !navigation::is_virtual(&self.dir()),
                 "paste" => self.can_paste(),
@@ -4489,8 +4659,9 @@ impl Render for Explorer {
             };
             toolbar = toolbar.child(
                 command
-                    .w(ui(if id == "new-folder" { 94. } else { 40. }))
+                    .w(ui(if id == "new-folder" { 94. } else { 32. }))
                     .flex_shrink_0()
+                    .when(id != "new-folder", |d| d.px_0())
                     .when(!enabled, |d| d.opacity(0.4).cursor_default())
                     .on_click(cx.listener(move |v, _, w, cx| {
                         if !enabled {
@@ -4498,10 +4669,19 @@ impl Render for Explorer {
                         }
                         match id {
                             "new-folder" => {
-                                v.popup = Some((
-                                    "new-menu".into(),
-                                    point(px(12. * v.zoom), px(132. * v.zoom)),
-                                ));
+                                if v.popup.as_ref().is_some_and(|(kind, _)| kind == "new-menu") {
+                                    v.popup = None;
+                                    v.submenu = None;
+                                    v.nested_submenu = None;
+                                } else {
+                                    let bounds = button_bounds.get();
+                                    v.popup = Some((
+                                        "new-menu".into(),
+                                        point(bounds.left(), bounds.bottom() + px(2. * v.zoom)),
+                                    ));
+                                    v.submenu = None;
+                                    v.nested_submenu = None;
+                                }
                                 cx.notify();
                             }
                             "cut" => v.copy(true, cx),
@@ -4528,11 +4708,15 @@ impl Render for Explorer {
                         }
                     })),
             );
-            if id == "new-folder" {
+            if id == "new-folder" && !self.toolbar_overflow.contains(&"cut") {
                 toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
             }
         }
-        toolbar = toolbar.child(div().w(ui(1.)).h(ui(20.)).mx_2().bg(rgb(t.border)));
+        if !self.toolbar_overflow.contains(&"sort-menu")
+            || !self.toolbar_overflow.contains(&"view-menu")
+        {
+            toolbar = toolbar.child(div().w(ui(1.)).h(ui(20.)).mx_2().bg(rgb(t.border)));
+        }
         for (id, label) in [
             ("sort-menu", rust_explorer::i18n::text("排序")),
             ("view-menu", rust_explorer::i18n::text("查看")),
@@ -4544,32 +4728,54 @@ impl Render for Explorer {
             if id == "more-menu" {
                 toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
             }
-            toolbar = toolbar.child(
+            let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
+            let paint_bounds = button_bounds.clone();
+            let menu_width = px(self.menu_width(id, window, cx) * self.zoom);
+            let command = if id == "more-menu" {
+                icon_button(id, "more", t)
+            } else {
                 button(id, "", t)
-                    .w(ui(if id == "more-menu" { 40. } else { 96. }))
+                    .w(ui(96.))
                     .flex_shrink_0()
                     .child(visual::icon(
                         match id {
                             "sort-menu" => "sort",
-                            "view-menu" => "view",
-                            _ => "more",
+                            _ => "view",
                         },
                         t.text,
                     ))
-                    .when(!label.is_empty(), |d| {
-                        d.child(label).child(visual::icon("chevron-down", t.muted))
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |v, event: &MouseDownEvent, _, cx| {
-                            v.popup = Some((
-                                id.into(),
-                                point(event.position.x, event.position.y + px(23. * v.zoom)),
-                            ));
-                            cx.notify();
-                        }),
-                    ),
+                    .child(label)
+                    .child(visual::icon("chevron-down", t.muted))
+            }
+            .child(
+                canvas(
+                    move |bounds, _, _| paint_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
             );
+            toolbar = toolbar.child(command.on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |v, _event: &MouseDownEvent, _, cx| {
+                    if v.popup.as_ref().is_some_and(|(kind, _)| kind == id) {
+                        v.popup = None;
+                        v.submenu = None;
+                        v.nested_submenu = None;
+                    } else {
+                        let bounds = button_bounds.get();
+                        let x = if id == "more-menu" {
+                            bounds.right() - menu_width
+                        } else {
+                            bounds.center().x - menu_width / 2.
+                        };
+                        v.popup = Some((id.into(), point(x, bounds.bottom() + px(2. * v.zoom))));
+                        v.submenu = None;
+                        v.nested_submenu = None;
+                    }
+                    cx.notify();
+                }),
+            ));
         }
         if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
             toolbar = toolbar.child(
@@ -5008,7 +5214,7 @@ impl Render for Explorer {
                     .text_color(rgb(t.muted))
                     .child(message.clone())
                     .into_any_element(),
-                Preview::Image(path) | Preview::Video(path) => div()
+                Preview::Image(path) => div()
                     .flex_1()
                     .min_h_0()
                     .p_3()
@@ -5018,6 +5224,19 @@ impl Render for Explorer {
                     .child(
                         img(path.clone())
                             .image_cache(&self.thumbnail_images)
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                Preview::Picture(image) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(image.clone())
                             .size_full()
                             .object_fit(ObjectFit::Contain),
                     )
@@ -5061,7 +5280,7 @@ impl Render for Explorer {
                         )
                         .into_any_element()
                 }
-                Preview::Pdf { path, page, pages } => div()
+                Preview::Pdf { image, page, pages } => div()
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -5085,8 +5304,7 @@ impl Render for Explorer {
                     )
                     .child(
                         div().flex_1().min_h_0().p_3().child(
-                            img(path.clone())
-                                .image_cache(&self.thumbnail_images)
+                            img(image.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         ),
@@ -5372,6 +5590,12 @@ impl Render for Explorer {
         }
         if let Some(dialog) = &self.dialog {
             if self.inline_rename.is_none() {
+                let rename_lines = if matches!(dialog, Dialog::RenameVolume { .. }) {
+                    let chars = self.dialog_input.read(cx).value().chars().count();
+                    ((chars as f32 / 28.).ceil() as usize).clamp(1, 6)
+                } else {
+                    1
+                };
                 let (title, description, delete) = match dialog {
                     Dialog::NewFolder => (
                         rust_explorer::i18n::text("新建文件夹"),
@@ -5504,6 +5728,9 @@ impl Render for Explorer {
                                             .bg(rgb(t.input))
                                             .rounded(ui(4.))
                                             .p_1()
+                                            .when(rename_lines > 1, |field| {
+                                                field.h(ui(18. * rename_lines as f32 + 8.))
+                                            })
                                             .child(self.dialog_input.clone()),
                                     )
                                 })

@@ -393,6 +393,36 @@ fn column_label(id: &str, usage: bool) -> &'static str {
         _ => rust_explorer::i18n::text("名称"),
     }
 }
+pub(super) fn icon_label_lines_max(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    window: &Window,
+) -> Vec<String> {
+    rust_explorer::icon_layout::label_lines(
+        text.graphemes(true),
+        width.max(1.),
+        max_lines.max(1),
+        |line| {
+            let run = TextRun {
+                len: line.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(0).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
+                    .width,
+            ) / scale
+        },
+    )
+}
 pub(super) fn icon_label_lines(
     text: &str,
     width: f32,
@@ -400,22 +430,46 @@ pub(super) fn icon_label_lines(
     scale: f32,
     window: &Window,
 ) -> Vec<String> {
-    rust_explorer::icon_layout::label_lines(text.graphemes(true), width.max(1.), 4, |line| {
-        let run = TextRun {
-            len: line.len(),
-            font: font("Microsoft YaHei UI"),
-            color: rgb(0).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        f32::from(
-            window
-                .text_system()
-                .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
-                .width,
-        ) / scale
-    })
+    icon_label_lines_max(text, width, font_size, scale, 4, window)
+}
+pub(super) fn icon_label_max_h(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    line_height: f32,
+    window: &Window,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .line_height(ui(line_height))
+        .text_size(ui(font_size))
+        .children(
+            icon_label_lines_max(text, width, font_size, scale, max_lines, window)
+                .into_iter()
+                .map(|line| {
+                    div()
+                        .h(ui(line_height))
+                        .w_full()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(line)
+                }),
+        )
+        .into_any_element()
+}
+pub(super) fn icon_label_max(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    window: &Window,
+) -> AnyElement {
+    icon_label_max_h(text, width, font_size, scale, max_lines, 20., window)
 }
 pub(super) fn icon_label(
     text: &str,
@@ -424,25 +478,7 @@ pub(super) fn icon_label(
     scale: f32,
     window: &Window,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .line_height(ui(20.))
-        .text_size(ui(font_size))
-        .children(
-            icon_label_lines(text, width, font_size, scale, window)
-                .into_iter()
-                .map(|line| {
-                    div()
-                        .h(ui(20.))
-                        .w_full()
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(line)
-                }),
-        )
-        .into_any_element()
+    icon_label_max(text, width, font_size, scale, 4, window)
 }
 fn menu_icon(id: &str) -> Option<&'static str> {
     Some(if id.starts_with("view:") {
@@ -2434,40 +2470,46 @@ impl Explorer {
     ) -> AnyElement {
         if self.inline_rename.as_ref() == Some(&e.path) {
             let value = self.dialog_input.read(cx).value();
-            let run = TextRun {
-                len: value.len(),
-                font: font("Microsoft YaHei UI"),
-                color: rgb(self.theme.text).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
+            self.dialog_input.update(cx, |input, _| {
+                input.compact = true;
+                input.wrap_chars = Some(super::DRIVE_LABEL_LINE_CHARS);
+                input.wrap_width = None;
+                input.single_line_scroll = false;
+            });
+            let measure = |text: &str| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font("Microsoft YaHei UI"),
+                    color: rgb(self.theme.text).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(
+                            SharedString::from(text.to_string()),
+                            px(13. * self.zoom),
+                            &[run],
+                            None,
+                        )
+                        .width,
+                ) / self.zoom
             };
-            let text_width = f32::from(
-                window
-                    .text_system()
-                    .shape_line(
-                        value.clone().into(),
-                        px(13. * self.zoom),
-                        &[run.clone()],
-                        None,
-                    )
-                    .width,
-            ) / self.zoom;
+            let chars: Vec<char> = value.chars().collect();
+            let text_width = chars
+                .chunks(super::DRIVE_LABEL_LINE_CHARS)
+                .map(|chunk| measure(&chunk.iter().collect::<String>()))
+                .fold(0.0_f32, f32::max);
             let max_width =
                 (f32::from(window.viewport_size().width) / self.zoom - 24.).clamp(48., 520.);
-            let editor_width = (text_width + 20.).clamp(48., max_width);
-            let lines = window
-                .text_system()
-                .shape_text(
-                    value.into(),
-                    px(13. * self.zoom),
-                    &[run],
-                    Some(px((editor_width - 8.) * self.zoom)),
-                    None,
-                )
-                .ok()
-                .and_then(|lines| lines.first().map(|line| line.wrap_boundaries().len() + 1))
-                .unwrap_or(1);
+            let editor_width = (text_width + measure("W") + 12.).clamp(48., max_width);
+            let lines = value
+                .chars()
+                .count()
+                .div_ceil(super::DRIVE_LABEL_LINE_CHARS)
+                .max(1);
             let editor_height = 4. + lines as f32 * 20.;
             // The editor is an overlay: growing it must not resize a details row.
             return div()
@@ -3085,7 +3127,10 @@ impl Explorer {
             } else {
                 None
             };
-            let thumbnail = key.as_ref().and_then(|key| self.thumbnails.image(key));
+            let thumbnail = key.as_ref().and_then(|key| {
+                let bytes = self.thumbnails.image(key)?;
+                visual::thumbnail_image(key, &bytes)
+            });
             let presentation = key
                 .as_ref()
                 .and_then(|key| self.thumbnails.presentation(key))
@@ -3987,6 +4032,11 @@ impl Explorer {
                 let mut items = Vec::new();
                 for id in &self.toolbar_overflow {
                     let item = match *id {
+                        "new-folder" => MenuItem::new(
+                            "submenu:new-menu",
+                            rust_explorer::i18n::text("新建                         ›"),
+                        )
+                        .enable(!navigation::is_virtual(&self.dir())),
                         "view-menu" => MenuItem::new(
                             "submenu:view-menu",
                             rust_explorer::i18n::text("查看                         ›"),
@@ -4084,11 +4134,52 @@ impl Explorer {
             _ => vec![],
         }
     }
+    /// Width of a menu based on its widest label. Includes the check column,
+    /// optional icon, right chevron and panel padding.
+    pub(super) fn menu_width(&self, kind: &str, window: &Window, cx: &mut Context<Self>) -> f32 {
+        let measure = |text: &str| {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(self.theme.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        SharedString::from(text.to_string()),
+                        px(13. * self.zoom),
+                        &[run],
+                        None,
+                    )
+                    .width,
+            ) / self.zoom
+        };
+        let label_width = self
+            .menu_items(kind, cx)
+            .iter()
+            .map(|item| {
+                if item.id == "-" {
+                    0.
+                } else {
+                    measure(item.label.trim_end_matches('›').trim())
+                }
+            })
+            .fold(0.0_f32, f32::max);
+        // Padding (24), check column (16), optional leading/trailing icons
+        // (16 each), gaps (24) and a little slack. The label itself must never
+        // wrap; menu rows are single-line.
+        (label_width + 104.).clamp(120., 400.)
+    }
     fn menu_panel(
         &self,
         kind: &str,
         x: f32,
         y: f32,
+        width: f32,
         level: usize,
         viewport_height: f32,
         cx: &mut Context<Self>,
@@ -4108,7 +4199,7 @@ impl Explorer {
             .absolute()
             .left(px(x))
             .top(px(y))
-            .w(ui(260.))
+            .w(ui(width))
             .max_h(px((viewport_height - y - 8.).max(1.).min(580. * self.zoom)))
             .overflow_y_scroll()
             .py_2()
@@ -4167,9 +4258,9 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .when(kind.starts_with("filter-menu:"), |d| {
-                                d.whitespace_nowrap().overflow_hidden().text_ellipsis()
-                            })
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .child(item.label.trim_end_matches('›').trim().to_string()),
                     )
                     .when(id.starts_with("submenu:"), |d| {
@@ -4279,7 +4370,8 @@ impl Explorer {
                 .child(panel)
                 .into_any_element();
         }
-        let width = 260. * self.zoom;
+        let width_logical = self.menu_width(&kind, window, cx);
+        let width = width_logical * self.zoom;
         let height = self
             .menu_items(&kind, cx)
             .iter()
@@ -4338,7 +4430,7 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .child(self.menu_panel(&kind, x, y, 0, max_y, cx));
+            .child(self.menu_panel(&kind, x, y, width_logical, 0, max_y, cx));
         if let Some((sub, offset)) = &self.submenu {
             if self
                 .menu_items(&kind, cx)
@@ -4346,14 +4438,24 @@ impl Explorer {
                 .any(|i| i.id == format!("submenu:{sub}"))
             {
                 let child_height = (self.menu_items(sub, cx).len() as f32 * 34. + 16.) * self.zoom;
-                let child_x = if x + width * 2. < f32::from(window.viewport_size().width) {
+                let child_width_logical = self.menu_width(sub, window, cx);
+                let child_width = child_width_logical * self.zoom;
+                let child_x = if x + width + child_width < f32::from(window.viewport_size().width) {
                     x + width - 2.
                 } else {
-                    (x - width + 2.).max(8.)
+                    (x - child_width + 2.).max(8.)
                 };
                 let child_y =
                     (y + offset * self.zoom).min((max_y - child_height - 8.).max(40. * self.zoom));
-                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, max_y, cx));
+                overlay = overlay.child(self.menu_panel(
+                    sub,
+                    child_x,
+                    child_y,
+                    child_width_logical,
+                    1,
+                    max_y,
+                    cx,
+                ));
                 if let Some((nested, offset)) = &self.nested_submenu {
                     if self
                         .menu_items(sub, cx)
@@ -4363,21 +4465,36 @@ impl Explorer {
                         let height = ((self.menu_items(nested, cx).len() as f32 * 34. + 16.)
                             * self.zoom)
                             .min(580. * self.zoom);
-                        let nested_x =
-                            if child_x + width * 2. < f32::from(window.viewport_size().width) {
-                                child_x + width - 2.
-                            } else {
-                                (child_x - width + 2.).max(8.)
-                            };
+                        let nested_width_logical = self.menu_width(nested, window, cx);
+                        let nested_width = nested_width_logical * self.zoom;
+                        let nested_x = if child_x + child_width + nested_width
+                            < f32::from(window.viewport_size().width)
+                        {
+                            child_x + child_width - 2.
+                        } else {
+                            (child_x - nested_width + 2.).max(8.)
+                        };
                         let nested_y = (child_y + offset * self.zoom)
                             .min((max_y - height - 8.).max(40. * self.zoom));
-                        overlay = overlay
-                            .child(self.menu_panel(nested, nested_x, nested_y, 2, max_y, cx));
+                        overlay = overlay.child(self.menu_panel(
+                            nested,
+                            nested_x,
+                            nested_y,
+                            nested_width_logical,
+                            2,
+                            max_y,
+                            cx,
+                        ));
                     }
                 }
             }
         }
-        overlay.into_any_element()
+        // The inline rename editor is a deferred layer above the normal tree.
+        // Menus must be deferred above it as well, otherwise the text editor
+        // covers the paste menu with its own overlay.
+        gpui::deferred(gpui::anchored().snap_to_window().child(overlay))
+            .with_priority(10)
+            .into_any_element()
     }
     /// Drop every generated cache (memory, thumbnails, folder sizes, disk).
     /// Shared by the selection menu and the advanced options page.
@@ -4518,6 +4635,7 @@ impl Explorer {
                 } else {
                     let tab = Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4727,6 +4845,7 @@ impl Explorer {
                 if let Some(path) = self.paths().first() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path.clone()),
                         query: String::new(),
                         global: false,
@@ -4746,6 +4865,7 @@ impl Explorer {
                 for path in folders {
                     let tab = Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4823,6 +4943,7 @@ impl Explorer {
                 if let Some(path) = self.context_target.clone() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4836,6 +4957,7 @@ impl Explorer {
                     let _ = open_explorer(
                         Some(Tab {
                             id: next_tab_id(),
+                            view: resolved_view(&self.settings, &path),
                             history: History::new(path),
                             query: String::new(),
                             global: false,
@@ -5015,6 +5137,7 @@ impl Explorer {
             "new-window" => {
                 let tab = Tab {
                     id: next_tab_id(),
+                    view: resolved_view(&self.settings, &self.dir()),
                     history: History::new(self.dir()),
                     query: String::new(),
                     global: false,

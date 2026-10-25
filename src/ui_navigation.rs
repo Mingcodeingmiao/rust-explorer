@@ -143,10 +143,13 @@ impl Explorer {
             && !path.to_string_lossy().starts_with("shell:")
         {
             let (x, y) = shell::cursor();
+            // Any folder currently shown in Quick Access (pinned, frequent or
+            // local favourite) must offer the remove action, not "pin".
             let quick_access_pinned = self
                 .system_quick_access
                 .iter()
-                .any(|item| item.path == path && item.pinned == Some(true));
+                .any(|item| item.path == path)
+                || self.settings.favorites.contains(&path);
             self.run_shell(
                 shell::Request::ThemedMenu {
                     folder: path.parent().unwrap_or(&path).to_path_buf(),
@@ -438,9 +441,11 @@ impl Explorer {
             let result = task.await;
             let _ = view.update(cx, |v, cx| {
                 v.volume_busy = false;
-                let Some(volumes) = result else {
+                let Some(mut volumes) = result else {
                     return;
                 };
+                let mut seen = std::collections::HashSet::new();
+                volumes.retain(|volume| seen.insert(volume.path.clone()));
                 v.volume_capacity_tick = Instant::now();
                 cx.notify(); // Repaint even when capacity is unchanged so drive icon epochs refresh.
                 if v.volumes != volumes {
@@ -1068,7 +1073,12 @@ impl Explorer {
                                     {
                                         let width = (width - row.depth as f32 * 12. - 48.)
                                             .clamp(80., 360.);
-                                        this.inline_rename_overlay(("tree-rename", index), width)
+                                        this.inline_rename_overlay(
+                                            ("tree-rename", index),
+                                            width,
+                                            window,
+                                            cx,
+                                        )
                                     } else {
                                         div()
                                             .flex_1()
@@ -1195,6 +1205,47 @@ impl Explorer {
         let drop_bounds = self.file_drop_bounds.clone();
         let selected = self.selected.contains(&index);
         let target = self.file_drag.as_ref().and_then(|d| d.target.as_ref()) == Some(&path);
+        let label_font = if grid {
+            match mode {
+                ViewMode::ExtraLarge => 15.,
+                ViewMode::Large => 14.,
+                _ => 13.,
+            }
+        } else {
+            13.
+        };
+        let label_width = if grid {
+            (width - 16.).max(24.)
+        } else {
+            (width - size - 24.).max(24.)
+        };
+        // Long drive names get exactly two lines. The tile layout has no vertical
+        // room for two lines plus a capacity bar, so Tiles omits the readout for
+        // every drive; other layouts suppress it only when the name is long.
+        // Measure the unbroken text as well: a long label may have no space to wrap at.
+        let name_width = {
+            let run = TextRun {
+                len: volume.label.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(t.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        volume.label.clone().into(),
+                        px(label_font * self.zoom),
+                        &[run],
+                        None,
+                    )
+                    .width,
+            ) / self.zoom
+        };
+        let long_name =
+            !details && (volume.label.chars().count() > 24 || name_width > label_width - 24.);
         let used = match (volume.total, volume.free) {
             (Some(total), Some(free)) if total > 0 => {
                 ((total - free.min(total)) as f32 / total as f32).clamp(0., 1.)
@@ -1206,23 +1257,24 @@ impl Explorer {
         let capacity = volume.kind != 5
             && volume.total.is_some_and(|n| n > 0)
             && volume.free.is_some_and(|free| free > 0);
-        let space = match (volume.total, volume.free, volume.kind) {
-            (Some(total), Some(free), 5) if free == 0 => {
-                rust_explorer::trf!("光盘 · 共 {}", fs::size_label(total))
+        let space = if long_name {
+            String::new()
+        } else {
+            match (volume.total, volume.free, volume.kind) {
+                (Some(total), Some(free), 5) if free == 0 => {
+                    rust_explorer::trf!("光盘 · 共 {}", fs::size_label(total))
+                }
+                (Some(total), Some(free), _) if free > 0 => rust_explorer::trf!(
+                    "{} 可用，共 {}",
+                    fs::size_label(free),
+                    fs::size_label(total)
+                ),
+                (Some(total), Some(_), _) => {
+                    rust_explorer::trf!("0 字节可用，共 {}", fs::size_label(total))
+                }
+                _ if volume.kind == 7 => rust_explorer::i18n::text("便携设备 / MTP").into(),
+                _ => rust_explorer::i18n::text("空间信息不可用").into(),
             }
-            (Some(total), Some(free), _) if free > 0 => rust_explorer::trf!(
-                "{} 可用，共 {}",
-                fs::size_label(free),
-                fs::size_label(total)
-            ),
-            (Some(total), Some(_), _) => {
-                rust_explorer::trf!("0 字节可用，共 {}", fs::size_label(total))
-            }
-            _ if volume.kind == 7 => rust_explorer::i18n::text("便携设备 / MTP").into(),
-            _ => volume
-                .remote
-                .clone()
-                .unwrap_or_else(|| rust_explorer::i18n::text("空间信息不可用").into()),
         };
         let label = |value: String| {
             div()
@@ -1287,7 +1339,10 @@ impl Explorer {
         }
         let zoom = self.zoom;
         let mut row = div()
-            .id(("volume", index))
+            .id(SharedString::from(format!(
+                "volume-{index}-{}",
+                volume.label
+            )))
             .w(ui(width))
             .flex_shrink_0()
             .relative()
@@ -1302,6 +1357,7 @@ impl Explorer {
                     .gap(ui(rust_explorer::layout_metrics::DRIVE_TILE_GAP))
                     .overflow_hidden()
             })
+            .when(tiles && long_name, |d| d.pt(ui(0.)))
             .when(details, |d| {
                 d.h(ui(if self.settings.compact { 26. } else { 34. }))
             })
@@ -1366,11 +1422,44 @@ impl Explorer {
                 MouseButton::Left,
                 cx.listener(move |v, e: &MouseDownEvent, w, cx| {
                     cx.stop_propagation();
-                    v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
+                    let was_selected = v.selected.contains(&index);
+                    let rename = was_selected
+                        && v.selected.len() == 1
+                        && e.click_count == 1
+                        && !e.modifiers.control
+                        && !e.modifiers.shift
+                        && !v.settings.single_click
+                        && v.selected_at.elapsed() > Duration::from_millis(500);
+                    if !was_selected || e.modifiers.control || e.modifiers.shift {
+                        v.select(index, e.modifiers.control, e.modifiers.shift, w, cx);
+                    } else {
+                        w.focus(&v.focus);
+                    }
                     if rust_explorer::navigation_gesture::opens_on_click(e.click_count)
                         || v.settings.single_click
                     {
+                        v.rename_token += 1;
                         v.navigate_with_modifiers(path.clone(), e.modifiers, cx);
+                    } else if rename {
+                        // A second click opens the drive; only rename after the
+                        // double-click window has elapsed.
+                        let token = v.rename_token;
+                        cx.spawn(async move |view, cx| {
+                            cx.background_executor()
+                                .timer(Duration::from_millis(550))
+                                .await;
+                            let _ = view.update(cx, |v, cx| {
+                                if v.rename_token == token
+                                    && v.selected.len() == 1
+                                    && v.selected.contains(&index)
+                                {
+                                    v.pending_rename = true;
+                                    v.rename_site = RenameSite::List;
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
                     }
                 }),
             )
@@ -1423,15 +1512,16 @@ impl Explorer {
                 if key == "total" || key == "free" {
                     field = field.justify_end();
                 }
-                row =
-                    row.child(if key == "name" && editing {
-                        field.child(self.inline_rename_overlay(
-                            ("volume-rename", index),
-                            (*cell - 12.).max(80.),
-                        ))
-                    } else {
-                        field.child(label(value).min_w_0())
-                    });
+                row = row.child(if key == "name" && editing {
+                    field.child(self.inline_rename_overlay(
+                        ("volume-rename", index),
+                        (*cell - 12.).max(80.),
+                        window,
+                        cx,
+                    ))
+                } else {
+                    field.child(label(value).min_w_0())
+                });
             }
         } else {
             row = row.child(if volume.kind == 8 {
@@ -1440,28 +1530,34 @@ impl Explorer {
                 visual::file_icon_sized(&volume.path, true, t.text, size)
             });
             let mut text = div()
+                .id(SharedString::from(format!(
+                    "volume-text-{index}-{long_name}"
+                )))
                 .min_w_0()
                 .flex()
                 .flex_col()
                 .gap_1()
                 .when(tiles, |d| d.gap(ui(1.)).line_height(ui(16.)))
+                .when(tiles && long_name, |d| d.gap(ui(2.)).mt(ui(-2.)))
                 .when(!grid, |d| d.flex_1())
                 .when(grid, |d| d.w_full().text_center())
                 .child(if editing {
                     self.inline_rename_overlay(
                         ("volume-rename", index),
                         (width - 16.).clamp(80., 360.),
+                        window,
+                        cx,
                     )
                 } else if grid {
-                    icon_label(
+                    icon_label_max(&volume.label, label_width, label_font, self.zoom, 2, window)
+                } else if long_name {
+                    icon_label_max_h(
                         &volume.label,
-                        (width - 16.).max(24.),
-                        match mode {
-                            ViewMode::ExtraLarge => 15.,
-                            ViewMode::Large => 14.,
-                            _ => 13.,
-                        },
+                        label_width,
+                        label_font,
                         self.zoom,
+                        2,
+                        15.,
                         window,
                     )
                 } else {
@@ -1494,27 +1590,29 @@ impl Explorer {
                             }))),
                     );
                 }
-                text = text.child(
-                    label(space)
-                        .text_size(ui(12.))
-                        .text_color(rgb(if tiles && t.dark { t.text } else { t.muted }))
-                        .when(tiles, |d| d.line_height(ui(14.))),
-                );
-                if content || volume.kind == 5 {
+                if !long_name {
                     text = text.child(
-                        label(format!(
-                            "{}{}",
-                            volume_type(volume),
-                            if volume.filesystem.is_empty() {
-                                String::new()
-                            } else {
-                                format!(" · {}", volume.filesystem)
-                            }
-                        ))
-                        .text_size(ui(12.))
-                        .when(tiles, |d| d.line_height(ui(14.)))
-                        .text_color(rgb(t.muted)),
+                        label(space)
+                            .text_size(ui(12.))
+                            .text_color(rgb(if tiles && t.dark { t.text } else { t.muted }))
+                            .when(tiles, |d| d.line_height(ui(14.))),
                     );
+                    if content || volume.kind == 5 {
+                        text = text.child(
+                            label(format!(
+                                "{}{}",
+                                volume_type(volume),
+                                if volume.filesystem.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" · {}", volume.filesystem)
+                                }
+                            ))
+                            .text_size(ui(12.))
+                            .when(tiles, |d| d.line_height(ui(14.)))
+                            .text_color(rgb(t.muted)),
+                        );
+                    }
                 }
             }
             row = row.child(text);
@@ -1743,7 +1841,15 @@ impl Explorer {
                 } else {
                     (available / columns).floor()
                 };
+                let content_key = items
+                    .iter()
+                    .map(|(_, volume)| volume.label.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|");
                 let mut content = div()
+                    .id(SharedString::from(format!(
+                        "volume-content-{group_index}-{content_key}"
+                    )))
                     .flex()
                     .items_start()
                     .when(!list && !details && self.view != ViewMode::Content, |d| {

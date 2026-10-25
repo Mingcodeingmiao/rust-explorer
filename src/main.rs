@@ -4,6 +4,10 @@ use anyhow::Context;
 fn main() {
     rust_explorer::i18n::set_language(&rust_explorer::settings::Settings::load().language);
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).is_none_or(|arg| !arg.starts_with("--")) {
+        // Old-version cleanup can touch many files; never delay the first frame.
+        let _ = std::thread::spawn(rust_explorer::native_assets::cleanup_legacy_disk_cache);
+    }
     let result = match args.get(1).map(String::as_str) {
         Some("--open-folder") => args
             .get(2)

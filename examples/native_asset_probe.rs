@@ -33,7 +33,7 @@ fn main() -> Result<()> {
         &cancel,
     )?;
     let video_time = start.elapsed();
-    let png = image::open(&video.path)?;
+    let png = image::load_from_memory(&video.image)?;
     ensure!(
         png.width() > 100 && png.height() > 100,
         "video frame has no pixels"
@@ -46,7 +46,7 @@ fn main() -> Result<()> {
         640,
         &cancel,
     )?;
-    ensure!(cached.path == video.path, "thumbnail cache miss");
+    ensure!(cached.image == video.image, "thumbnail cache miss");
     let cache_time = start.elapsed();
     let pdf = native_assets::preview(
         &fixtures.join("sample.pdf"),
@@ -56,7 +56,7 @@ fn main() -> Result<()> {
         &cancel,
     )?;
     ensure!(
-        pdf.pages == 1 && image::open(&pdf.path)?.width() > 100,
+        pdf.pages == 1 && image::load_from_memory(&pdf.image)?.width() > 100,
         "native PDF image invalid"
     );
     let icons = native_assets::icons(vec![

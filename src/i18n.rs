@@ -31,10 +31,24 @@ impl Language {
     }
     pub fn from_langid(id: u16) -> Self {
         match id & 0x03ff {
+            // All Chinese locales (Simplified, Traditional, Hong Kong, etc.)
+            // use the single zh-CN catalog.
             0x04 => Self::Chinese,
             0x11 => Self::Japanese,
             0x12 => Self::Korean,
             _ => Self::English,
+        }
+    }
+    /// UI language selected by Windows on first launch.
+    pub fn system() -> Self {
+        #[cfg(windows)]
+        {
+            use windows::Win32::Globalization::GetUserDefaultUILanguage;
+            Self::from_langid(unsafe { GetUserDefaultUILanguage() } as u16)
+        }
+        #[cfg(not(windows))]
+        {
+            Self::English
         }
     }
     pub fn native_name(self) -> &'static str {
@@ -270,6 +284,9 @@ mod tests {
         }
         for (id, expected) in [
             (0x0804, Language::Chinese),
+            (0x0404, Language::Chinese),
+            (0x0c04, Language::Chinese),
+            (0x1004, Language::Chinese),
             (0x0411, Language::Japanese),
             (0x0412, Language::Korean),
             (0x0409, Language::English),

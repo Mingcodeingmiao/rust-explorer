@@ -171,7 +171,7 @@ fn indexed_query(
 pub fn supports_everything(folder: &Path) -> bool {
     use std::os::windows::ffi::OsStrExt;
     use windows::{
-        Win32::Storage::FileSystem::{GetVolumeInformationW, GetVolumePathNameW},
+        Win32::Storage::FileSystem::{GetDriveTypeW, GetVolumeInformationW, GetVolumePathNameW},
         core::PCWSTR,
     };
     if folder.to_string_lossy().starts_with("\\\\") {
@@ -182,6 +182,11 @@ pub fn supports_everything(folder: &Path) -> bool {
     let mut fs = [0u16; 32];
     unsafe {
         if GetVolumePathNameW(PCWSTR(input.as_ptr()), &mut root).is_err() {
+            return false;
+        }
+        // A mapped network drive can report NTFS from the remote server; it is
+        // still not part of Everything's local NTFS index.
+        if GetDriveTypeW(PCWSTR(root.as_ptr())) == 4 {
             return false;
         }
         if GetVolumeInformationW(PCWSTR(root.as_ptr()), None, None, None, None, Some(&mut fs))
@@ -461,6 +466,11 @@ mod tests {
         cancel.store(true, Ordering::Relaxed);
         assert!(recursive_names("needle", &root, &cancel).is_err());
         assert!(!supports_everything(Path::new("\\\\server\\share")));
+        // A mapped network drive may report NTFS from the remote server. This
+        // machine's Z: is network-backed; skip on machines without that mapping.
+        if Path::new("Z:\\").exists() {
+            assert!(!supports_everything(Path::new("Z:\\")));
+        }
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
