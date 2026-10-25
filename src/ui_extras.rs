@@ -4635,6 +4635,7 @@ impl Explorer {
                 } else {
                     let tab = Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4844,6 +4845,7 @@ impl Explorer {
                 if let Some(path) = self.paths().first() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path.clone()),
                         query: String::new(),
                         global: false,
@@ -4863,6 +4865,7 @@ impl Explorer {
                 for path in folders {
                     let tab = Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4940,6 +4943,7 @@ impl Explorer {
                 if let Some(path) = self.context_target.clone() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
+                        view: resolved_view(&self.settings, &path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -4953,6 +4957,7 @@ impl Explorer {
                     let _ = open_explorer(
                         Some(Tab {
                             id: next_tab_id(),
+                            view: resolved_view(&self.settings, &path),
                             history: History::new(path),
                             query: String::new(),
                             global: false,
@@ -5132,6 +5137,7 @@ impl Explorer {
             "new-window" => {
                 let tab = Tab {
                     id: next_tab_id(),
+                    view: resolved_view(&self.settings, &self.dir()),
                     history: History::new(self.dir()),
                     query: String::new(),
                     global: false,

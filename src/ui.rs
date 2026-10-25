@@ -116,6 +116,8 @@ struct Tab {
     query: String,
     global: bool,
     reveal_targets: Vec<PathBuf>,
+    /// Presentation remembered while this tab is inactive.
+    view: ViewMode,
 }
 #[derive(Clone)]
 struct DragFiles {
@@ -907,6 +909,7 @@ impl Explorer {
                 query: String::new(),
                 global: false,
                 reveal_targets: launch.map(|r| r.select).unwrap_or_default(),
+                view,
             }],
             active: 0,
             entries: Arc::new(vec![]),
@@ -1160,12 +1163,15 @@ impl Explorer {
                 .map(|(i, t)| (i, t.history.current(), t.reveal_targets.as_slice())),
         );
         let index = index.unwrap_or_else(|| {
+            let folder = request.folder.clone();
+            let view = resolved_view(&self.settings, &folder);
             self.tabs.push(Tab {
                 id: next_tab_id(),
                 history: History::new(request.folder),
                 query: String::new(),
                 global: false,
                 reveal_targets: Vec::new(),
+                view,
             });
             self.tabs.len() - 1
         });
@@ -1807,12 +1813,14 @@ impl Explorer {
         if self.focus_existing_tab(&path, cx) {
             return;
         }
+        let view = resolved_view(&self.settings, &path);
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view,
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
@@ -1856,6 +1864,7 @@ impl Explorer {
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view: resolved_view(&self.settings, &path),
         };
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
@@ -3037,28 +3046,41 @@ impl Explorer {
         }
     }
     fn new_tab(&mut self, cx: &mut Context<Self>) {
+        let path = if self.settings.new_tab_this_pc {
+            PathBuf::from("::ThisPC")
+        } else {
+            self.dir()
+        };
+        let view = resolved_view(&self.settings, &path);
         self.tabs.push(Tab {
             id: next_tab_id(),
-            history: History::new(if self.settings.new_tab_this_pc {
-                PathBuf::from("::ThisPC")
-            } else {
-                self.dir()
-            }),
+            history: History::new(path),
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
+            view,
         });
         self.switch_tab(self.tabs.len() - 1, cx);
     }
     fn switch_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        // Save the outgoing tab before changing `dir()`/`active`.
+        self.remember_history_state();
+        self.tabs[self.active].view = self.view;
+        self.activate_tab(index, cx);
+    }
+    fn activate_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        if index >= self.tabs.len() {
+            return;
+        }
         let was_computer = volumes::is_computer(&self.dir());
         self.active = index;
         self.external_reveal = self.tabs[index].reveal_targets.clone();
         self.reveal_pending = !self.external_reveal.is_empty();
         self.reveal_scroll = None;
-        if self.settings.remember_views {
-            self.view = resolved_view(&self.settings, &self.dir());
-        }
+        self.view = self.tabs[index].view;
         if !was_computer && volumes::is_computer(&self.dir()) {
             self.group = "kind".into();
         } else if was_computer && !volumes::is_computer(&self.dir()) {
@@ -3067,6 +3089,17 @@ impl Explorer {
         self.tab_scroll.scroll_to_item(index);
         let query = self.tabs[index].query.clone();
         self.search.update(cx, |v, cx| v.set_value(query, cx));
+        self.apply_remembered_state();
+        if self
+            .pending_restore
+            .as_ref()
+            .is_none_or(|state| state.selection.is_empty() && state.row <= 0.)
+        {
+            self.list_scroll.scroll_to(ListOffset {
+                item_ix: 0,
+                offset_in_item: px(0.),
+            });
+        }
         self.reload(cx);
     }
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3078,12 +3111,17 @@ impl Explorer {
             }
             return;
         }
+        let closed_active = index == self.active;
         self.tabs.remove(index);
         if index < self.active {
             self.active -= 1;
         }
         self.active = self.active.min(self.tabs.len() - 1);
-        self.switch_tab(self.active, cx);
+        if closed_active {
+            self.activate_tab(self.active, cx);
+        } else {
+            self.switch_tab(self.active, cx);
+        }
     }
     fn key_move(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
         self.key_navigate(NavigationStep::Vertical(delta), false, false, window, cx);
@@ -4131,6 +4169,7 @@ impl Render for Explorer {
                         query: String::new(),
                         global: false,
                         reveal_targets: Vec::new(),
+                        view: v.view,
                     }),
                     cx,
                 );
