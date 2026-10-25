@@ -430,6 +430,7 @@ fn built_in_view(path: &std::path::Path) -> ViewMode {
 fn view_trace(message: impl std::fmt::Display) {
     rust_explorer::shell::menu_trace(format!("view: {message}"));
 }
+const DRIVE_LABEL_LINE_CHARS: usize = 23;
 
 impl Explorer {
     pub(super) fn begin_marquee(
@@ -868,7 +869,9 @@ impl Explorer {
             tab_drag: None,
             tab_tip: None,
             tab_tip_scale: 1.0,
-            volumes: volumes::roots().iter().map(|p| volumes::basic(p)).collect(),
+            // Do not paint the cheap `basic` labels first: mapped drives would
+            // briefly show their UNC path and then overlap the real Shell name.
+            volumes: Vec::new(),
             storage_volumes: Vec::new(),
             volume_busy: false,
             volume_tick: Instant::now() - Duration::from_secs(10),
@@ -2844,19 +2847,84 @@ impl Explorer {
     /// Anchored inline editor for labels outside the file list (navigation rows and
     /// drive tiles). It mirrors the list's rename overlay: an accent-bordered box
     /// drawn over the label, so a long name cannot relayout the row or the tile.
-    fn inline_rename_overlay(&self, id: (&'static str, usize), width: f32) -> AnyElement {
+    fn inline_rename_overlay(
+        &self,
+        id: (&'static str, usize),
+        width: f32,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let max_width = width.clamp(80., 360.);
+        let is_volume = matches!(self.dialog, Some(Dialog::RenameVolume { .. }));
+        let is_file = matches!(self.dialog, Some(Dialog::Rename(_)));
+        let value = self.dialog_input.read(cx).value();
+        if is_volume || is_file {
+            self.dialog_input.update(cx, |input, _| {
+                input.compact = true;
+                // Hard-wrap the display in 23-character chunks. The value itself
+                // stays free of newlines because GPUI rejects them in shape_text.
+                input.wrap_chars = Some(DRIVE_LABEL_LINE_CHARS);
+                input.wrap_width = None;
+                input.single_line_scroll = false;
+            });
+        } else {
+            self.dialog_input.update(cx, |input, _| {
+                input.wrap_chars = None;
+                input.wrap_width = None;
+            });
+        }
+        let lines = if is_volume || is_file {
+            let chars = value.chars().count();
+            chars.div_ceil(DRIVE_LABEL_LINE_CHARS).clamp(1, 12)
+        } else {
+            1
+        };
+        let height = 24. + (lines.saturating_sub(1) as f32) * 18.;
+        // The editor box follows the longest 23-character line plus one
+        // character of breathing room, capped by the tile/list label width.
+        let width = if is_volume {
+            let measure = |text: &str| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font("Microsoft YaHei UI"),
+                    color: rgb(self.theme.text).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(
+                            SharedString::from(text.to_string()),
+                            px(13. * self.zoom),
+                            &[run],
+                            None,
+                        )
+                        .width,
+                ) / self.zoom
+            };
+            let chars: Vec<char> = value.chars().collect();
+            let text_width = chars
+                .chunks(DRIVE_LABEL_LINE_CHARS)
+                .map(|chunk| measure(&chunk.iter().collect::<String>()))
+                .fold(0.0_f32, f32::max);
+            (text_width + measure("W") + 12.).clamp(60., max_width)
+        } else {
+            max_width
+        };
         div()
             .relative()
             .w(ui(width.max(24.)))
-            .h(ui(22.))
+            .h(ui(height))
             .flex_shrink_0()
             .child(
                 gpui::deferred(
                     gpui::anchored().snap_to_window().child(
                         div()
                             .id(id)
-                            .w(ui(width.clamp(80., 360.)))
-                            .h(ui(24.))
+                            .w(ui(width))
+                            .h(ui(height))
                             .bg(rgb(self.theme.input))
                             .border_1()
                             .border_color(rgb(self.theme.accent))
@@ -5393,6 +5461,12 @@ impl Render for Explorer {
         }
         if let Some(dialog) = &self.dialog {
             if self.inline_rename.is_none() {
+                let rename_lines = if matches!(dialog, Dialog::RenameVolume { .. }) {
+                    let chars = self.dialog_input.read(cx).value().chars().count();
+                    ((chars as f32 / 28.).ceil() as usize).clamp(1, 6)
+                } else {
+                    1
+                };
                 let (title, description, delete) = match dialog {
                     Dialog::NewFolder => (
                         rust_explorer::i18n::text("新建文件夹"),
@@ -5525,6 +5599,9 @@ impl Render for Explorer {
                                             .bg(rgb(t.input))
                                             .rounded(ui(4.))
                                             .p_1()
+                                            .when(rename_lines > 1, |field| {
+                                                field.h(ui(18. * rename_lines as f32 + 8.))
+                                            })
                                             .child(self.dialog_input.clone()),
                                     )
                                 })

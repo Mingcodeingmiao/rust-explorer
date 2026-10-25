@@ -393,6 +393,36 @@ fn column_label(id: &str, usage: bool) -> &'static str {
         _ => rust_explorer::i18n::text("名称"),
     }
 }
+pub(super) fn icon_label_lines_max(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    window: &Window,
+) -> Vec<String> {
+    rust_explorer::icon_layout::label_lines(
+        text.graphemes(true),
+        width.max(1.),
+        max_lines.max(1),
+        |line| {
+            let run = TextRun {
+                len: line.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(0).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
+                    .width,
+            ) / scale
+        },
+    )
+}
 pub(super) fn icon_label_lines(
     text: &str,
     width: f32,
@@ -400,22 +430,46 @@ pub(super) fn icon_label_lines(
     scale: f32,
     window: &Window,
 ) -> Vec<String> {
-    rust_explorer::icon_layout::label_lines(text.graphemes(true), width.max(1.), 4, |line| {
-        let run = TextRun {
-            len: line.len(),
-            font: font("Microsoft YaHei UI"),
-            color: rgb(0).into(),
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        f32::from(
-            window
-                .text_system()
-                .shape_line(line.to_owned().into(), px(font_size * scale), &[run], None)
-                .width,
-        ) / scale
-    })
+    icon_label_lines_max(text, width, font_size, scale, 4, window)
+}
+pub(super) fn icon_label_max_h(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    line_height: f32,
+    window: &Window,
+) -> AnyElement {
+    div()
+        .w_full()
+        .flex()
+        .flex_col()
+        .line_height(ui(line_height))
+        .text_size(ui(font_size))
+        .children(
+            icon_label_lines_max(text, width, font_size, scale, max_lines, window)
+                .into_iter()
+                .map(|line| {
+                    div()
+                        .h(ui(line_height))
+                        .w_full()
+                        .whitespace_nowrap()
+                        .overflow_hidden()
+                        .child(line)
+                }),
+        )
+        .into_any_element()
+}
+pub(super) fn icon_label_max(
+    text: &str,
+    width: f32,
+    font_size: f32,
+    scale: f32,
+    max_lines: usize,
+    window: &Window,
+) -> AnyElement {
+    icon_label_max_h(text, width, font_size, scale, max_lines, 20., window)
 }
 pub(super) fn icon_label(
     text: &str,
@@ -424,25 +478,7 @@ pub(super) fn icon_label(
     scale: f32,
     window: &Window,
 ) -> AnyElement {
-    div()
-        .w_full()
-        .flex()
-        .flex_col()
-        .line_height(ui(20.))
-        .text_size(ui(font_size))
-        .children(
-            icon_label_lines(text, width, font_size, scale, window)
-                .into_iter()
-                .map(|line| {
-                    div()
-                        .h(ui(20.))
-                        .w_full()
-                        .whitespace_nowrap()
-                        .overflow_hidden()
-                        .child(line)
-                }),
-        )
-        .into_any_element()
+    icon_label_max(text, width, font_size, scale, 4, window)
 }
 fn menu_icon(id: &str) -> Option<&'static str> {
     Some(if id.starts_with("view:") {
@@ -2434,40 +2470,46 @@ impl Explorer {
     ) -> AnyElement {
         if self.inline_rename.as_ref() == Some(&e.path) {
             let value = self.dialog_input.read(cx).value();
-            let run = TextRun {
-                len: value.len(),
-                font: font("Microsoft YaHei UI"),
-                color: rgb(self.theme.text).into(),
-                background_color: None,
-                underline: None,
-                strikethrough: None,
+            self.dialog_input.update(cx, |input, _| {
+                input.compact = true;
+                input.wrap_chars = Some(super::DRIVE_LABEL_LINE_CHARS);
+                input.wrap_width = None;
+                input.single_line_scroll = false;
+            });
+            let measure = |text: &str| {
+                let run = TextRun {
+                    len: text.len(),
+                    font: font("Microsoft YaHei UI"),
+                    color: rgb(self.theme.text).into(),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                f32::from(
+                    window
+                        .text_system()
+                        .shape_line(
+                            SharedString::from(text.to_string()),
+                            px(13. * self.zoom),
+                            &[run],
+                            None,
+                        )
+                        .width,
+                ) / self.zoom
             };
-            let text_width = f32::from(
-                window
-                    .text_system()
-                    .shape_line(
-                        value.clone().into(),
-                        px(13. * self.zoom),
-                        &[run.clone()],
-                        None,
-                    )
-                    .width,
-            ) / self.zoom;
+            let chars: Vec<char> = value.chars().collect();
+            let text_width = chars
+                .chunks(super::DRIVE_LABEL_LINE_CHARS)
+                .map(|chunk| measure(&chunk.iter().collect::<String>()))
+                .fold(0.0_f32, f32::max);
             let max_width =
                 (f32::from(window.viewport_size().width) / self.zoom - 24.).clamp(48., 520.);
-            let editor_width = (text_width + 20.).clamp(48., max_width);
-            let lines = window
-                .text_system()
-                .shape_text(
-                    value.into(),
-                    px(13. * self.zoom),
-                    &[run],
-                    Some(px((editor_width - 8.) * self.zoom)),
-                    None,
-                )
-                .ok()
-                .and_then(|lines| lines.first().map(|line| line.wrap_boundaries().len() + 1))
-                .unwrap_or(1);
+            let editor_width = (text_width + measure("W") + 12.).clamp(48., max_width);
+            let lines = value
+                .chars()
+                .count()
+                .div_ceil(super::DRIVE_LABEL_LINE_CHARS)
+                .max(1);
             let editor_height = 4. + lines as f32 * 20.;
             // The editor is an overlay: growing it must not resize a details row.
             return div()
@@ -4380,7 +4422,12 @@ impl Explorer {
                 }
             }
         }
-        overlay.into_any_element()
+        // The inline rename editor is a deferred layer above the normal tree.
+        // Menus must be deferred above it as well, otherwise the text editor
+        // covers the paste menu with its own overlay.
+        gpui::deferred(gpui::anchored().snap_to_window().child(overlay))
+            .with_priority(10)
+            .into_any_element()
     }
     /// Drop every generated cache (memory, thumbnails, folder sizes, disk).
     /// Shared by the selection menu and the advanced options page.

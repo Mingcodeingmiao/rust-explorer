@@ -25,9 +25,16 @@ pub struct Volume {
 }
 /// The kernel volume label of a drive, for the inline rename editor.
 pub fn rename_initial(volume: &Volume) -> String {
-    if volume.kind == 4 {
-        // Mapped network drives are renamed by display name; keep the suffix off.
-        return volume.label.clone();
+    // Both kernel labels and mapped-drive Shell names are stored without the
+    // drive-letter suffix; a fallback removes `(Z:)` from old snapshots.
+    if volume.name.is_empty() && volume.kind == 4 {
+        let letter = volume.path.to_string_lossy().chars().next().unwrap_or('?');
+        let suffix = format!(" ({letter}:)");
+        return volume
+            .label
+            .strip_suffix(&suffix)
+            .unwrap_or(&volume.label)
+            .to_string();
     }
     volume.name.clone()
 }
@@ -132,6 +139,7 @@ pub fn info(path: &Path) -> Volume {
     if volume.kind == 4 {
         // This function runs only in a killable helper (800 ms total budget).
         // Query capacity and read-only flags without trying to reconnect or write.
+        let original = path;
         let path = wide(path);
         let (mut total, mut free) = (0, 0);
         unsafe {
@@ -160,6 +168,30 @@ pub fn info(path: &Path) -> Volume {
             .is_ok()
             {
                 volume.read_only = flags & 0x00080000 != 0;
+            }
+        }
+        // A mapped drive's real display name lives in the Shell namespace, not
+        // in HKCU\Network\...\RemotePath. Show it (without the `(Z:)` suffix)
+        // instead of exposing the UNC path in the drive tile.
+        use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+        let _ = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) };
+        if let Ok(display) = crate::volume_label::read(original) {
+            let letter = original
+                .to_string_lossy()
+                .chars()
+                .next()
+                .unwrap_or('?')
+                .to_ascii_uppercase();
+            let suffix = format!(" ({letter}:)");
+            let name = display
+                .label
+                .strip_suffix(&suffix)
+                .unwrap_or(&display.label)
+                .trim()
+                .to_string();
+            if !name.is_empty() {
+                volume.name = name.clone();
+                volume.label = format!("{name} ({letter}:)");
             }
         }
         return volume;

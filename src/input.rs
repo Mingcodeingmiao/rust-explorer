@@ -41,11 +41,17 @@ pub struct TextInput {
     selected_range: Range<usize>,
     selection_reversed: bool,
     marked_range: Option<Range<usize>>,
-    last_layout: Option<WrappedLine>,
+    last_lines: Vec<WrappedLine>,
+    last_line_starts: Vec<usize>,
     last_bounds: Option<Bounds<Pixels>>,
     last_line_height: Pixels,
     is_selecting: bool,
     pub compact: bool,
+    /// Logical wrap width for callers that render in a fixed-width overlay.
+    pub wrap_width: Option<f32>,
+    /// Hard-wrap display into chunks of this many characters. Content itself
+    /// never contains newlines (GPUI's `shape_text` rejects them).
+    pub wrap_chars: Option<usize>,
     pub single_line_scroll: bool,
     pub click_to_end: bool,
     pub double_click_select_all: bool,
@@ -62,11 +68,14 @@ impl TextInput {
             selected_range: 0..0,
             selection_reversed: false,
             marked_range: None,
-            last_layout: None,
+            last_lines: Vec::new(),
+            last_line_starts: Vec::new(),
             last_bounds: None,
             last_line_height: px(20.),
             is_selecting: false,
             compact: false,
+            wrap_width: None,
+            wrap_chars: None,
             single_line_scroll: false,
             click_to_end: false,
             double_click_select_all: false,
@@ -284,13 +293,27 @@ impl TextInput {
         }
     }
 
+    fn position_for_offset(&self, offset: usize) -> Option<Point<Pixels>> {
+        let lines = &self.last_lines;
+        let starts = &self.last_line_starts;
+        let line_index = starts
+            .iter()
+            .rposition(|start| *start <= offset)
+            .unwrap_or(0)
+            .min(lines.len().checked_sub(1)?);
+        let line = &lines[line_index];
+        let local = offset.saturating_sub(starts[line_index]);
+        line.position_for_index(local.min(line.text.len()), self.last_line_height)
+            .map(|position| {
+                position + gpui::point(px(0.), self.last_line_height * line_index as f32)
+            })
+    }
+
     fn index_for_mouse_position(&self, position: Point<Pixels>) -> usize {
         if self.content.is_empty() {
             return 0;
         }
-
-        let (Some(bounds), Some(line)) = (self.last_bounds.as_ref(), self.last_layout.as_ref())
-        else {
+        let Some(bounds) = self.last_bounds.as_ref() else {
             return 0;
         };
         if position.y < bounds.top() {
@@ -299,21 +322,29 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        let local = position - bounds.origin + gpui::point(self.scroll_x, px(0.));
-        // Positions outside the shaped text do not resolve to an index; map them to
-        // the nearest end instead of falling back to the start of the line.
-        if local.x <= px(0.) {
+        let lines = &self.last_lines;
+        if lines.is_empty() {
             return 0;
         }
-        let end = line
-            .position_for_index(self.content.len(), self.last_line_height)
-            .map(|position| position.x)
-            .unwrap_or_default();
-        if local.x >= end {
-            return self.content.len();
+        let local_y = position.y - bounds.top();
+        let line_index = ((local_y / self.last_line_height).floor() as usize).min(lines.len() - 1);
+        let start = self.last_line_starts[line_index];
+        let line = &lines[line_index];
+        let local_x = position.x - bounds.left() + self.scroll_x;
+        if local_x <= px(0.) || line.text.is_empty() {
+            return start;
         }
-        line.closest_index_for_position(local, self.last_line_height)
-            .unwrap_or(0)
+        let end_x = line
+            .position_for_index(line.text.len(), self.last_line_height)
+            .map(|position| position.x)
+            .unwrap_or(px(0.));
+        if local_x >= end_x {
+            return start + line.text.len();
+        }
+        start
+            + line
+                .closest_index_for_position(gpui::point(local_x, px(0.)), self.last_line_height)
+                .unwrap_or(0)
     }
 
     fn select_to(&mut self, offset: usize, cx: &mut Context<Self>) {
@@ -495,10 +526,9 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
-        let start = last_layout.position_for_index(range.start, self.last_line_height)?;
-        let end = last_layout.position_for_index(range.end, self.last_line_height)?;
+        let start = self.position_for_offset(range.start)?;
+        let end = self.position_for_offset(range.end)?;
         Some(Bounds::new(
             bounds.origin + start - gpui::point(self.scroll_x, px(0.)),
             size(
@@ -518,16 +548,7 @@ impl EntityInputHandler for TextInput {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        let bounds = self.last_bounds?;
-        let utf8_index = self
-            .last_layout
-            .as_ref()?
-            .closest_index_for_position(
-                point - bounds.origin + gpui::point(self.scroll_x, px(0.)),
-                self.last_line_height,
-            )
-            .ok()?;
-        Some(self.offset_to_utf16(utf8_index))
+        Some(self.offset_to_utf16(self.index_for_mouse_position(point)))
     }
 }
 
@@ -536,7 +557,8 @@ struct TextElement {
 }
 
 struct PrepaintState {
-    line: Option<WrappedLine>,
+    lines: Vec<WrappedLine>,
+    line_starts: Vec<usize>,
     cursor: Option<PaintQuad>,
     selection: Vec<PaintQuad>,
     scroll_x: Pixels,
@@ -570,12 +592,14 @@ impl Element for TextElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
+        let input = self.input.read(cx);
         style.size.width = relative(1.).into();
-        style.size.height = if self.input.read(cx).compact {
-            relative(1.).into()
-        } else {
-            window.line_height().into()
-        };
+        style.size.height =
+            if input.compact || input.wrap_width.is_some() || input.wrap_chars.is_some() {
+                relative(1.).into()
+            } else {
+                window.line_height().into()
+            };
         (window.request_layout(style, [], cx), ())
     }
 
@@ -668,21 +692,82 @@ impl Element for TextElement {
         }
 
         let font_size = style.font_size.to_pixels(window.rem_size());
-        let line = window
-            .text_system()
-            .shape_text(
-                display_text,
-                font_size,
-                &runs,
-                input.compact.then_some(bounds.size.width),
-                None,
-            )
-            .unwrap()
-            .remove(0);
+        let display_source = display_text.clone();
+        // GPUI's `shape_text` panics on newlines. For hard-wrapped editors we
+        // shape each character chunk separately and never put a newline into
+        // the input value.
+        let lines = if let Some(chunk_chars) = input.wrap_chars {
+            let chars: Vec<char> = display_source.chars().collect();
+            let mut chunks: Vec<String> = chars
+                .chunks(chunk_chars.max(1))
+                .map(|chunk| chunk.iter().collect())
+                .collect();
+            if chunks.is_empty() {
+                chunks.push(String::new());
+            }
+            chunks
+                .into_iter()
+                .map(|chunk| {
+                    let chunk_run = TextRun {
+                        len: chunk.len(),
+                        font: style.font(),
+                        color: text_color,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    };
+                    window
+                        .text_system()
+                        .shape_text(
+                            SharedString::from(chunk),
+                            font_size,
+                            &[chunk_run],
+                            None,
+                            None,
+                        )
+                        .unwrap()
+                        .remove(0)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            window
+                .text_system()
+                .shape_text(
+                    display_text,
+                    font_size,
+                    &runs,
+                    input
+                        .wrap_width
+                        .map(|width| px(width * window.scale_factor()))
+                        .or_else(|| input.compact.then_some(bounds.size.width)),
+                    None,
+                )
+                .unwrap()
+                .into_iter()
+                .collect::<Vec<_>>()
+        };
         let line_height = window.line_height();
-        let cursor_pos = line
-            .position_for_index(cursor, line_height)
-            .unwrap_or_default();
+        let source = display_source.as_bytes();
+        let mut line_starts = Vec::with_capacity(lines.len());
+        let mut start = 0usize;
+        for line in &lines {
+            line_starts.push(start);
+            start += line.text.len();
+            // `shape_text` splits at the newline and excludes it from `text`;
+            // advance past it so cursor offsets stay global.
+            while matches!(source.get(start), Some(b'\r' | b'\n')) {
+                start += 1;
+            }
+        }
+        let cursor_line = line_starts
+            .iter()
+            .rposition(|start| *start <= cursor)
+            .unwrap_or(0);
+        let cursor_local = cursor.saturating_sub(line_starts[cursor_line]);
+        let cursor_pos = lines[cursor_line]
+            .position_for_index(cursor_local, line_height)
+            .unwrap_or_default()
+            + gpui::point(px(0.), line_height * cursor_line as f32);
         let scroll_x = if input.single_line_scroll {
             let right = (bounds.size.width - px(2.)).max(px(1.));
             let mut offset = input.scroll_x;
@@ -692,8 +777,8 @@ impl Element for TextElement {
             if cursor_pos.x > offset + right {
                 offset = cursor_pos.x - right;
             }
-            let end = line
-                .position_for_index(input.content.len(), line_height)
+            let end = lines[0]
+                .position_for_index(lines[0].len(), line_height)
                 .unwrap_or_default()
                 .x;
             offset.clamp(px(0.), (end - right).max(px(0.)))
@@ -703,27 +788,36 @@ impl Element for TextElement {
         let origin = bounds.origin - gpui::point(scroll_x, px(0.));
         let mut selection = Vec::new();
         if !selected_range.is_empty() {
-            for (start, ch) in line
-                .text
-                .char_indices()
-                .filter(|(i, _)| selected_range.contains(i))
-            {
-                let p = line
-                    .position_for_index(start, line_height)
-                    .unwrap_or_default();
-                let q = line
-                    .position_for_index(start + ch.len_utf8(), line_height)
-                    .unwrap_or(p);
-                let width = if q.y == p.y {
-                    q.x - p.x
-                } else {
-                    bounds.size.width - p.x
-                };
-                selection.push(fill(
-                    Bounds::new(origin + p, size(width.max(px(1.)), line_height)),
-                    // Windows text selection: rgb(0,120,215).
-                    rgb(0x0078D7),
-                ));
+            for (line_index, line) in lines.iter().enumerate() {
+                let line_start = line_starts[line_index];
+                let line_end = line_start + line.text.len();
+                if selected_range.end <= line_start || selected_range.start >= line_end {
+                    continue;
+                }
+                for (start, ch) in line.text.char_indices() {
+                    let global = line_start + start;
+                    if !selected_range.contains(&global) {
+                        continue;
+                    }
+                    let p = line
+                        .position_for_index(start, line_height)
+                        .unwrap_or_default()
+                        + gpui::point(px(0.), line_height * line_index as f32);
+                    let q = line
+                        .position_for_index(start + ch.len_utf8(), line_height)
+                        .unwrap_or(p - gpui::point(px(0.), line_height * line_index as f32))
+                        + gpui::point(px(0.), line_height * line_index as f32);
+                    let width = if q.y == p.y {
+                        q.x - p.x
+                    } else {
+                        bounds.size.width - p.x
+                    };
+                    selection.push(fill(
+                        Bounds::new(origin + p, size(width.max(px(1.)), line_height)),
+                        // Windows text selection: rgb(0,120,215).
+                        rgb(0x0078D7),
+                    ));
+                }
             }
         }
         let cursor = selected_range.is_empty().then(|| {
@@ -733,7 +827,8 @@ impl Element for TextElement {
             )
         });
         PrepaintState {
-            line: Some(line),
+            lines,
+            line_starts,
             cursor,
             selection,
             scroll_x,
@@ -759,16 +854,18 @@ impl Element for TextElement {
         for selection in prepaint.selection.drain(..) {
             window.paint_quad(selection)
         }
-        let line = prepaint.line.take().unwrap();
-        line.paint(
-            bounds.origin - gpui::point(prepaint.scroll_x, px(0.)),
-            window.line_height(),
-            gpui::TextAlign::Left,
-            Some(bounds),
-            window,
-            cx,
-        )
-        .unwrap();
+        for (index, line) in prepaint.lines.iter().enumerate() {
+            line.paint(
+                bounds.origin - gpui::point(prepaint.scroll_x, px(0.))
+                    + gpui::point(px(0.), window.line_height() * index as f32),
+                window.line_height(),
+                gpui::TextAlign::Left,
+                Some(bounds),
+                window,
+                cx,
+            )
+            .unwrap();
+        }
 
         if focus_handle.is_focused(window)
             && let Some(cursor) = prepaint.cursor.take()
@@ -778,7 +875,8 @@ impl Element for TextElement {
 
         self.input.update(cx, |input, _cx| {
             input.last_line_height = window.line_height();
-            input.last_layout = Some(line);
+            input.last_lines = prepaint.lines.clone();
+            input.last_line_starts = prepaint.line_starts.clone();
             input.last_bounds = Some(bounds);
             input.scroll_x = prepaint.scroll_x;
         });
@@ -829,13 +927,19 @@ impl Render for TextInput {
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
-            .when(self.compact, |d| d.h_full())
+            .when(
+                self.compact || self.wrap_width.is_some() || self.wrap_chars.is_some(),
+                |d| d.h_full(),
+            )
             .overflow_hidden()
             .line_height(gpui::rems(if self.compact { 1.125 } else { 1.375 }))
             .text_size(gpui::rems(0.8125))
             .child(
                 div()
-                    .when(self.compact, |d| d.h_full())
+                    .when(
+                        self.compact || self.wrap_width.is_some() || self.wrap_chars.is_some(),
+                        |d| d.h_full(),
+                    )
                     .when(!self.compact, |d| d.h(gpui::rems(1.875)))
                     .w_full()
                     .p(gpui::rems(if self.compact { 0.0625 } else { 0.25 }))

@@ -5,6 +5,8 @@
 ### Changed
 
 - Icons, thumbnails and PDF/video/font previews now share one SQLite image cache. The UI receives PNG bytes directly; no per-icon, per-thumbnail or preview PNG/JSON files are created, and legacy image-cache files are removed on upgrade. A deleted database is recreated automatically, with WAL/locking recovery and bounded icon/thumbnail/preview LRU tables.
+- Network drive names accept Shell display-name characters such as `\ : ( )`, show the Shell name instead of the UNC path, and are excluded from Everything search. Long drive names use two compact lines and keep the capacity bar (the numeric readout is hidden); clicking an already selected drive starts its rename, like a file.
+- Volume-label validation now treats NTFS, exFAT, ReFS and mapped network drives permissively (path characters allowed), while FAT/FAT32 retain the strict 11-unit rule and reject `\ / : * ? " < > |`. The drive rename editor uses 23-character display lines and grows to show them while typing; display newlines are removed before saving.
 
 ## [0.7.7-part1] - 2026-10-24
 

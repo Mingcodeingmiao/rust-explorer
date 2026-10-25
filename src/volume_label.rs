@@ -69,26 +69,43 @@ pub fn read(path: &Path) -> Result<VolumeLabel> {
 }
 
 pub fn validate(label: &str, filesystem: &str) -> Result<()> {
+    let filesystem = filesystem.to_ascii_uppercase();
     if filesystem == "NETWORK" {
-        return crate::fs::valid_name(label);
-    }
-    let fat = matches!(filesystem.to_ascii_uppercase().as_str(), "FAT" | "FAT32");
-    ensure!(
-        label.encode_utf16().count() <= if fat { 11 } else { 32 },
-        "卷标过长（FAT/FAT32 最多 11 个字符，其他卷最多 32 个 UTF-16 单元）"
-    );
-    ensure!(
-        !label
-            .chars()
-            .any(|c| c.is_control() || "\\/:*?\"<>|".contains(c)),
-        "卷标包含无效字符"
-    );
-    if fat {
+        // A mapped drive's name is a Shell display name, not a kernel volume
+        // label or a file name. Shell permits \ : ( ) and other path-like
+        // characters that fs::valid_name rejects.
+        ensure!(!label.is_empty(), "网络驱动器名称不能为空");
         ensure!(
-            !label.chars().any(|c| "+=;,[]".contains(c)),
-            "FAT 卷标包含无效字符"
+            label.encode_utf16().count() <= 255,
+            "网络驱动器名称过长（最多 255 个 UTF-16 单元）"
         );
+        ensure!(
+            !label.chars().any(|c| c.is_control()),
+            "网络驱动器名称包含控制字符"
+        );
+        return Ok(());
     }
+    let fat = matches!(filesystem.as_str(), "FAT" | "FAT32");
+    ensure!(!label.chars().any(|c| c.is_control()), "卷标包含控制字符");
+    if fat {
+        // FAT/FAT32 inherit the old, strict 11-character rule and reject the
+        // Windows path characters plus the FAT-specific punctuation set.
+        ensure!(
+            label.encode_utf16().count() <= 11,
+            "FAT/FAT32 卷标最多 11 个 UTF-16 单元"
+        );
+        ensure!(
+            !label.chars().any(|c| "\\/:*?\"<>|+=;,[]".contains(c)),
+            "FAT/FAT32 卷标包含无效字符"
+        );
+        return Ok(());
+    }
+    // NTFS, exFAT, ReFS and other modern/unknown filesystems accept path-like
+    // characters; the kernel still limits a local volume label to 32 units.
+    ensure!(
+        label.encode_utf16().count() <= 32,
+        "卷标过长（其他卷最多 32 个 UTF-16 单元）"
+    );
     Ok(())
 }
 pub fn rename(path: &Path, label: &str) -> Result<()> {
@@ -224,9 +241,17 @@ mod tests {
         assert!(validate(&"a".repeat(32), "NTFS").is_ok());
         assert!(validate(&"a".repeat(33), "NTFS").is_err());
         assert!(validate(&"a".repeat(12), "FAT32").is_err());
-        assert!(validate("data/backup", "NTFS").is_err());
+        assert!(validate("data/backup", "NTFS").is_ok());
+        assert!(validate("a\\b:c*d?e\"f<g>h|i", "NTFS").is_ok());
+        assert!(validate("same:name", "exFAT").is_ok());
+        assert!(validate("same:name", "ReFS").is_ok());
+        assert!(validate("data/backup", "FAT32").is_err());
+        assert!(validate("a+b=c;d,e[f]", "FAT").is_err());
         assert!(validate("bad\0label", "NTFS").is_err());
         assert!(validate(&"n".repeat(64), "NETWORK").is_ok());
-        assert!(validate("invalid/name", "NETWORK").is_err());
+        assert!(validate("pri/v\\1.:2 (Z:)", "NETWORK").is_ok());
+        assert!(validate("invalid/name", "NETWORK").is_ok());
+        assert!(validate(&"n".repeat(256), "NETWORK").is_err());
+        assert!(validate("bad\0label", "NETWORK").is_err());
     }
 }
