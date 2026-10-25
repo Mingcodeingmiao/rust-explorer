@@ -3637,6 +3637,23 @@ fn button(id: impl Into<ElementId>, label: impl Into<SharedString>, t: Theme) ->
         .when(!symbolic, |d| d.child(label))
 }
 
+/// Icon-only toolbar button. Unlike `button`, it has no text child, gap or
+/// horizontal padding, so the 16px glyph sits at the exact centre of a square.
+fn icon_button(id: impl Into<ElementId>, icon: &str, t: Theme) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(ui(32.))
+        .h(ui(32.))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(ui(4.))
+        .cursor_pointer()
+        .hover(move |s| s.bg(rgb(t.hover)))
+        .child(visual::icon(icon, t.text))
+}
+
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.file_drop_bounds.borrow_mut().clear();
@@ -4560,7 +4577,7 @@ impl Render for Explorer {
             let command = if id == "new-folder" {
                 button(id, label, t).child(visual::icon("chevron-down", t.muted))
             } else {
-                button(id, "", t).child(visual::icon(id, t.text))
+                icon_button(id, id, t)
             };
             let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
             let paint_bounds = button_bounds.clone();
@@ -4668,29 +4685,30 @@ impl Render for Explorer {
             let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
             let paint_bounds = button_bounds.clone();
             let menu_width = px(self.menu_width(id, window, cx) * self.zoom);
-            let command = button(id, "", t)
-                .w(ui(if id == "more-menu" { 32. } else { 96. }))
-                .flex_shrink_0()
-                .when(id == "more-menu", |d| d.px_0())
-                .child(visual::icon(
-                    match id {
-                        "sort-menu" => "sort",
-                        "view-menu" => "view",
-                        _ => "more",
-                    },
-                    t.text,
-                ))
-                .when(!label.is_empty(), |d| {
-                    d.child(label).child(visual::icon("chevron-down", t.muted))
-                })
-                .child(
-                    canvas(
-                        move |bounds, _, _| paint_bounds.set(bounds),
-                        |_, _, _, _| {},
-                    )
-                    .absolute()
-                    .inset_0(),
-                );
+            let command = if id == "more-menu" {
+                icon_button(id, "more", t)
+            } else {
+                button(id, "", t)
+                    .w(ui(96.))
+                    .flex_shrink_0()
+                    .child(visual::icon(
+                        match id {
+                            "sort-menu" => "sort",
+                            _ => "view",
+                        },
+                        t.text,
+                    ))
+                    .child(label)
+                    .child(visual::icon("chevron-down", t.muted))
+            }
+            .child(
+                canvas(
+                    move |bounds, _, _| paint_bounds.set(bounds),
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0(),
+            );
             toolbar = toolbar.child(command.on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |v, _event: &MouseDownEvent, _, cx| {
