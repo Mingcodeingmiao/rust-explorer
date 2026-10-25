@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-10-25
+
+Merged PR #37. Adds a unified SQLite image cache for icons, thumbnails and previews, improves network-drive naming and volume-label handling, restores saved folder views and tab state, anchors toolbar menus to their buttons, and detects the Windows display language on first launch. Core tests: 141 passed (one ignored).
+
+See [release notes](docs/v0.7.8.md).
+
 ### Changed
 
 - Icons, thumbnails and PDF/video/font previews now share one SQLite image cache. The UI receives PNG bytes directly; no per-icon, per-thumbnail or preview PNG/JSON files are created, and legacy image-cache files are removed on upgrade. A deleted database is recreated automatically, with WAL/locking recovery and bounded icon/thumbnail/preview LRU tables.
