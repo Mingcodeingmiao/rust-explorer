@@ -13,7 +13,7 @@
 - 默认文件夹浏览器以实验性、当前用户可选功能重新整合；原值备份、独立恢复文件、失败回滚与范围限制见 [说明](default-folder-browser.md)。公开 0.7.2 仍为此前暂缓该功能的版本。
 - `src/shell_folder.rs`：通过隔离 helper 枚举 Shell 命名空间中的便携设备/MTP 目录，以 PIDL 十六进制路径保存项目标识，并提供 Shell 图标与打开操作。
 - `src/native_preview.rs`：Shell 视频单帧和 Windows.Data.Pdf 原生页面渲染。
-- `src/native_assets.rs`：带取消、硬超时和 PNG 缓存的原生图像 helper 协议。
+- `src/native_assets.rs`：带取消、硬超时和 SQLite PNG BLOB 缓存的原生图像 helper 协议。
 - `src/system_icons.rs`：系统关联、stock icon 与 DLL/MUN 资源加载，所有 HICON/HBITMAP/GDI 句柄 RAII 回收。
 - `src/visual.rs`：串行批量图标加载、DPI 缓存、自绘矢量回退和 rem 布局单位。
 - `src/theme.rs`：读取当前用户的 Windows 应用主题。

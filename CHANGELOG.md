@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Changed
+
+- Icons, thumbnails and PDF/video/font previews now share one SQLite image cache. The UI receives PNG bytes directly; no per-icon, per-thumbnail or preview PNG/JSON files are created, and legacy image-cache files are removed on upgrade. A deleted database is recreated automatically, with WAL/locking recovery and bounded icon/thumbnail/preview LRU tables.
+
 ## [0.7.7-part1] - 2026-10-24
 
 > **Known issue: Windows native context menus are not fully fixed.** Inconsistent file-menu styling can still occur on Windows 10. See [release notes](docs/v0.7.7-part1.md).

@@ -3085,7 +3085,10 @@ impl Explorer {
             } else {
                 None
             };
-            let thumbnail = key.as_ref().and_then(|key| self.thumbnails.image(key));
+            let thumbnail = key.as_ref().and_then(|key| {
+                let bytes = self.thumbnails.image(key)?;
+                visual::thumbnail_image(key, &bytes)
+            });
             let presentation = key
                 .as_ref()
                 .and_then(|key| self.thumbnails.presentation(key))

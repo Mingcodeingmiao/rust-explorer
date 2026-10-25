@@ -115,7 +115,7 @@ pub fn resolution(pixels: u32) -> u32 {
         .unwrap_or(256)
 }
 struct Cached {
-    path: Option<PathBuf>,
+    image: Option<std::sync::Arc<[u8]>>,
     presentation: Presentation,
     used: u64,
 }
@@ -306,7 +306,7 @@ impl State {
         let mut bytes: usize = self
             .cache
             .iter()
-            .filter(|(_, value)| value.path.is_some())
+            .filter(|(_, value)| value.image.is_some())
             .map(|(key, _)| key.cost())
             .sum();
         while self.cache.len() > MAX_CACHE || bytes > CACHE_BYTES {
@@ -322,7 +322,7 @@ impl State {
             if self
                 .cache
                 .remove(&key)
-                .is_some_and(|value| value.path.is_some())
+                .is_some_and(|value| value.image.is_some())
             {
                 bytes = bytes.saturating_sub(key.cost());
             }
@@ -431,7 +431,7 @@ fn run_worker(shared: Arc<Shared>, index: usize) {
                     ),
                 }
             });
-        let image = asset.map(|asset| asset.image);
+        let image = asset.map(|asset| std::sync::Arc::<[u8]>::from(asset.image));
         let mut state = shared.state.lock().unwrap();
         state.finish_job(index, &key);
         if is_shell(&key) {
@@ -451,7 +451,7 @@ fn run_worker(shared: Arc<Shared>, index: usize) {
             state.cache.insert(
                 key,
                 Cached {
-                    path: image,
+                    image,
                     presentation,
                     used,
                 },
@@ -501,7 +501,7 @@ impl Loader {
         crate::shell::menu_trace(format!("thumbnails: queued {count} folder previews"));
         self.shared.wake.notify_all();
     }
-    pub fn image(&self, key: &Key) -> Option<PathBuf> {
+    pub fn image(&self, key: &Key) -> Option<Arc<[u8]>> {
         let mut state = self.shared.state.lock().unwrap();
         state.clock += 1;
         let used = state.clock;
@@ -522,7 +522,7 @@ impl Loader {
         };
         let cached = state.cache.get_mut(&lookup)?;
         cached.used = used;
-        cached.path.clone()
+        cached.image.clone()
     }
     pub fn changed(&self) -> bool {
         self.shared.changed.swap(false, Ordering::AcqRel)
@@ -756,7 +756,7 @@ mod tests {
             state.cache.insert(
                 key(n),
                 Cached {
-                    path: None,
+                    image: None,
                     presentation: Presentation::default(),
                     used: n as u64,
                 },
@@ -776,7 +776,7 @@ mod tests {
         state.cache.insert(
             key(1),
             Cached {
-                path: None,
+                image: None,
                 presentation: Presentation::default(),
                 used: 0,
             },

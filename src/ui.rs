@@ -151,9 +151,9 @@ enum Preview {
     Loading,
     Text(Arc<Vec<String>>, bool, &'static str),
     Image(PathBuf),
-    Video(PathBuf),
+    Picture(Arc<Image>),
     Pdf {
-        path: PathBuf,
+        image: Arc<Image>,
         page: u32,
         pages: u32,
     },
@@ -1666,7 +1666,12 @@ impl Explorer {
                             640,
                             &cancel,
                         ) {
-                            Ok(asset) => Preview::Video(asset.path),
+                            Ok(asset) => match visual::png_image(&asset.image) {
+                                Some(image) => Preview::Picture(image),
+                                None => Preview::Message(
+                                    rust_explorer::i18n::text("视频预览图像无效").into(),
+                                ),
+                            },
                             Err(_) => Preview::Message(
                                 rust_explorer::i18n::text("此视频暂无可快速获取的系统单帧缩略图")
                                     .into(),
@@ -1682,7 +1687,8 @@ impl Explorer {
                             &cancel,
                         )?;
                         Preview::Pdf {
-                            path: asset.path,
+                            image: visual::png_image(&asset.image)
+                                .ok_or_else(|| anyhow::anyhow!("PDF 预览图像无效"))?,
                             page,
                             pages: asset.pages,
                         }
@@ -1695,7 +1701,10 @@ impl Explorer {
                             960,
                             &cancel,
                         )?;
-                        Preview::Image(asset.path)
+                        Preview::Picture(
+                            visual::png_image(&asset.image)
+                                .ok_or_else(|| anyhow::anyhow!("字体预览图像无效"))?,
+                        )
                     }
                     Kind::Unsupported => Preview::Message(
                         rust_explorer::i18n::text(
@@ -5008,7 +5017,7 @@ impl Render for Explorer {
                     .text_color(rgb(t.muted))
                     .child(message.clone())
                     .into_any_element(),
-                Preview::Image(path) | Preview::Video(path) => div()
+                Preview::Image(path) => div()
                     .flex_1()
                     .min_h_0()
                     .p_3()
@@ -5018,6 +5027,19 @@ impl Render for Explorer {
                     .child(
                         img(path.clone())
                             .image_cache(&self.thumbnail_images)
+                            .size_full()
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element(),
+                Preview::Picture(image) => div()
+                    .flex_1()
+                    .min_h_0()
+                    .p_3()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        img(image.clone())
                             .size_full()
                             .object_fit(ObjectFit::Contain),
                     )
@@ -5061,7 +5083,7 @@ impl Render for Explorer {
                         )
                         .into_any_element()
                 }
-                Preview::Pdf { path, page, pages } => div()
+                Preview::Pdf { image, page, pages } => div()
                     .flex_1()
                     .min_h_0()
                     .flex()
@@ -5085,8 +5107,7 @@ impl Render for Explorer {
                     )
                     .child(
                         div().flex_1().min_h_0().p_3().child(
-                            img(path.clone())
-                                .image_cache(&self.thumbnail_images)
+                            img(image.clone())
                                 .size_full()
                                 .object_fit(ObjectFit::Contain),
                         ),
