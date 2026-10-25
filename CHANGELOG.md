@@ -10,6 +10,7 @@
 - Back/Forward navigation now resolves the destination folder's view from saved folder views and then the built-in default, instead of inheriting the view of the folder being left.
 - Toolbar Sort/View/More menus are anchored to their buttons, toggle closed when the same button is clicked again, and close when a folder or blank area is clicked. Sort/View align to the button centre and More aligns its right edge to the More button. Menu widths now follow their widest item instead of a fixed 260px. Icon-only toolbar buttons are 32x32 with centred icons, and separators disappear with their adjacent hidden button groups.
 - Switching tabs now restores that tab's scroll position, selection and display mode instead of recalculating the incoming tab's view from the outgoing folder.
+- On first launch the UI language follows the Windows display language: every Chinese locale uses Simplified Chinese, supported Japanese/Korean locales use their catalogs, and all other languages fall back to English.
 
 ## [0.7.7-part1] - 2026-10-24
 

@@ -189,6 +189,9 @@ impl Settings {
             .unwrap_or_else(std::env::temp_dir)
             .join("RustExplorer/settings.json")
     }
+    pub fn exists() -> bool {
+        Self::path().is_file()
+    }
     pub fn load() -> Self {
         let mut s: Self = std::fs::read(Self::path())
             .ok()

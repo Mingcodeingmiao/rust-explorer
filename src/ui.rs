@@ -529,6 +529,13 @@ impl Explorer {
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
         let mut settings = Settings::load();
+        if !Settings::exists() {
+            // First launch: follow the Windows UI language. Chinese locales all
+            // collapse to the Simplified Chinese catalog; unsupported languages
+            // fall back to English inside `Language::system`.
+            settings.language = rust_explorer::i18n::Language::system().tag().into();
+            settings.save();
+        }
         rust_explorer::i18n::set_language(&settings.language);
         let initial = launch
             .as_ref()
