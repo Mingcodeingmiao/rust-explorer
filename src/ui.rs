@@ -4596,8 +4596,9 @@ impl Render for Explorer {
             };
             toolbar = toolbar.child(
                 command
-                    .w(ui(if id == "new-folder" { 94. } else { 40. }))
+                    .w(ui(if id == "new-folder" { 94. } else { 32. }))
                     .flex_shrink_0()
+                    .when(id != "new-folder", |d| d.px_0())
                     .when(!enabled, |d| d.opacity(0.4).cursor_default())
                     .on_click(cx.listener(move |v, _, w, cx| {
                         if !enabled {
@@ -4644,11 +4645,15 @@ impl Render for Explorer {
                         }
                     })),
             );
-            if id == "new-folder" {
+            if id == "new-folder" && !self.toolbar_overflow.contains(&"cut") {
                 toolbar = toolbar.child(div().w(ui(1.)).h(ui(24.)).mx_2().bg(rgb(t.border)));
             }
         }
-        toolbar = toolbar.child(div().w(ui(1.)).h(ui(20.)).mx_2().bg(rgb(t.border)));
+        if !self.toolbar_overflow.contains(&"sort-menu")
+            || !self.toolbar_overflow.contains(&"view-menu")
+        {
+            toolbar = toolbar.child(div().w(ui(1.)).h(ui(20.)).mx_2().bg(rgb(t.border)));
+        }
         for (id, label) in [
             ("sort-menu", rust_explorer::i18n::text("排序")),
             ("view-menu", rust_explorer::i18n::text("查看")),
@@ -4662,9 +4667,11 @@ impl Render for Explorer {
             }
             let button_bounds = std::rc::Rc::new(std::cell::Cell::new(Bounds::<Pixels>::default()));
             let paint_bounds = button_bounds.clone();
+            let menu_width = px(self.menu_width(id, window, cx) * self.zoom);
             let command = button(id, "", t)
-                .w(ui(if id == "more-menu" { 40. } else { 96. }))
+                .w(ui(if id == "more-menu" { 32. } else { 96. }))
                 .flex_shrink_0()
+                .when(id == "more-menu", |d| d.px_0())
                 .child(visual::icon(
                     match id {
                         "sort-menu" => "sort",
@@ -4693,7 +4700,6 @@ impl Render for Explorer {
                         v.nested_submenu = None;
                     } else {
                         let bounds = button_bounds.get();
-                        let menu_width = px(260. * v.zoom);
                         let x = if id == "more-menu" {
                             bounds.right() - menu_width
                         } else {

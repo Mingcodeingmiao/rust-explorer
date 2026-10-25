@@ -275,6 +275,7 @@ pub fn toolbar_overflow(width: f32, statistics: bool) -> Vec<&'static str> {
         ("cut", 48.),
         ("usage", 112.),
         ("global", 128.),
+        ("new-folder", 94.),
     ] {
         if needed <= width {
             break;

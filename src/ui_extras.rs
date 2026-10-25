@@ -4032,6 +4032,11 @@ impl Explorer {
                 let mut items = Vec::new();
                 for id in &self.toolbar_overflow {
                     let item = match *id {
+                        "new-folder" => MenuItem::new(
+                            "submenu:new-menu",
+                            rust_explorer::i18n::text("新建                         ›"),
+                        )
+                        .enable(!navigation::is_virtual(&self.dir())),
                         "view-menu" => MenuItem::new(
                             "submenu:view-menu",
                             rust_explorer::i18n::text("查看                         ›"),
@@ -4129,11 +4134,52 @@ impl Explorer {
             _ => vec![],
         }
     }
+    /// Width of a menu based on its widest label. Includes the check column,
+    /// optional icon, right chevron and panel padding.
+    pub(super) fn menu_width(&self, kind: &str, window: &Window, cx: &mut Context<Self>) -> f32 {
+        let measure = |text: &str| {
+            let run = TextRun {
+                len: text.len(),
+                font: font("Microsoft YaHei UI"),
+                color: rgb(self.theme.text).into(),
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            };
+            f32::from(
+                window
+                    .text_system()
+                    .shape_line(
+                        SharedString::from(text.to_string()),
+                        px(13. * self.zoom),
+                        &[run],
+                        None,
+                    )
+                    .width,
+            ) / self.zoom
+        };
+        let label_width = self
+            .menu_items(kind, cx)
+            .iter()
+            .map(|item| {
+                if item.id == "-" {
+                    0.
+                } else {
+                    measure(item.label.trim_end_matches('›').trim())
+                }
+            })
+            .fold(0.0_f32, f32::max);
+        // Padding (24), check column (16), optional leading/trailing icons
+        // (16 each), gaps (24) and a little slack. The label itself must never
+        // wrap; menu rows are single-line.
+        (label_width + 104.).clamp(120., 400.)
+    }
     fn menu_panel(
         &self,
         kind: &str,
         x: f32,
         y: f32,
+        width: f32,
         level: usize,
         viewport_height: f32,
         cx: &mut Context<Self>,
@@ -4153,7 +4199,7 @@ impl Explorer {
             .absolute()
             .left(px(x))
             .top(px(y))
-            .w(ui(260.))
+            .w(ui(width))
             .max_h(px((viewport_height - y - 8.).max(1.).min(580. * self.zoom)))
             .overflow_y_scroll()
             .py_2()
@@ -4212,9 +4258,9 @@ impl Explorer {
                         div()
                             .flex_1()
                             .min_w_0()
-                            .when(kind.starts_with("filter-menu:"), |d| {
-                                d.whitespace_nowrap().overflow_hidden().text_ellipsis()
-                            })
+                            .whitespace_nowrap()
+                            .overflow_hidden()
+                            .text_ellipsis()
                             .child(item.label.trim_end_matches('›').trim().to_string()),
                     )
                     .when(id.starts_with("submenu:"), |d| {
@@ -4324,7 +4370,8 @@ impl Explorer {
                 .child(panel)
                 .into_any_element();
         }
-        let width = 260. * self.zoom;
+        let width_logical = self.menu_width(&kind, window, cx);
+        let width = width_logical * self.zoom;
         let height = self
             .menu_items(&kind, cx)
             .iter()
@@ -4383,7 +4430,7 @@ impl Explorer {
                     cx.notify();
                 }),
             )
-            .child(self.menu_panel(&kind, x, y, 0, max_y, cx));
+            .child(self.menu_panel(&kind, x, y, width_logical, 0, max_y, cx));
         if let Some((sub, offset)) = &self.submenu {
             if self
                 .menu_items(&kind, cx)
@@ -4391,14 +4438,24 @@ impl Explorer {
                 .any(|i| i.id == format!("submenu:{sub}"))
             {
                 let child_height = (self.menu_items(sub, cx).len() as f32 * 34. + 16.) * self.zoom;
-                let child_x = if x + width * 2. < f32::from(window.viewport_size().width) {
+                let child_width_logical = self.menu_width(sub, window, cx);
+                let child_width = child_width_logical * self.zoom;
+                let child_x = if x + width + child_width < f32::from(window.viewport_size().width) {
                     x + width - 2.
                 } else {
-                    (x - width + 2.).max(8.)
+                    (x - child_width + 2.).max(8.)
                 };
                 let child_y =
                     (y + offset * self.zoom).min((max_y - child_height - 8.).max(40. * self.zoom));
-                overlay = overlay.child(self.menu_panel(sub, child_x, child_y, 1, max_y, cx));
+                overlay = overlay.child(self.menu_panel(
+                    sub,
+                    child_x,
+                    child_y,
+                    child_width_logical,
+                    1,
+                    max_y,
+                    cx,
+                ));
                 if let Some((nested, offset)) = &self.nested_submenu {
                     if self
                         .menu_items(sub, cx)
@@ -4408,16 +4465,26 @@ impl Explorer {
                         let height = ((self.menu_items(nested, cx).len() as f32 * 34. + 16.)
                             * self.zoom)
                             .min(580. * self.zoom);
-                        let nested_x =
-                            if child_x + width * 2. < f32::from(window.viewport_size().width) {
-                                child_x + width - 2.
-                            } else {
-                                (child_x - width + 2.).max(8.)
-                            };
+                        let nested_width_logical = self.menu_width(nested, window, cx);
+                        let nested_width = nested_width_logical * self.zoom;
+                        let nested_x = if child_x + child_width + nested_width
+                            < f32::from(window.viewport_size().width)
+                        {
+                            child_x + child_width - 2.
+                        } else {
+                            (child_x - nested_width + 2.).max(8.)
+                        };
                         let nested_y = (child_y + offset * self.zoom)
                             .min((max_y - height - 8.).max(40. * self.zoom));
-                        overlay = overlay
-                            .child(self.menu_panel(nested, nested_x, nested_y, 2, max_y, cx));
+                        overlay = overlay.child(self.menu_panel(
+                            nested,
+                            nested_x,
+                            nested_y,
+                            nested_width_logical,
+                            2,
+                            max_y,
+                            cx,
+                        ));
                     }
                 }
             }
