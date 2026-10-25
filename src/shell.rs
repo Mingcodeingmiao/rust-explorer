@@ -2808,12 +2808,13 @@ fn context_menu_options(
             };
         if quick_access_pinned {
             // The file-system folder menu always exposes `pintohome`, even for a
-            // folder that is already pinned. Present the truthful action instead;
-            // the selection is intercepted below and routed to `unpinfromhome`.
+            // folder that is already in Quick Access. Present the truthful action
+            // instead; the selection is intercepted below and routed to the
+            // canonical remove/unpin verb.
             for position in 0..GetMenuItemCount(Some(popup.0)) {
                 let id = GetMenuItemID(popup.0, position);
                 if verbs.verb(id) == "pintohome" {
-                    let text = wide("从快速访问取消固定");
+                    let text = wide("从快速访问中移除");
                     let _ = ModifyMenuW(
                         popup.0,
                         position as u32,

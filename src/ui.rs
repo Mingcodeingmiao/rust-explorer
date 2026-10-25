@@ -3316,6 +3316,10 @@ impl Explorer {
     fn go_back(&mut self, cx: &mut Context<Self>) {
         self.remember_history_state();
         if self.tabs[self.active].history.back() {
+            // The destination owns its presentation: resolve it from saved
+            // folder views, then the built-in default. Never inherit the view
+            // of the folder we are leaving.
+            self.apply_listing_defaults(&self.dir());
             self.apply_remembered_state();
             self.reload(cx);
         }
@@ -3323,6 +3327,7 @@ impl Explorer {
     fn go_forward(&mut self, cx: &mut Context<Self>) {
         self.remember_history_state();
         if self.tabs[self.active].history.forward() {
+            self.apply_listing_defaults(&self.dir());
             self.apply_remembered_state();
             self.reload(cx);
         }

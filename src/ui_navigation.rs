@@ -143,10 +143,13 @@ impl Explorer {
             && !path.to_string_lossy().starts_with("shell:")
         {
             let (x, y) = shell::cursor();
+            // Any folder currently shown in Quick Access (pinned, frequent or
+            // local favourite) must offer the remove action, not "pin".
             let quick_access_pinned = self
                 .system_quick_access
                 .iter()
-                .any(|item| item.path == path && item.pinned == Some(true));
+                .any(|item| item.path == path)
+                || self.settings.favorites.contains(&path);
             self.run_shell(
                 shell::Request::ThemedMenu {
                     folder: path.parent().unwrap_or(&path).to_path_buf(),
