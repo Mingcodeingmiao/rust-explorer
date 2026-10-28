@@ -8,10 +8,42 @@ use std::{
     process::{Command, Stdio},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
+
+/// Bumped when this process restores a network connection. A disconnected mapping
+/// keeps its drive letter and the Shell draws a red X over its icon, so the cached
+/// icon has to be asked for again once the connection is back.
+static NETWORK_ICON_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Bumped by "refresh" in This PC: capacity bars and connection overlays on the
+/// drive tiles come from the Shell, not from the path.
+static DRIVE_ICON_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// Process start in seconds. A drive icon carries status badges (BitLocker,
+/// warning, capacity) that the path does not describe, so it is re-read once per
+/// launch instead of being reused forever under one stable key.
+static DRIVE_ICON_SESSION: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+
+fn session_epoch() -> u64 {
+    *DRIVE_ICON_SESSION.get_or_init(|| {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    })
+}
+
+/// Make every network root ask the Shell for its icon again.
+pub fn refresh_network_icons() {
+    NETWORK_ICON_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
+
+/// Make every drive root ask the Shell for its icon again.
+pub fn refresh_drive_icons() {
+    DRIVE_ICON_EPOCH.fetch_add(1, Ordering::Relaxed);
+}
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
 pub struct IconRequest {
@@ -98,21 +130,36 @@ impl IconRequest {
             path: key,
             directory,
             pixels,
-            // A drive icon is cached under a stable key so a new process can paint it
-            // from disk on the first frame (an outdated badge is better than a blank
-            // square; "clear cache" refreshes it). Artwork folders and portable-device
-            // roots keep the time bucket because their icon can change on its own.
+            // A drive icon is re-read once per process launch: its status badges
+            // (BitLocker, warning, connection) are Shell state that the path does
+            // not describe, and a stale badge used to survive every restart.
+            // Network roots additionally re-read on a slow bucket because they can
+            // reconnect while the app runs, and "refresh" in This PC bumps them all
+            // immediately.
             epoch: if shell_root || custom_folder {
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs()
-                    / 30
+                icon_epoch(30)
+            } else if drive_root {
+                let base = if crate::network::is_network_root(path) {
+                    icon_epoch(60).wrapping_add(session_epoch())
+                } else {
+                    session_epoch()
+                };
+                base.wrapping_add(NETWORK_ICON_EPOCH.load(Ordering::Relaxed))
+                    .wrapping_add(DRIVE_ICON_EPOCH.load(Ordering::Relaxed))
             } else {
                 0
             },
         }
     }
+}
+
+/// Time bucket for icons whose artwork can change while the application runs.
+fn icon_epoch(period: u64) -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        / period
 }
 /// The already generated icon for this request, if any. Read from disk without a
 /// helper round trip so a restarted application paints cached icons immediately.
@@ -1160,15 +1207,33 @@ mod cache_tests {
 
         let drive = IconRequest::file(std::path::Path::new("C:\\"), true, 96);
         assert_eq!(drive.path, PathBuf::from("C:\\"));
-        // A drive icon uses a stable key: a fresh process paints the cached bitmap
-        // immediately instead of waiting for the Shell (an outdated badge is fine).
-        assert_eq!(drive.epoch, 0);
+        // A drive icon is re-read once per process launch (its badges are Shell
+        // state, not path state), so the key is stable inside one run only.
+        assert!(drive.epoch > 0);
+        assert_eq!(
+            IconRequest::file(std::path::Path::new("C:\\"), true, 96).epoch,
+            drive.epoch
+        );
         // Drive roots keep their own icon: it carries the drive type and overlays,
         // so it must never be replaced by the generic folder icon.
         assert_eq!(share_plain_folder_icon(drive.clone()).path, drive.path);
-        assert_eq!(share_plain_folder_icon(drive).epoch, 0);
+        assert_eq!(share_plain_folder_icon(drive.clone()).epoch, drive.epoch);
         let unc = IconRequest::file(std::path::Path::new("\\\\server\\share"), true, 96);
         assert_eq!(share_plain_folder_icon(unc.clone()).path, unc.path);
+        // A network root draws a connection overlay, which changes without the
+        // path changing: its key must not be frozen, or a mapping that was
+        // reconnected keeps the cached red X.
+        assert!(unc.epoch > 0);
+        let before = unc.epoch;
+        refresh_network_icons();
+        let after = IconRequest::file(std::path::Path::new("\\\\server\\share"), true, 96).epoch;
+        assert!(after > before);
+
+        // "Refresh" in This PC re-reads every drive root, local ones included.
+        let before = IconRequest::file(std::path::Path::new("C:\\"), true, 96).epoch;
+        refresh_drive_icons();
+        let after = IconRequest::file(std::path::Path::new("C:\\"), true, 96).epoch;
+        assert!(after > before);
 
         let text = IconRequest::file(std::path::Path::new("C:\\a\\x.txt"), false, 96);
         let upper = IconRequest::file(std::path::Path::new("D:\\b\\y.TXT"), false, 96);

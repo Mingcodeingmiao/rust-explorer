@@ -51,6 +51,32 @@ pub fn thumbnail_edge(logical: f32, width: u32, height: u32, scale: f32, folder:
     (width.max(height) as f32 / scale.max(0.5)).clamp(logical / 3., logical)
 }
 
+/// Display edge for a Shell icon bitmap that may be smaller than its slot.
+///
+/// A 32 px `.url` icon asked for the jumbo view used to be stretched to the whole
+/// slot, which is one big blurry picture. The artwork keeps its native size and
+/// is centered instead, but never below a third of the edge — a ninth of the
+/// slot's area, Explorer's minimum for a low-resolution icon.
+pub fn icon_edge(logical: f32, native: u32, scale: f32) -> f32 {
+    if logical <= 0. {
+        return 0.;
+    }
+    if native == 0 {
+        return logical;
+    }
+    (native as f32 / scale.max(0.5)).clamp(logical / 3., logical)
+}
+
+/// Pixel dimensions of a PNG asset, read from its IHDR chunk.
+pub fn png_size(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 24 || &bytes[..8] != b"\x89PNG\r\n\x1a\n" || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes([bytes[16], bytes[17], bytes[18], bytes[19]]);
+    let height = u32::from_be_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
 /// Jumbo image lists sometimes contain a 32px legacy icon in a 256px canvas.
 /// Center that real artwork and frame it rather than pinning it to the top.
 pub fn center_legacy_icon(size: u32, rgba: Vec<u8>) -> Vec<u8> {
@@ -175,6 +201,35 @@ mod tests {
             assert_eq!(thumbnail_edge(240., 256, 256, scale, true), 240.);
         }
         assert_eq!(thumbnail_edge(240., 48, 48, 1., false), 80.);
+    }
+    #[test]
+    fn low_resolution_file_icons_shrink_to_native_size_but_never_below_a_ninth() {
+        // Full-size artwork fills the slot; oversized artwork is clamped to it.
+        assert_eq!(icon_edge(257., 256, 1.), 256.);
+        assert_eq!(icon_edge(48., 256, 1.), 48.);
+        assert_eq!(icon_edge(16., 16, 1.), 16.);
+        // A 32 px .url icon in the jumbo view keeps its size, centered.
+        assert_eq!(icon_edge(257., 32, 1.), 257. / 3.);
+        // A mid-sized bitmap is neither stretched nor shrunk below the floor.
+        assert_eq!(icon_edge(257., 96, 1.), 96.);
+        // Device pixels are converted to logical pixels first.
+        assert_eq!(icon_edge(128., 192, 2.), 96.);
+        assert_eq!(icon_edge(0., 32, 1.), 0.);
+        assert_eq!(icon_edge(64., 0, 1.), 64.);
+    }
+    #[test]
+    fn png_dimensions_come_from_the_header() {
+        let image = image::RgbaImage::from_pixel(7, 5, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = Vec::new();
+        image
+            .write_to(
+                &mut std::io::Cursor::new(&mut bytes),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        assert_eq!(png_size(&bytes), Some((7, 5)));
+        assert_eq!(png_size(b"not a png at all, really"), None);
+        assert_eq!(png_size(&[]), None);
     }
     #[test]
     fn legacy_artwork_is_centered_and_full_size_art_is_untouched() {

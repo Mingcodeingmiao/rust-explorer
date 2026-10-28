@@ -32,6 +32,8 @@ use std::{collections::HashMap, time::Instant};
 mod extras;
 #[path = "ui_navigation.rs"]
 mod navigation;
+#[path = "ui_operations.rs"]
+mod operations_window;
 use extras::*;
 
 actions!(
@@ -215,16 +217,17 @@ impl Render for RecycledRow {
     }
 }
 
-struct SystemOperation {
-    id: u64,
+/// One row of a breadcrumb dropdown.
+#[derive(Clone)]
+struct CrumbRow {
     label: String,
-    started: Instant,
-    finished: Option<Instant>,
-    status: String,
-    control: shell::OperationControl,
+    path: PathBuf,
+    /// Named glyph for app pages and Shell locations that have no filesystem
+    /// icon (`::Network`, the Recycle Bin, This PC, Control Panel).
+    glyph: Option<&'static str>,
 }
+
 struct Explorer {
-    system_operations: Vec<SystemOperation>,
     next_operation: u64,
     marquee: Option<Marquee>,
     settings: Settings,
@@ -255,12 +258,31 @@ struct Explorer {
     thumbnails: rust_explorer::thumbnails::Loader,
     thumbnail_images: Entity<visual::ThumbnailImages>,
     thumbnail_viewport: std::cell::Cell<Option<(u64, usize, usize, u32, u64)>>,
-    /// (listing generation, pixels) whose full-folder prefetch was already queued.
-    thumbnail_prefetch: std::cell::Cell<Option<(u64, u32)>>,
-    /// (listing generation, pixels) whose real per-item icons were already queued.
-    icon_prefetch: std::cell::Cell<Option<(u64, u32)>>,
+    /// (listing generation, pixels, immediate mode) whose full-folder prefetch
+    /// was already queued.
+    thumbnail_prefetch: std::cell::Cell<Option<(u64, u32, bool)>>,
+    /// Every previewable item of the current listing, for the status-bar counter.
+    thumbnail_keys: std::cell::RefCell<Vec<rust_explorer::thumbnails::Key>>,
+    /// Generated previews of `thumbnail_keys`, recomputed when one arrives.
+    thumbnail_ready: std::cell::Cell<usize>,
+    thumbnail_ready_dirty: std::cell::Cell<bool>,
+    /// (listing generation, pixel size, immediate mode) whose real per-item icons
+    /// were already queued.
+    icon_prefetch: std::cell::Cell<Option<(u64, u32, bool)>>,
+    /// Real per-item icon requests queued for the current listing.
+    icon_keys: std::cell::RefCell<Vec<rust_explorer::native_assets::IconRequest>>,
+    /// Resolved icons of `icon_keys`, recomputed when one arrives.
+    icon_ready: std::cell::Cell<usize>,
+    icon_ready_dirty: std::cell::Cell<bool>,
     thumbnail_sync_queued: std::cell::Cell<bool>,
     hidden_breadcrumbs: std::cell::RefCell<Vec<(String, PathBuf)>>,
+    /// Folder whose children the breadcrumb chevron dropdown lists.
+    crumb_children_path: Option<PathBuf>,
+    /// Child of that folder on the current path, highlighted in the dropdown.
+    crumb_children_current: Option<PathBuf>,
+    crumb_children: Vec<CrumbRow>,
+    crumb_children_loading: bool,
+    crumb_scroll: ScrollHandle,
     view: ViewMode,
     group: String,
     filters: rust_explorer::file_filter::Filters,
@@ -294,6 +316,8 @@ struct Explorer {
     drag_rx: mpsc::Receiver<TabDrop>,
     drag_tx: mpsc::Sender<TabDrop>,
     own_window: Option<AnyWindowHandle>,
+    /// The operations window, reused (and re-activated) by the status bar.
+    operations_window: Option<WindowHandle<operations_window::OperationsWindow>>,
     tab_drag: Option<Arc<AtomicBool>>,
     tab_tip: Option<crate::tab_tip::TabTip>,
     /// Scale the tab card was built for (zoom × monitor DPI).
@@ -841,9 +865,20 @@ impl Explorer {
             thumbnail_images: visual::ThumbnailImages::new(cx),
             thumbnail_viewport: std::cell::Cell::new(None),
             thumbnail_prefetch: std::cell::Cell::new(None),
+            thumbnail_keys: std::cell::RefCell::new(Vec::new()),
+            thumbnail_ready: std::cell::Cell::new(0),
+            thumbnail_ready_dirty: std::cell::Cell::new(false),
             icon_prefetch: std::cell::Cell::new(None),
+            icon_keys: std::cell::RefCell::new(Vec::new()),
+            icon_ready: std::cell::Cell::new(0),
+            icon_ready_dirty: std::cell::Cell::new(false),
             thumbnail_sync_queued: std::cell::Cell::new(false),
             hidden_breadcrumbs: std::cell::RefCell::new(Vec::new()),
+            crumb_children_path: None,
+            crumb_children_current: None,
+            crumb_children: Vec::new(),
+            crumb_children_loading: false,
+            crumb_scroll: ScrollHandle::new(),
             rows: vec![],
             content_image_present: false,
             filters: Default::default(),
@@ -882,6 +917,7 @@ impl Explorer {
             drag_rx,
             drag_tx,
             own_window: Some(window.window_handle()),
+            operations_window: None,
             tab_drag: None,
             tab_tip: None,
             tab_tip_scale: 1.0,
@@ -941,7 +977,6 @@ impl Explorer {
             descending: false,
             loading: false,
             busy: false,
-            system_operations: Vec::new(),
             next_operation: 0,
             system_menu_active: false,
             undo_stack: Vec::new(),
@@ -1050,17 +1085,6 @@ impl Explorer {
                                 }
                             }
                         }
-                        if this
-                            .popup
-                            .as_ref()
-                            .is_some_and(|(kind, _)| kind == "system-operations")
-                            && this
-                                .system_operations
-                                .iter()
-                                .any(|op| op.finished.is_none())
-                        {
-                            cx.notify();
-                        }
                         if !this.volume_busy && this.volume_tick.elapsed() > Duration::from_secs(3)
                         {
                             this.refresh_volumes(cx);
@@ -1103,6 +1127,9 @@ impl Explorer {
                             }
                         }
                         if visual::drain() | this.thumbnails.changed() {
+                            // A preview or per-item icon arrived: the counters are stale.
+                            this.thumbnail_ready_dirty.set(true);
+                            this.icon_ready_dirty.set(true);
                             cx.notify();
                         }
                         this.watch_pending |= this.watch_rx.try_iter().count() > 0;
@@ -1248,6 +1275,12 @@ impl Explorer {
         ));
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if path == std::path::Path::new(navigation::CONTROL_PANEL) {
+            // The Control Panel's items are Shell virtual folders this app cannot
+            // operate on, so the address is handed to Windows instead of listed.
+            self.open_control_panel(cx);
+            return;
+        }
         if self.popup.is_some() {
             self.popup = None;
             self.submenu = None;
@@ -1290,6 +1323,98 @@ impl Explorer {
         self.search
             .update(cx, |v, cx| v.set_value(String::new(), cx));
         self.reload(cx);
+    }
+    /// Refresh the current folder. This PC's drive tiles carry capacity bars and
+    /// connection overlays that come from the Shell rather than the path, so the
+    /// icon cache is invalidated there instead of repainting the old bitmaps.
+    fn refresh_current(&mut self, cx: &mut Context<Self>) {
+        if volumes::is_computer(&self.dir()) || self.dir() == PathBuf::from("::Network") {
+            rust_explorer::native_assets::refresh_drive_icons();
+            self.volume_capacity_tick = Instant::now() - Duration::from_secs(60);
+            self.refresh_volumes(cx);
+        }
+        self.reload(cx);
+    }
+    /// Open the folder-contents dropdown of a breadcrumb chevron. Like Explorer,
+    /// the chevron becomes a down arrow and lists what the segment to its left
+    /// contains, with the folder on the current path marked.
+    fn open_crumb_children(
+        &mut self,
+        path: PathBuf,
+        current: Option<PathBuf>,
+        position: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let open = self
+            .popup
+            .as_ref()
+            .is_some_and(|(kind, _)| kind == "crumb-children")
+            && self.crumb_children_path.as_ref() == Some(&path);
+        if open {
+            self.popup = None;
+            self.crumb_children_path = None;
+            self.crumb_children.clear();
+            cx.notify();
+            return;
+        }
+        self.popup = Some(("crumb-children".into(), position));
+        self.submenu = None;
+        self.nested_submenu = None;
+        self.crumb_children_path = Some(path.clone());
+        self.crumb_children_current = current;
+        self.crumb_children.clear();
+        self.crumb_children_loading = false;
+        self.crumb_scroll.set_offset(point(px(0.), px(0.)));
+        // App pages and Shell places have no filesystem listing of their own:
+        // their rows come from the window's own state.
+        let virtual_children = if path == PathBuf::from("::RootPlaces") {
+            Some(self.root_place_rows())
+        } else if volumes::is_computer(&path) {
+            Some(self.volume_rows(false))
+        } else if path == PathBuf::from("::Network") {
+            Some(self.volume_rows(true))
+        } else {
+            None
+        };
+        if let Some(rows) = virtual_children {
+            self.crumb_children = rows;
+            cx.notify();
+            return;
+        }
+        self.crumb_children_loading = true;
+        let load = path.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let task = cx
+            .background_executor()
+            .spawn(async move { rust_explorer::fs::read_directory(&load, &cancel) });
+        cx.spawn(async move |view, cx| {
+            let result = task.await;
+            let _ = view.update(cx, |v, cx| {
+                if v.crumb_children_path.as_deref() != Some(path.as_path()) {
+                    return;
+                }
+                v.crumb_children_loading = false;
+                if let Ok((entries, _)) = result {
+                    let mut folders: Vec<Entry> = entries
+                        .into_iter()
+                        .filter(|entry| entry.directory)
+                        .collect();
+                    rust_explorer::fs::sort(&mut folders, Sort::Name, false);
+                    folders.truncate(2048);
+                    v.crumb_children = folders
+                        .into_iter()
+                        .map(|entry| CrumbRow {
+                            label: entry.name,
+                            path: entry.path,
+                            glyph: None,
+                        })
+                        .collect();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
     fn reload(&mut self, cx: &mut Context<Self>) {
         let path = self.dir();
@@ -1380,6 +1505,12 @@ impl Explorer {
             return;
         }
         let shell_folder = navigation::is_shell_folder(&path);
+        // A bare `\\server` address has no filesystem entry point at all: its
+        // content is the shares the server publishes, the way Explorer lists
+        // that address. Search inside such a folder makes no sense.
+        let server_root = !shell_folder
+            && query.trim().is_empty()
+            && rust_explorer::network::is_server_root(&path);
         let virtual_search = navigation::is_app_virtual(&path);
         let path = if virtual_search {
             PathBuf::from(format!(
@@ -1420,6 +1551,28 @@ impl Explorer {
                     }
                     let status = rust_explorer::trf!("{} 个项目 · {}", entries.len(), listing.name);
                     return Ok((entries, status, None, Some((listing.name, listing.parents))));
+                }
+                if server_root {
+                    let mut entries: Vec<Entry> = rust_explorer::network::shares_bounded(&path)?
+                        .iter()
+                        .map(rust_explorer::network::Share::entry)
+                        .collect();
+                    fs::sort(&mut entries, sort, descending);
+                    if !folders_first {
+                        entries.sort_by(|a, b| compare_entries(a, b, sort, descending));
+                    }
+                    let status = rust_explorer::trf!(
+                        "{} 个项目 · {}",
+                        entries.len(),
+                        navigation::location_name(&path)
+                    );
+                    return Ok((entries, status, None, None));
+                }
+                // A mapping whose server was unreachable at sign-in keeps its
+                // drive letter but loses its root directory. Restore it before
+                // the listing, like Explorer does when that drive is opened.
+                if rust_explorer::network::needs_mount(&path) {
+                    let _ = rust_explorer::network::mount_bounded(&path);
                 }
                 let (mut entries, status) = if query.trim().is_empty() {
                     let (items, skipped) = fs::read_directory(&path, &cancel)?;
@@ -1563,8 +1716,10 @@ impl Explorer {
                                 this.pending_rename = true;
                             }
                         }
-                        // Back/forward/up: reselect what was selected here and
-                        // scroll back to it (or to the remembered row).
+                        // Back/forward/up and tab switches: reselect what was
+                        // selected here and restore the remembered first visible
+                        // row exactly. The restored viewport wins over the
+                        // selection, which used to be scrolled to the top.
                         if let Some(restore) = this.pending_restore.take() {
                             for path in &restore.selection {
                                 if let Some(index) =
@@ -1581,8 +1736,17 @@ impl Explorer {
                                 this.anchor = index;
                                 this.focus_item = Some(this.entries[index].path.clone());
                                 this.keyboard_cursor = this.focus_item.clone();
-                                this.reveal_scroll = this.focus_item.clone();
-                            } else if restore.row > 0. {
+                                // A remembered row is restored as it was, even
+                                // when the selection is outside it. Only a
+                                // folder opened at its top (navigation to the
+                                // parent that selects the folder just left, or
+                                // a reveal from outside) has to bring the item
+                                // into view.
+                                if restore.row <= 0. {
+                                    this.reveal_scroll = this.focus_item.clone();
+                                }
+                            }
+                            if restore.row > 0. {
                                 this.pending_scroll_row = Some(restore.row);
                             }
                         }
@@ -2042,13 +2206,7 @@ impl Explorer {
         released
     }
     fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
-        if self
-            .system_operations
-            .iter()
-            .filter(|op| op.finished.is_none())
-            .count()
-            >= 8
-        {
+        if rust_explorer::operations::running() >= 8 {
             self.error = Some(
                 rust_explorer::i18n::text("同时运行的系统操作过多，请先停止或关闭现有操作").into(),
             );
@@ -2081,7 +2239,10 @@ impl Explorer {
                 | shell::Request::AdvancedShare { .. }
                 | shell::Request::InvokeVerb { .. }
         );
-        if self.busy && !passive {
+        // File operations run in their own killable helper and may overlap; the
+        // exclusive `busy` flag is for menus, dialogs and other interactive work.
+        let concurrent = runs_concurrently(&request);
+        if self.busy && !passive && !concurrent {
             return;
         }
         let system_menu = matches!(
@@ -2093,29 +2254,15 @@ impl Explorer {
         if system_menu {
             self.system_menu_active = true;
         }
-        if !passive {
+        if !passive && !concurrent {
             self.busy = true;
         }
         self.next_operation += 1;
         let operation_id = self.next_operation;
         let control = shell::OperationControl::default();
-        if self.system_operations.len() >= 32 {
-            if let Some(index) = self
-                .system_operations
-                .iter()
-                .position(|op| op.finished.is_some())
-            {
-                self.system_operations.remove(index);
-            }
-        }
-        self.system_operations.push(SystemOperation {
-            id: operation_id,
-            label: shell::operation_label(&request),
-            started: Instant::now(),
-            finished: None,
-            status: rust_explorer::i18n::text("正在进行").into(),
-            control: control.clone(),
-        });
+        let label = shell::operation_label(&request);
+        let details = operation_details(&request);
+        rust_explorer::operations::begin(operation_id, label, details, control.clone());
         self.error = None;
         let recycle_menu = match &request {
             shell::Request::Menu { folder, .. } | shell::Request::ThemedMenu { folder, .. } => {
@@ -2190,31 +2337,25 @@ impl Explorer {
         cx.spawn(async move |view, cx| {
             let (result, history) = task.await;
             view.update(cx, |this, cx| {
-                if let Some(op) = this
-                    .system_operations
-                    .iter_mut()
-                    .find(|op| op.id == operation_id)
+                let status = if rust_explorer::operations::stopping(operation_id) {
+                    rust_explorer::i18n::text("已停止（请确认部分操作结果）").to_string()
+                } else if let Err(error) = &result {
+                    rust_explorer::trf!("失败：{error:#}")
+                } else if let Some(error) =
+                    history.as_ref().and_then(|history| history.error.as_ref())
                 {
-                    op.finished = Some(Instant::now());
-                    op.status = if op.control.stopping() {
-                        rust_explorer::i18n::text("已停止（请确认部分操作结果）").into()
-                    } else if let Err(error) = &result {
-                        rust_explorer::trf!("失败：{error:#}")
-                    } else if let Some(error) =
-                        history.as_ref().and_then(|history| history.error.as_ref())
-                    {
-                        rust_explorer::trf!("失败：{error}")
-                    } else {
-                        rust_explorer::i18n::text("已完成").into()
-                    };
-                }
+                    rust_explorer::trf!("失败：{error}")
+                } else {
+                    rust_explorer::i18n::text("已完成").to_string()
+                };
+                rust_explorer::operations::finish(operation_id, status);
                 if invalidates_usage {
                     disk_usage::invalidate_cache();
                 }
                 if system_menu {
                     this.system_menu_active = false;
                 }
-                if !passive {
+                if !passive && !concurrent {
                     this.busy = false;
                 }
                 if let Some(response) = history {
@@ -3327,12 +3468,7 @@ impl Explorer {
             self.select(index, false, extend, window, cx);
         }
         self.keyboard_cursor = Some(self.entries[index].path.clone());
-        if let Some(row) = self
-            .rows
-            .iter()
-            .position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index))
-                || matches!(r, DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i == index))))
-        {
+        if let Some(row) = self.display_row(index) {
             if self.high_performance_active() {
                 let top = self.high_performance_row.get().floor() as usize;
                 let visible_rows = self.high_performance_visible.get().max(1);
@@ -3347,24 +3483,42 @@ impl Explorer {
                 // the viewport have no height yet, so anchor distant jumps by
                 // index.
                 if row < top || row >= top.saturating_add(visible_rows) {
-                    self.list_scroll
-                        .scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
+                    self.list_scroll.scroll_to(ListOffset {
+                        item_ix: row,
+                        offset_in_item: px(0.),
+                    });
                 } else {
                     self.list_scroll.scroll_to_reveal_item(row);
                 }
             }
             if let DisplayRow::List(cells) = &self.rows[row] {
-                if let Some(column) = cells.iter().position(|c| matches!(c,ListCell::File(i) if *i == index)) {
+                if let Some(column) = cells
+                    .iter()
+                    .position(|c| matches!(c,ListCell::File(i) if *i == index))
+                {
                     let left = column as f32 * 230. * self.zoom;
                     let viewport = self.layout_width * self.zoom;
                     let mut p = self.content_scroll.offset();
-                    if left < -f32::from(p.x) {p.x = px(-left);}
-                    else if left + 230. * self.zoom > -f32::from(p.x) + viewport { p.x = px(viewport - left - 230. * self.zoom); }
+                    if left < -f32::from(p.x) {
+                        p.x = px(-left);
+                    } else if left + 230. * self.zoom > -f32::from(p.x) + viewport {
+                        p.x = px(viewport - left - 230. * self.zoom);
+                    }
                     self.content_scroll.set_offset(p);
                 }
             }
         }
         cx.notify();
+    }
+    /// Display row that holds an entry, when the current view shows it.
+    fn display_row(&self, index: usize) -> Option<usize> {
+        self.rows.iter().position(|row| match row {
+            DisplayRow::Items(items) => items.contains(&index),
+            DisplayRow::List(cells) => cells
+                .iter()
+                .any(|cell| matches!(cell, ListCell::File(value) if *value == index)),
+            DisplayRow::Group { .. } => false,
+        })
     }
     /// First visible row, in row units, for the current view.
     fn scroll_row(&self) -> f32 {
@@ -3457,6 +3611,23 @@ impl Explorer {
     fn go_up(&mut self, cx: &mut Context<Self>) {
         let path = self.dir();
         if navigation::is_app_virtual(&path) {
+            return;
+        }
+        if rust_explorer::network::is_server_root(&path) {
+            // A `\\server` root sits under Network. Its `parent()` is the
+            // root-only `\`, which is not a location.
+            self.navigate(PathBuf::from("::Network"), cx);
+            return;
+        }
+        // `Path::parent` stops at the share prefix, so a share root has to name
+        // its server explicitly. Selecting the folder that was left matches the
+        // behaviour of the other branches.
+        if rust_explorer::network::is_share_root(&path)
+            && let Some(server) = rust_explorer::network::server_root(&path)
+        {
+            let share = path.clone();
+            self.navigate(server, cx);
+            self.focus_after_load(share);
             return;
         }
         if navigation::is_shell_folder(&path) {
@@ -3552,12 +3723,18 @@ impl Explorer {
         self.address_choice = None;
         self.address_generation = self.address_generation.wrapping_add(1);
         window.focus(&self.focus);
-        if navigation::is_virtual(&path) {
+        if navigation::is_virtual(&path) || rust_explorer::network::is_server_root(&path) {
             self.navigate(path, cx);
         } else {
-            let task = cx
-                .background_executor()
-                .spawn(async move { Entry::from_path(path) });
+            let task = cx.background_executor().spawn(async move {
+                // The metadata probe fails on a drive that is not mounted
+                // yet, before navigation can restore it. Restore it here
+                // (bounded helper; a dead server cannot stall this thread).
+                if rust_explorer::network::needs_mount(&path) {
+                    let _ = rust_explorer::network::mount_bounded(&path);
+                }
+                Entry::from_path(path)
+            });
             cx.spawn(async move |view, cx| {
                 let result = task.await;
                 let _ = view.update(cx, |v, cx| {
@@ -3725,6 +3902,104 @@ fn icon_button(id: impl Into<ElementId>, icon: &str, t: Theme) -> Stateful<Div> 
         .child(visual::icon(icon, t.text))
 }
 
+/// Requests that carry out a file operation in their own killable helper
+/// process. They may overlap each other; menus, dialogs and undo/redo stay
+/// exclusive through the `busy` flag.
+fn runs_concurrently(request: &shell::Request) -> bool {
+    matches!(
+        request,
+        shell::Request::Copy { .. }
+            | shell::Request::Transfer { .. }
+            | shell::Request::Delete { .. }
+            | shell::Request::PermanentDelete { .. }
+            | shell::Request::Rename { .. }
+            | shell::Request::Shortcut { .. }
+            | shell::Request::EmptyRecycleBin
+    )
+}
+
+/// One line describing what a request acts on, shown in the operations window.
+/// Paths only: the label already names the action in the user's language.
+fn operation_details(request: &shell::Request) -> String {
+    fn summary(paths: &[PathBuf]) -> String {
+        let mut text = paths
+            .iter()
+            .take(3)
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if paths.len() > 3 {
+            text.push_str(", …");
+        }
+        text
+    }
+    match request {
+        shell::Request::Copy {
+            paths, destination, ..
+        }
+        | shell::Request::Transfer {
+            paths, destination, ..
+        } => format!("{} → {}", summary(paths), destination.display()),
+        shell::Request::Delete { paths } | shell::Request::PermanentDelete { paths } => {
+            summary(paths)
+        }
+        shell::Request::Rename { path, name } => format!("{} → {name}", path.display()),
+        shell::Request::Shortcut {
+            target,
+            destination,
+        } => {
+            format!("{} → {}", target.display(), destination.display())
+        }
+        // A right-click menu is described by the folder it was opened in and how
+        // many items it targets.
+        shell::Request::Menu { paths, folder, .. }
+        | shell::Request::ThemedMenu { paths, folder, .. }
+        | shell::Request::InspectMenu { paths, folder, .. } => {
+            if paths.is_empty() {
+                folder.display().to_string()
+            } else {
+                format!(
+                    "{} · {}",
+                    folder.display(),
+                    rust_explorer::trf!("{} 个项目", paths.len())
+                )
+            }
+        }
+        shell::Request::ComputerMenu { .. } => rust_explorer::i18n::text("此电脑").to_string(),
+        shell::Request::Open { path }
+        | shell::Request::Properties { path }
+        | shell::Request::FontPreview { path }
+        | shell::Request::VolumeLabel { path }
+        | shell::Request::AdvancedShare { path }
+        | shell::Request::RecordCreated { path }
+        | shell::Request::SharingAccess { path, .. } => path.display().to_string(),
+        shell::Request::PropertiesMany { paths } | shell::Request::Share { paths } => {
+            summary(paths)
+        }
+        shell::Request::InvokeVerb { paths, verb } => {
+            format!("{verb} · {}", summary(paths))
+        }
+        shell::Request::QuickAccessPin { path, .. } => path.display().to_string(),
+        shell::Request::RenameVolume { path, label } => {
+            format!("{} → {label}", path.display())
+        }
+        shell::Request::RenameComputer { name, .. } => name.clone().unwrap_or_default(),
+        // Undo/redo: the items the recorded transaction acts on.
+        shell::Request::History { transaction } => {
+            let paths: Vec<PathBuf> = transaction
+                .actions
+                .iter()
+                .map(|action| match action {
+                    rust_explorer::file_history::Action::Move { from, .. } => from.clone(),
+                    rust_explorer::file_history::Action::Recycle { path, .. } => path.clone(),
+                })
+                .collect();
+            summary(&paths)
+        }
+        _ => String::new(),
+    }
+}
+
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.install_native_drop(window);
@@ -3788,21 +4063,32 @@ impl Render for Explorer {
             self.rebuild_rows();
             self.list_scroll.scroll_to(offset);
         }
-        if let Some(path) = self.reveal_scroll.take() {
-            if let Some(index) = self.entries.iter().position(|e| e.path == path) {
-                if let Some(row) = self.rows.iter().position(|r| matches!(r,DisplayRow::Items(items) if items.contains(&index)) || matches!(r,DisplayRow::List(cells) if cells.iter().any(|c| matches!(c,ListCell::File(i) if *i==index)))) {
-                    self.set_high_performance_row(row as f32);
-                    self.list_scroll.scroll_to(ListOffset { item_ix: row, offset_in_item: px(0.) });
-                }
-            }
-        }
-        if let Some(row) = self.pending_scroll_row.take() {
-            // Nothing was selected in the folder we came back to: restore only the
-            // scroll position.
+        // Restore the remembered first visible row before anything looks at the
+        // selection: the viewport must not move to the selected item, which is
+        // what put the selected folder at the top after switching tabs.
+        let restored_row = self.pending_scroll_row.take().map(|row| {
             let max = self.rows.len().saturating_sub(1) as f32;
             let row = row.clamp(0., max);
             self.high_performance_row.set(row);
             self.set_list_scroll_row(row);
+            row
+        });
+        if let Some(path) = self.reveal_scroll.take() {
+            if let Some(index) = self.entries.iter().position(|e| e.path == path) {
+                if let Some(row) = self.display_row(index) {
+                    // An item the restored rows already show stays where it is;
+                    // otherwise it is brought in to the nearest edge.
+                    let top = restored_row.unwrap_or_else(|| self.scroll_row());
+                    let visible =
+                        self.layout_height / (self.estimated_row_height() * self.zoom).max(1.);
+                    if let Some(target) =
+                        rust_explorer::scroll_restore::reveal_after_restore(top, row, visible)
+                    {
+                        self.high_performance_row.set(target);
+                        self.set_list_scroll_row(target);
+                    }
+                }
+            }
         }
         self.sync_thumbnails();
         self.prefetch_entry_icons();
@@ -4085,7 +4371,7 @@ impl Render for Explorer {
             }))
             .on_action(cx.listener(|v, _: &Refresh, _, cx| {
                 if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
-                    v.reload(cx);
+                    v.refresh_current(cx);
                 }
             }))
             .on_action(cx.listener(|v, _: &Address, w, cx| {
@@ -4524,7 +4810,7 @@ impl Render for Explorer {
                 "back" => v.go_back(cx),
                 "forward" => v.go_forward(cx),
                 "up" => v.go_up(cx),
-                _ => v.reload(cx),
+                _ => v.refresh_current(cx),
             });
             nav = nav.child(if id == "refresh" {
                 // Match the other navigation buttons while retaining a centered glyph.
@@ -5412,12 +5698,7 @@ impl Render for Explorer {
             body = body.child(pane);
         }
         root = root.child(body);
-        let status = if self.busy
-            || self
-                .system_operations
-                .iter()
-                .any(|op| op.finished.is_none())
-        {
+        let status = if self.busy || rust_explorer::operations::running() > 0 {
             rust_explorer::i18n::text("正在处理系统操作…").to_owned()
         } else if self.loading {
             rust_explorer::i18n::text("正在加载…").to_owned()
@@ -5458,6 +5739,26 @@ impl Render for Explorer {
                 }
             )
         };
+        // Preview progress of the current listing, appended to the status text so
+        // it sits right beside the item count and cannot be clipped away.
+        let mut progress = String::new();
+        if self.tabs[self.active].query.trim().is_empty() && !self.loading {
+            let thumbnails = self.thumbnail_keys.borrow().len();
+            if thumbnails > 0 {
+                progress.push_str(&format!(
+                    " · {}",
+                    rust_explorer::trf!("缩略图 {}/{}", self.thumbnail_ready.get(), thumbnails)
+                ));
+            }
+            let icons = self.icon_keys.borrow().len();
+            if icons > 0 {
+                progress.push_str(&format!(
+                    " · {}",
+                    rust_explorer::trf!("图标 {}/{}", self.icon_ready.get(), icons)
+                ));
+            }
+        }
+        let status = format!("{status}{progress}");
         root = root.child(
             div()
                 .h(ui(32.))
@@ -5481,41 +5782,28 @@ impl Render for Explorer {
                                 .id("system-operation-details")
                                 .cursor_pointer()
                                 .child(status)
-                                .on_click(cx.listener(|v, _, w, cx| {
-                                    v.popup =
-                                        Some(("system-operations".into(), w.mouse_position()));
-                                    cx.notify();
+                                .on_click(cx.listener(|v, _, _, cx| {
+                                    if let Err(error) = v.open_operations_window(cx) {
+                                        v.error = Some(error.to_string());
+                                        cx.notify();
+                                    }
                                 })),
                         )
-                        .when(
-                            self.system_operations
-                                .iter()
-                                .any(|op| op.finished.is_none()),
-                            |d| {
-                                d.child(
-                                    button(
-                                        "system-operation-stop",
-                                        rust_explorer::i18n::text("停止"),
-                                        t,
-                                    )
-                                    .on_click(cx.listener(
-                                        |v, _, _, cx| {
-                                            for op in v
-                                                .system_operations
-                                                .iter_mut()
-                                                .filter(|op| op.finished.is_none())
-                                            {
-                                                op.control.stop(false);
-                                                op.status =
-                                                    rust_explorer::i18n::text("正在请求停止")
-                                                        .into();
-                                            }
-                                            cx.notify();
-                                        },
-                                    )),
+                        .when(rust_explorer::operations::running() > 0, |d| {
+                            d.child(
+                                button(
+                                    "system-operation-stop",
+                                    rust_explorer::i18n::text("停止"),
+                                    t,
                                 )
-                            },
-                        ),
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
+                                        rust_explorer::operations::stop_all(false);
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                        }),
                 )
                 .child(rust_explorer::trf!(
                     "{:.0}% · Ctrl +/− 缩放 · Ctrl+0 重置",
@@ -5842,8 +6130,10 @@ impl Render for Explorer {
 
 pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
     rust_explorer::fluent_icons::initialize();
-    // Context menus are now built in-process, so there is no helper to pre-warm;
-    // the Shell's handlers are loaded together with the application's own COM.
+    // Menus are built in-process, so the first right-click pays the cold load of
+    // every registered Shell extension. Warm that path in the background while the
+    // window is still opening instead of on the first click.
+    rust_explorer::shell::prewarm_in_process_menu();
     Application::new()
         .with_assets(rust_explorer::fluent_icons::Assets)
         .run(move |cx: &mut App| {

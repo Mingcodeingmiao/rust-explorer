@@ -20,6 +20,23 @@ pub fn recycled_row_count(viewport_height: f32, zoom: f32, total_rows: usize) ->
     total_rows.min(((viewport_height.max(0.) * zoom + 320.) / (26. * zoom)).ceil() as usize + 2)
 }
 
+/// Whether the drawn link badge is needed for an item whose current artwork is a
+/// thumbnail (`has_thumbnail`) or the Shell bitmap fallback.
+///
+/// A thumbnail of a shortcut or reparse link shows the target's picture and has no
+/// overlay, so the marker is drawn on top. The Shell bitmap already owns the arrow
+/// for `.lnk`/`.url`; only reparse-point links need the marker there. `.url` icons
+/// always draw their own arrow, so they never get a drawn badge.
+pub fn needs_link_badge(link: bool, has_thumbnail: bool, shortcut: bool, url: bool) -> bool {
+    if !link || url {
+        return false;
+    }
+    if has_thumbnail {
+        return true;
+    }
+    !shortcut
+}
+
 /// Whether a right click targets one item cell. An unselected item only answers
 /// a hit on its icon, text or metadata regions; an item that is already
 /// selected answers anywhere inside its own cell.
@@ -40,6 +57,19 @@ pub fn right_click_hits(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn link_badges_follow_the_artwork_that_is_actually_shown() {
+        // Thumbnails show the target's picture: any link needs the marker.
+        assert!(needs_link_badge(true, true, true, false));
+        assert!(needs_link_badge(true, true, false, false));
+        // The Shell bitmap of a .lnk already carries the arrow; a junction does not.
+        assert!(!needs_link_badge(true, false, true, false));
+        assert!(needs_link_badge(true, false, false, false));
+        // .url never gets a drawn badge, and plain items never do either.
+        assert!(!needs_link_badge(true, true, true, true));
+        assert!(!needs_link_badge(true, false, true, true));
+        assert!(!needs_link_badge(false, true, false, false));
+    }
     #[test]
     fn requested_chrome_and_drive_ratios_fit_fixed_tiles() {
         assert!((DRIVE_TILE_ICON / 40. - 1.17).abs() < 0.001);

@@ -88,6 +88,26 @@ fn main() {
             );
             Ok(())
         })(),
+        // Restoring a disconnected mapped drive blocks in the SMB redirector;
+        // the GUI runs it here so a dead server cannot stall a window thread.
+        Some("--network-mount") => (|| -> anyhow::Result<()> {
+            let raw = args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?;
+            let path: std::path::PathBuf =
+                serde_json::from_str(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
+            rust_explorer::network::mount(&path)?;
+            println!("true");
+            Ok(())
+        })(),
+        Some("--network-shares") => (|| -> anyhow::Result<()> {
+            let raw = args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?;
+            let path: std::path::PathBuf =
+                serde_json::from_str(raw).unwrap_or_else(|_| std::path::PathBuf::from(raw));
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::network::list_shares(&path)?)?
+            );
+            Ok(())
+        })(),
         Some("--shell-resolve") => (|| -> anyhow::Result<()> {
             let text: String =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;

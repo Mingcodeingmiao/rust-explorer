@@ -270,6 +270,20 @@ pub fn clear_cache() {
 pub fn prefetch_icons(keys: Vec<IconRequest>) {
     ICONS.with(|icons| icons.borrow_mut().prefetch(keys));
 }
+/// How many of these icon requests already have a resolved bitmap. Used for the
+/// status bar progress next to the thumbnail counter.
+pub fn ready_icons(keys: &[IconRequest]) -> usize {
+    ICONS.with(|icons| {
+        let icons = icons.borrow();
+        keys.iter()
+            .filter(|key| {
+                let mut key = (*key).clone();
+                key.epoch = key.epoch.wrapping_add(icons.generation << 32);
+                icons.images.get(&key).is_some_and(|image| image.is_some())
+            })
+            .count()
+    })
+}
 pub fn set_pixels(pixels: u32) {
     ICONS.with(|v| v.borrow_mut().pixels = pixels.clamp(16, 96));
 }
@@ -419,8 +433,13 @@ pub fn icon_sized(name: &str, color: u32, logical: f32) -> AnyElement {
 pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
     file_icon_sized(path, directory, color, 16.)
 }
-/// Badge for reparse links whose shared class icon has no Shell overlay.
-/// Do not add to .lnk/.url icons: their per-item Shell bitmap owns its arrow.
+/// Badge for links whose displayed artwork carries no Shell arrow.
+///
+/// A thumbnail of a link shows the target's picture, which has no overlay, so
+/// the marker is drawn on top. The Shell-bitmap fallback already owns the arrow
+/// for `.lnk`/`.url`; only reparse-point links (junctions, symlinks) still need
+/// the marker there. `.url` icons always draw their own arrow, so they never get
+/// one. The decision itself lives in [`rust_explorer::layout_metrics::needs_link_badge`].
 ///
 /// The Shell exposes the link overlay only as part of a complete icon (there is no
 /// standalone overlay bitmap API), so the arrow stays drawn; its size follows the
@@ -428,7 +447,7 @@ pub fn file_icon(path: &Path, directory: bool, color: u32) -> AnyElement {
 pub fn link_badge(logical: f32) -> AnyElement {
     // One badge per item, sized from the icon: a fixed 16 px box looked oversized
     // next to extra-large icons and tiny next to medium ones.
-    let edge = if logical >= 140. {
+    let mut edge = if logical >= 140. {
         logical * 0.20
     } else if logical >= 96. {
         logical * 0.20
@@ -437,6 +456,11 @@ pub fn link_badge(logical: f32) -> AnyElement {
     } else {
         (logical * 0.36).clamp(8., 18.)
     };
+    // Only the jumbo slot draws the marker at 70%: it would otherwise cover a
+    // large part of the artwork. Every other slot keeps the previous size.
+    if logical >= 200. {
+        edge *= 0.7;
+    }
     div()
         .absolute()
         .left_0()
@@ -591,23 +615,41 @@ pub fn film_strip() -> AnyElement {
     .into_any_element()
 }
 pub fn file_icon_sized(path: &Path, directory: bool, color: u32, logical: f32) -> AnyElement {
-    let image = ICONS.with(|v| {
+    let (image, scale) = ICONS.with(|v| {
         let mut v = v.borrow_mut();
         let key = IconRequest::file(
             path,
             directory,
             (v.pixels as f32 * logical / 16.).ceil().clamp(8., 256.) as u32,
         );
-        v.get(key)
+        let scale = v.pixels as f32 / 16.;
+        (v.get(key), scale)
     });
+    // A Shell bitmap can be far smaller than its slot (the 32 px `.url` icon in
+    // the jumbo view). Stretching it shows one big blurry picture, so the artwork
+    // is drawn at its own resolution, centered, never below a third of the slot.
+    // Folders and drives keep the full slot: their composition is generic.
+    let edge = if directory {
+        logical
+    } else {
+        image.as_ref().map_or(logical, |image| {
+            let native = rust_explorer::icon_layout::png_size(&image.bytes)
+                .map_or(0, |(width, height)| width.max(height));
+            rust_explorer::icon_layout::icon_edge(logical, native, scale)
+        })
+    };
     div()
         .size(ui(logical))
         .flex_shrink_0()
         .flex()
         .items_center()
         .justify_center()
-        .when_some(image.clone(), |d, path| {
-            d.child(icon_image(path).size_full().object_fit(ObjectFit::Contain))
+        .when_some(image.clone(), |d, image| {
+            d.child(
+                icon_image(image)
+                    .size(ui(edge))
+                    .object_fit(ObjectFit::Contain),
+            )
         })
         .when(image.is_none(), |d| {
             d.child(drawn_icon_sized(

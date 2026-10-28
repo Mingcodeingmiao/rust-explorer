@@ -81,6 +81,9 @@ pub struct Settings {
     pub compact: bool,
     pub high_performance: bool,
     pub thumbnails: bool,
+    /// Load every thumbnail of a folder as soon as it opens instead of only the
+    /// rows that are scrolled into view.
+    pub immediate_thumbnails: bool,
     pub blank_double_click_up: bool,
     pub thumbnail_cache_directory: Option<PathBuf>,
     pub wrap_names: bool,
@@ -132,6 +135,7 @@ impl Default for Settings {
             compact: false,
             high_performance: false,
             thumbnails: true,
+            immediate_thumbnails: false,
             blank_double_click_up: false,
             thumbnail_cache_directory: None,
             wrap_names: true,
