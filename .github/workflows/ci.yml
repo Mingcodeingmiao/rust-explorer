@@ -24,4 +24,6 @@ jobs:
           rustup default stable
       - name: Format, core tests and desktop compilation
         shell: pwsh
-        run: ./scripts/check.ps1
+        # Hosted runners have no interactive Explorer desktop. Compile the OLE
+        # fixture here; execute it with a deadline on the release-test desktop.
+        run: ./scripts/check.ps1 -SkipInteractiveShellTests

@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.7.8。** 合并 PR #37，加入统一 SQLite 图像缓存、网络驱动器显示与卷标处理、视图和标签状态恢复、工具栏菜单定位及首次启动系统语言检测。详见 [0.7.8 更新说明](docs/v0.7.8.md)。
+**当前版本为 0.7.9 part1。** 合并 PR #40，加入原生 OLE 文件拖放、网络共享浏览与重连、独立系统操作窗口，改进标签滚动位置恢复、图标与缩略图加载。详见 [0.7.9 part1 更新说明](docs/v0.7.9-part1.md)。
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-最新已发布下载：[Rust Explorer 0.7.8](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.8)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
+最新已发布下载：[Rust Explorer 0.7.9 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.9-part1)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -23,7 +23,7 @@
 - 多标签、前进/后退/上级、面包屑地址栏与快捷键。
 - 八种查看模式、列宽调整、排序、分组、筛选、框选与多选；可选高性能固定组件池模式，不支持大图标/中图标/超大图标/内容视图时自动回退传统实现。
 - 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面；可浏览 MTP/便携设备（如 Android 手机）并通过 Shell 命名空间复制、删除项目，支持完整面包屑、左侧树展开、磁盘容量页和 MTP 项目右键菜单。
-- 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；拖放前确认。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
+- 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；本地文件通过 Windows OLE 与 Shell 协商拖放操作。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
 - 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单；文件夹菜单提供新标签页/新窗口打开，空白菜单提供粘贴。
 - 图片、视频单帧、PDF、字体与文件夹缩略图，链接箭头和隐藏文件半透明。
 - 明色/暗色/跟随系统主题、界面缩放和高 DPI 图标。

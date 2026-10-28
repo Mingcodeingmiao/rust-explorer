@@ -1,3 +1,4 @@
+param([switch]$SkipInteractiveShellTests)
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
 # Windows PowerShell 5.1 treats native stderr as errors when redirected.
@@ -17,7 +18,14 @@ try {
     # The Shell-link test initializes a COM apartment, so it runs in its own process;
     # sharing the unit-test thread tore the apartment down and crashed the next test.
     Invoke-CargoChecked @('test', '--locked', '--test', 'shortcut_targets')
-    # OLE tests create and clean only their own temporary transfer fixtures.
+    # Compile the interactive OLE test everywhere, with its ignored reason visible.
     Invoke-CargoChecked @('test', '--locked', '--test', 'native_drag', '--', '--test-threads=1')
+    if (-not $SkipInteractiveShellTests) {
+        # A Shell Drop can block without an interactive desktop. The test runs
+        # in a bounded child process and uses only disposable local fixtures.
+        Invoke-CargoChecked @('test', '--locked', '--test', 'native_drag', '--', '--ignored', '--test-threads=1')
+    } else {
+        Write-Host 'Interactive Shell drag/drop execution omitted; run scripts/check.ps1 on an unlocked Windows desktop before release.'
+    }
     Invoke-CargoChecked @('check', '--locked', '--all-targets')
 } finally { Pop-Location }
