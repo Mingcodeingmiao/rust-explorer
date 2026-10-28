@@ -33,6 +33,8 @@ pub mod thumbnails;
 pub mod volume_label;
 pub mod volumes;
 pub mod window_frame;
+
+pub mod type_select;
 extern crate self as rust_explorer;
 pub mod i18n;
 pub use rust_explorer_i18n_macros::trf;
