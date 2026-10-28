@@ -1008,7 +1008,7 @@ impl Explorer {
                                             v.confirm_drop(
                                                 drag.paths.clone(),
                                                 drop_path.clone(),
-                                                w.modifiers().control,
+                                                w.modifiers(),
                                                 cx,
                                             );
                                         }))
@@ -1018,7 +1018,7 @@ impl Explorer {
                                                 v.confirm_drop(
                                                     drag.paths().to_vec(),
                                                     external_drop_path.clone(),
-                                                    w.modifiers().control,
+                                                    w.modifiers(),
                                                     cx,
                                                 );
                                             }),
@@ -1402,19 +1402,14 @@ impl Explorer {
             )
             .on_drop(cx.listener(move |v, drag: &DragFiles, w, cx| {
                 cx.stop_propagation();
-                v.confirm_drop(
-                    drag.paths.clone(),
-                    drop_path.clone(),
-                    w.modifiers().control,
-                    cx,
-                );
+                v.confirm_drop(drag.paths.clone(), drop_path.clone(), w.modifiers(), cx);
             }))
             .on_drop(cx.listener(move |v, drag: &ExternalPaths, w, cx| {
                 cx.stop_propagation();
                 v.confirm_drop(
                     drag.paths().to_vec(),
                     external_drop_path.clone(),
-                    w.modifiers().control,
+                    w.modifiers(),
                     cx,
                 );
             }))

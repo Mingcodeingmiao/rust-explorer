@@ -18,5 +18,6 @@ template<class T> class ComPtr {
 public:
     ~ComPtr() { if (value_) value_->Release(); }
     T** put() { return &value_; }
+    T* get() const { return value_; }
     T* operator->() const { return value_; }
 };

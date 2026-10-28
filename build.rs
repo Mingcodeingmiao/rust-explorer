@@ -8,6 +8,7 @@ fn main() {
             "OpenInFolder.h",
             "ComSupport.h",
             "bridge.cpp",
+            "drag_drop.cpp",
         ] {
             println!("cargo:rerun-if-changed=native/shell_bridge/{file}");
         }
@@ -18,12 +19,15 @@ fn main() {
             .define("UNICODE", None)
             .define("_UNICODE", None)
             .file("native/shell_bridge/OpenInFolder.cpp")
-            .file("native/shell_bridge/bridge.cpp");
+            .file("native/shell_bridge/bridge.cpp")
+            .file("native/shell_bridge/drag_drop.cpp");
         if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("gnu") {
             bridge.cpp_link_stdlib_static(true);
         }
         bridge.compile("re_shell_bridge");
-        for library in ["ole32", "oleaut32", "shell32", "uuid", "propsys"] {
+        for library in [
+            "ole32", "oleaut32", "shell32", "uuid", "propsys", "comctl32",
+        ] {
             println!("cargo:rustc-link-lib={library}");
         }
         // Link the resource archive (manifest + version info + icon) into every

@@ -17,5 +17,7 @@ try {
     # The Shell-link test initializes a COM apartment, so it runs in its own process;
     # sharing the unit-test thread tore the apartment down and crashed the next test.
     Invoke-CargoChecked @('test', '--locked', '--test', 'shortcut_targets')
+    # OLE tests create and clean only their own temporary transfer fixtures.
+    Invoke-CargoChecked @('test', '--locked', '--test', 'native_drag', '--', '--test-threads=1')
     Invoke-CargoChecked @('check', '--locked', '--all-targets')
 } finally { Pop-Location }

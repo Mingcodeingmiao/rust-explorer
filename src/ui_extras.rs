@@ -965,19 +965,118 @@ impl Explorer {
             )
             .into_any_element()
     }
+    pub(super) fn install_native_drop(&mut self, window: &Window) {
+        let background = if !self.busy
+            && self.dialog.is_none()
+            && self.options.is_none()
+            && !navigation::is_app_virtual(&self.dir())
+        {
+            Some(self.dir())
+        } else {
+            None
+        };
+        if let Some(Ok(target)) = &self.native_drop {
+            *target.background.borrow_mut() = background;
+            target.set_enabled(!self.busy && self.dialog.is_none() && self.options.is_none());
+            return;
+        }
+        if self.native_drop.is_some() {
+            return;
+        }
+        let Some(owner) = native_hwnd(window) else {
+            return;
+        };
+        let current = std::rc::Rc::new(RefCell::new(background));
+        let fallback = current.clone();
+        let bounds = self.file_drop_bounds.clone();
+        let scroll = self.content_scroll.clone();
+        let registration =
+            rust_explorer::native_drag::DropTarget::register(owner, current, move |x, y| {
+                let current = fallback.try_borrow().ok()?.clone();
+                let position = point(px(x), px(y));
+                let regions = bounds.try_borrow().ok()?;
+                if let Some((path, _, directory)) = regions
+                    .iter()
+                    .rev()
+                    .find(|(_, area, _)| area.contains(&position))
+                {
+                    return (*directory && !navigation::is_app_virtual(path)).then(|| path.clone());
+                }
+                scroll
+                    .bounds()
+                    .contains(&position)
+                    .then_some(current)
+                    .flatten()
+            })
+            .map_err(|error| format!("{error:#}"));
+        if let Err(error) = &registration {
+            self.status = error.clone();
+        }
+        self.native_drop = Some(registration);
+    }
+    pub(super) fn begin_native_drag(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        rust_explorer::native_drag::trace("requested");
+        // Defer until GPUI has installed its local payload, then hand ownership
+        // of mouse capture to OLE. The posted native message runs after this
+        // callback returns; its nested message pump holds no App/Entity borrow.
+        cx.defer_in(window, move |view, window, cx| {
+            rust_explorer::native_drag::trace("deferred start");
+            cx.stop_active_drag(window);
+            view.rename_token += 1;
+            view.pending_selection_click = None;
+            view.file_drag = None;
+            if view.busy {
+                return;
+            }
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+            }
+            let result = view
+                .native_drop
+                .as_ref()
+                .and_then(|target| target.as_ref().ok())
+                .ok_or_else(|| anyhow::anyhow!("Windows drop target is unavailable"))
+                .and_then(|target| target.start(&paths));
+            match result {
+                Ok(()) => {}
+                Err(error) => view.status = format!("{error:#}"),
+            }
+            cx.notify();
+        });
+    }
     pub(super) fn confirm_drop(
         &mut self,
         paths: Vec<PathBuf>,
         destination: PathBuf,
-        copy_only: bool,
+        modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let mode = if copy_only {
-            shell::TransferMode::Copy
-        } else {
-            self.file_drag.as_ref().map(|d| d.mode).unwrap_or_default()
-        };
-        self.confirm_drop_mode(paths, destination, mode, cx);
+        let mode =
+            rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+        if !rust_explorer::file_drag::allows(&paths, &destination, mode)
+            || navigation::is_app_virtual(&destination)
+            || self.busy
+            || self.options.is_some()
+            || self.dialog.is_some()
+        {
+            return;
+        }
+        self.rename_token += 1;
+        self.pending_selection_click = None;
+        self.run_shell(
+            shell::Request::Transfer {
+                paths,
+                destination,
+                copy_only: mode == shell::TransferMode::Copy,
+                mode,
+            },
+            cx,
+        );
     }
     fn confirm_drop_mode(
         &mut self,
@@ -986,7 +1085,7 @@ impl Explorer {
         mode: shell::TransferMode,
         cx: &mut Context<Self>,
     ) {
-        if paths.is_empty()
+        if !rust_explorer::file_drag::allows(&paths, &destination, mode)
             || navigation::is_app_virtual(&destination)
             || self.busy
             || self.options.is_some()
@@ -1029,23 +1128,27 @@ impl Explorer {
                 Some(self.dir())
             }
             _ => None,
-        }
-        .filter(|target| {
-            !paths
-                .iter()
-                .any(|source| target == source || target.starts_with(source))
-        });
-        let mode = if modifiers.alt {
-            shell::TransferMode::Link
-        } else if modifiers.control {
-            shell::TransferMode::Copy
-        } else if modifiers.shift {
-            shell::TransferMode::Move
+        };
+        let mode =
+            rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+        let target = target.filter(|target| rust_explorer::file_drag::allows(&paths, target, mode));
+        let previews = if let Some(drag) = &self.file_drag {
+            drag.previews.clone()
         } else {
-            shell::TransferMode::Auto
+            paths
+                .iter()
+                .take(3)
+                .filter_map(|path| {
+                    self.entries
+                        .iter()
+                        .find(|entry| &entry.path == path)
+                        .cloned()
+                })
+                .collect()
         };
         self.file_drag = Some(FileDragState {
             paths,
+            previews,
             position,
             target,
             mode,
@@ -1056,27 +1159,13 @@ impl Explorer {
         let Some(target) = &drag.target else {
             return rust_explorer::trf!("{} 个项目 · 不能放置到此处", drag.paths.len());
         };
-        let operation = match drag.mode {
-            shell::TransferMode::Copy => rust_explorer::i18n::text("复制到"),
-            shell::TransferMode::Move => rust_explorer::i18n::text("移动到"),
-            shell::TransferMode::Link => rust_explorer::i18n::text("创建快捷方式到"),
-            shell::TransferMode::Auto => {
-                let target_volume = target
-                    .components()
-                    .next()
-                    .map(|p| p.as_os_str().to_string_lossy().to_lowercase());
-                if drag.paths.iter().all(|path| {
-                    path.components()
-                        .next()
-                        .map(|p| p.as_os_str().to_string_lossy().to_lowercase())
-                        == target_volume
-                }) {
-                    rust_explorer::i18n::text("移动到")
-                } else {
-                    rust_explorer::i18n::text("复制到")
-                }
-            }
-        };
+        let operation =
+            match rust_explorer::file_drag::feedback_mode(&drag.paths, target, drag.mode) {
+                shell::TransferMode::Copy => rust_explorer::i18n::text("复制到"),
+                shell::TransferMode::Move => rust_explorer::i18n::text("移动到"),
+                shell::TransferMode::Link => rust_explorer::i18n::text("创建快捷方式到"),
+                shell::TransferMode::Auto => unreachable!("feedback resolves Auto"),
+            };
         rust_explorer::trf!(
             "{} 个项目 · {operation} {}",
             drag.paths.len(),
@@ -1085,6 +1174,139 @@ impl Explorer {
                 .unwrap_or(target.as_os_str())
                 .to_string_lossy()
         )
+    }
+    pub(super) fn render_file_drag(
+        &self,
+        drag: &FileDragState,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        // Read only already-loaded images. A pointer move must never wait on
+        // thumbnail generation, file metadata or a network location.
+        let mut stack = div().relative().w(ui(104.)).h(ui(104.));
+        for (layer, path) in drag.paths.iter().take(3).enumerate().rev() {
+            let entry = drag.previews.iter().find(|entry| &entry.path == path);
+            let directory = entry.is_some_and(|entry| entry.directory);
+            let key = entry.and_then(|entry| {
+                rust_explorer::thumbnails::Key::from_entry(
+                    entry,
+                    visual::thumbnail_pixels(self.view.icon_size()),
+                )
+            });
+            let picture = key.as_ref().and_then(|key| {
+                let bytes = self.thumbnails.image(key)?;
+                visual::thumbnail_image(key, &bytes)
+            });
+            let presentation = key
+                .as_ref()
+                .and_then(|key| self.thumbnails.presentation(key))
+                .unwrap_or_default();
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .left(ui(layer as f32 * 6.))
+                    .top(ui(layer as f32 * 6.))
+                    .size(ui(88.))
+                    .rounded(ui(3.))
+                    .bg(rgba(if t.dark { 0x30303090 } else { 0xffffff90 }))
+                    .border_1()
+                    .border_color(rgba(if t.dark { 0xffffff40 } else { 0x00000030 }))
+                    .p(ui(4.))
+                    .opacity(0.82)
+                    .child(visual::thumbnail_or_icon(
+                        path,
+                        directory,
+                        t.text,
+                        78.,
+                        picture,
+                        (presentation.width, presentation.height),
+                        directory || presentation.directory,
+                        &self.thumbnail_images,
+                        cx,
+                    )),
+            );
+        }
+        if drag.paths.len() > 1 {
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .min_w(ui(24.))
+                    .h(ui(24.))
+                    .px(ui(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui(3.))
+                    .bg(rgb(0x0078d4))
+                    .text_color(rgb(0xffffff))
+                    .child(drag.paths.len().to_string()),
+            );
+        }
+        let badge = if drag.target.is_none() {
+            "close"
+        } else {
+            match rust_explorer::file_drag::feedback_mode(
+                &drag.paths,
+                drag.target.as_ref().unwrap(),
+                drag.mode,
+            ) {
+                shell::TransferMode::Copy => "plus",
+                shell::TransferMode::Link => "shortcut",
+                _ => "forward",
+            }
+        };
+        // Keep the complete feedback inside a narrow or high-DPI window.
+        let viewport = window.viewport_size();
+        let width = (f32::from(viewport.width) / self.zoom - 8.).clamp(40., 360.);
+        let left = f32::from(drag.position.x) + 16. * self.zoom;
+        let top = f32::from(drag.position.y) + 20. * self.zoom;
+        div()
+            .absolute()
+            .left(px(left.min(
+                (f32::from(viewport.width) - width * self.zoom - 4.).max(0.),
+            )))
+            .top(px(top.min(
+                (f32::from(viewport.height) - 142. * self.zoom).max(0.),
+            )))
+            .w(ui(width))
+            .flex()
+            .flex_col()
+            .gap(ui(4.))
+            .child(stack)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(ui(6.))
+                    .px(ui(8.))
+                    .py(ui(4.))
+                    .rounded(ui(3.))
+                    .shadow_md()
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .bg(rgb(t.panel))
+                    .text_color(rgb(t.text))
+                    .child(visual::icon(
+                        badge,
+                        if drag.target.is_some() {
+                            t.accent
+                        } else {
+                            t.muted
+                        },
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.file_drag_label(drag)),
+                    ),
+            )
+            .into_any_element()
     }
     pub(super) fn horizontal_scrollbar(
         &self,
@@ -2565,9 +2787,7 @@ impl Explorer {
             })
             .on_drag(drag, move |drag, _, w, cx| {
                 let _ = source.update(cx, |v, cx| {
-                    v.rename_token += 1;
-                    v.pending_selection_click = None;
-                    v.update_file_drag(drag.paths.clone(), w.mouse_position(), w.modifiers(), cx);
+                    v.begin_native_drag(drag.paths.clone(), w, cx);
                 });
                 cx.new(|_| drag.clone())
             })
@@ -2934,14 +3154,7 @@ impl Explorer {
                     },
                     move |drag, _, w, cx| {
                         let _ = drag_source.update(cx, |v, cx| {
-                            v.rename_token += 1;
-                            v.pending_selection_click = None;
-                            v.update_file_drag(
-                                drag.paths.clone(),
-                                w.mouse_position(),
-                                w.modifiers(),
-                                cx,
-                            );
+                            v.begin_native_drag(drag.paths.clone(), w, cx);
                         });
                         cx.new(|_| drag.clone())
                     },
@@ -3018,11 +3231,11 @@ impl Explorer {
             row = row
                 .on_drop(cx.listener(move |v, drag: &DragFiles, w, cx| {
                     cx.stop_propagation();
-                    v.confirm_drop(drag.paths.clone(), path.clone(), w.modifiers().control, cx);
+                    v.confirm_drop(drag.paths.clone(), path.clone(), w.modifiers(), cx);
                 }))
-                .on_drop(cx.listener(move |v, drag: &ExternalPaths, _, cx| {
+                .on_drop(cx.listener(move |v, drag: &ExternalPaths, w, cx| {
                     cx.stop_propagation();
-                    v.confirm_drop(drag.paths().to_vec(), external.clone(), false, cx);
+                    v.confirm_drop(drag.paths().to_vec(), external.clone(), w.modifiers(), cx);
                 }));
         } else {
             // A file is not a destination; consume the drop so it cannot

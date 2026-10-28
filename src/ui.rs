@@ -126,6 +126,7 @@ struct DragFiles {
 #[derive(Clone)]
 struct FileDragState {
     paths: Vec<PathBuf>,
+    previews: Vec<Entry>,
     position: Point<Pixels>,
     target: Option<PathBuf>,
     mode: shell::TransferMode,
@@ -337,6 +338,7 @@ struct Explorer {
     right_file_drag: Option<RightFileDrag>,
     pending_right_drop: Option<(Vec<PathBuf>, PathBuf)>,
     file_drop_bounds: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, Bounds<Pixels>, bool)>>>,
+    native_drop: Option<Result<rust_explorer::native_drag::DropTarget, String>>,
     anchor: usize,
     sort: Sort,
     descending: bool,
@@ -933,6 +935,7 @@ impl Explorer {
             right_file_drag: None,
             pending_right_drop: None,
             file_drop_bounds: Default::default(),
+            native_drop: None,
             anchor: 0,
             sort: Sort::Name,
             descending: false,
@@ -998,6 +1001,29 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
+                        let finished = this
+                            .native_drop
+                            .as_ref()
+                            .and_then(|target| target.as_ref().ok())
+                            .and_then(|target| target.source_result());
+                        if let Some(result) = finished {
+                            match result {
+                                Ok(effect) if effect != 0 => this.reload(cx),
+                                Err(error) => {
+                                    this.status = error;
+                                    cx.notify();
+                                }
+                                _ => cx.notify(),
+                            }
+                        }
+                        if this
+                            .native_drop
+                            .as_ref()
+                            .and_then(|target| target.as_ref().ok())
+                            .is_some_and(|target| target.take_completed())
+                        {
+                            this.reload(cx);
+                        }
                         if let Some(request) = launch_hwnd.and_then(rust_explorer::instance::take) {
                             this.accept_launch(request, cx);
                         }
@@ -3701,6 +3727,7 @@ fn icon_button(id: impl Into<ElementId>, icon: &str, t: Theme) -> Stateful<Div> 
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.install_native_drop(window);
         self.file_drop_bounds.borrow_mut().clear();
         window.set_rem_size(px(16. * self.zoom));
         visual::set_pixels((16. * self.zoom * window.scale_factor()).ceil() as u32);
@@ -4275,6 +4302,12 @@ impl Render for Explorer {
                         event.event.modifiers,
                         cx,
                     );
+                }
+            }))
+            .on_modifiers_changed(cx.listener(|v, event: &ModifiersChangedEvent, _, cx| {
+                if let Some(drag) = &v.file_drag {
+                    let (paths, position) = (drag.paths.clone(), drag.position);
+                    v.update_file_drag(paths, position, event.modifiers, cx);
                 }
             }))
             .on_mouse_move({
@@ -5050,11 +5083,11 @@ impl Render for Explorer {
                             v.begin_marquee(e, w, cx);
                         }),
                     )
-                    .on_drop(cx.listener(|v, drag: &ExternalPaths, _, cx| {
-                        v.confirm_drop(drag.paths().to_vec(), v.dir(), false, cx);
+                    .on_drop(cx.listener(|v, drag: &ExternalPaths, w, cx| {
+                        v.confirm_drop(drag.paths().to_vec(), v.dir(), w.modifiers(), cx);
                     }))
                     .on_drop(cx.listener(|v, drag: &DragFiles, w, cx| {
-                        v.confirm_drop(drag.paths.clone(), v.dir(), w.modifiers().control, cx);
+                        v.confirm_drop(drag.paths.clone(), v.dir(), w.modifiers(), cx);
                     }))
                     .flex_1()
                     .min_h_0()
@@ -5800,25 +5833,7 @@ impl Render for Explorer {
         }
 
         if let Some(drag) = &self.file_drag {
-            root = root.child(
-                div()
-                    .absolute()
-                    .left(drag.position.x + px(16. * self.zoom))
-                    .top(drag.position.y + px(20. * self.zoom))
-                    .max_w(ui(460.))
-                    .px_3()
-                    .py_1()
-                    .rounded(ui(4.))
-                    .shadow_md()
-                    .border_1()
-                    .border_color(rgb(t.border))
-                    .bg(rgb(t.panel))
-                    .text_color(rgb(t.text))
-                    .whitespace_nowrap()
-                    .overflow_hidden()
-                    .text_ellipsis()
-                    .child(self.file_drag_label(drag)),
-            );
+            root = root.child(self.render_file_drag(drag, window, cx));
         }
 
         root
