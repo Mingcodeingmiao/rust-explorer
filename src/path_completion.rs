@@ -133,6 +133,12 @@ pub fn resolve_input(current: &Path, input: &str) -> Option<PathBuf> {
     if input.len() == 2 && input.as_bytes()[1] == b':' {
         input.push('\\');
     }
+    // `\\server` alone parses as a rooted path without a prefix, so joining it
+    // under the current folder would invent a local path. It is an absolute
+    // network address either way.
+    if input.starts_with(r"\\") {
+        return Some(PathBuf::from(input));
+    }
     let path = PathBuf::from(input);
     if path.is_absolute() {
         Some(path)
@@ -155,6 +161,16 @@ mod integrated_tests {
         assert_eq!(
             resolve_input(Path::new("D:\\work"), "C:"),
             Some(PathBuf::from("C:\\"))
+        );
+        // A bare server address is absolute even though Rust parses it as a
+        // rooted path without a prefix.
+        assert_eq!(
+            resolve_input(Path::new("D:\\work"), r"\\10.0.16.48"),
+            Some(PathBuf::from(r"\\10.0.16.48"))
+        );
+        assert_eq!(
+            resolve_input(Path::new("D:\\work"), r"\\nas\media"),
+            Some(PathBuf::from(r"\\nas\media"))
         );
         assert_eq!(expand_environment("100%%"), "100%");
         assert_eq!(

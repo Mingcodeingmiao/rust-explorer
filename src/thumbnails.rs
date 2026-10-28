@@ -527,6 +527,21 @@ impl Loader {
     pub fn changed(&self) -> bool {
         self.shared.changed.swap(false, Ordering::AcqRel)
     }
+    /// How many of `keys` already have a generated thumbnail. Counted by the
+    /// artwork identity (path, size, time, pixels) the cache also falls back on,
+    /// so a shortcut whose epoch changed is still counted.
+    pub fn ready(&self, keys: &[Key]) -> usize {
+        let state = self.shared.state.lock().unwrap();
+        let ready: HashSet<(&std::path::Path, u64, Option<SystemTime>, u32)> = state
+            .cache
+            .iter()
+            .filter(|(_, cached)| cached.image.is_some())
+            .map(|(key, _)| (key.path.as_path(), key.size, key.modified, key.pixels))
+            .collect();
+        keys.iter()
+            .filter(|key| ready.contains(&(key.path.as_path(), key.size, key.modified, key.pixels)))
+            .count()
+    }
     /// Cached decoration flags only: never resolve links or touch disk while rendering.
     pub fn presentation(&self, key: &Key) -> Option<Presentation> {
         let state = self.shared.state.lock().unwrap();

@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.7.9-part1] - 2026-10-28
+
+合并 PR #40，提供 Windows x64 便携包。详见[中文发行说明](docs/v0.7.9-part1.md)。
+
+- 增加 Windows 原生 OLE 文件拖放：使用 Shell 数据对象和目录目标处理复制、移动和快捷方式，并在操作后刷新列表。
+- 修复标签页及历史记录恢复选中项时滚动位置被覆盖的问题。
+- 增加断开的网络驱动器重连、服务器共享列表与 UNC 地址栏层级；网络请求在有超时限制的辅助进程中运行。
+- 系统操作记录改为独立窗口，显示开始时间、用时、目标、状态及停止控制，支持查看多个窗口发起的操作。
+- 增加立即加载文件夹缩略图选项和图标/缩略图进度，改进按视图尺寸预加载、低分辨率图标和链接角标。
+- 改进面包屑下拉菜单、此电脑位置导航和驱动器图标状态刷新；预热进程内 Shell 菜单，保留 owner/独立 STA 边界。
+- 修复发布检查在托管运行器执行交互式 Shell 拖放测试时无限等待的问题：CI 明确编译但跳过交互测试，本地发布检查执行该测试，并由独立子进程提供 60 秒超时保护。
+- 同步 Cargo 版本为 0.7.9，Windows 文件版本为 0.7.9.1，产品版本与发行标签为 0.7.9-part1。
+
 ## [0.7.8] - 2026-10-25
 
 Merged PR #37. Adds a unified SQLite image cache for icons, thumbnails and previews, improves network-drive naming and volume-label handling, restores saved folder views and tab state, anchors toolbar menus to their buttons, and detects the Windows display language on first launch. Core tests: 141 passed (one ignored).

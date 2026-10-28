@@ -4,19 +4,19 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.7.8** merges PR #37: unified SQLite image caching, improved network-drive naming and volume labels, saved folder/tab state, toolbar menu anchoring, and first-launch Windows language detection. See the [release notes](docs/v0.7.8.md).
+Version **0.7.9 part1** merges PR #40: native OLE file drag and drop, network share browsing and reconnection, an independent operations window, improved tab scroll restoration, and icon/thumbnail loading. See the [release notes](docs/v0.7.9-part1.md).
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Latest published download: [Rust Explorer 0.7.8](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.8). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
+Latest published download: [Rust Explorer 0.7.9 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.9-part1). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
 
 ## Features
 
 - Tabs, breadcrumbs, navigation history and keyboard shortcuts.
 - Eight views, adjustable columns, sorting, grouping, filters and marquee selection; an optional fixed-pool high-performance mode falls back to the traditional implementation for unsupported views.
 - System Quick Access synchronization, resizable panes and drive capacity views. Portable/MTP devices support full breadcrumbs, tree expansion, storage-capacity pages, Shell copy/paste and context menus.
-- Native clipboard/Shell operations, drag/drop confirmation and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
+- Native clipboard/Shell operations, Windows OLE file drag and drop, and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
 - Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
 - Light/dark/system themes, zoom, high-DPI icons and optional Everything integration.

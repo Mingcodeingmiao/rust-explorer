@@ -15,6 +15,10 @@ pub(super) struct NavRow {
     pinned: bool,
     icon: String,
 }
+/// The Control Panel namespace address. The app only hands it to the system
+/// Control Panel; it never lists or edits its items.
+pub(super) const CONTROL_PANEL: &str = "::{26EE0668-A00A-44D7-9371-BEB064C98683}";
+
 fn special(path: &std::path::Path) -> bool {
     path.to_string_lossy().starts_with("::") || rust_explorer::shell_folder::is_shell_path(path)
 }
@@ -464,6 +468,91 @@ impl Explorer {
             });
         })
         .detach();
+    }
+    /// Hand the Control Panel to Windows. Its items are Shell virtual folders this
+    /// app cannot operate on, so they are never listed here.
+    pub(super) fn open_control_panel(&mut self, cx: &mut Context<Self>) {
+        let windows = std::env::var_os("WINDIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
+        self.run_shell(
+            shell::Request::Open {
+                path: windows.join("System32").join("control.exe"),
+            },
+            cx,
+        );
+    }
+    /// Children of This PC (every volume) or of the Network page (mapped network
+    /// locations only), for the breadcrumb dropdown. Mapped network locations are
+    /// the volumes whose kind is `4`, so they appear in both lists.
+    pub(super) fn volume_rows(&self, network_only: bool) -> Vec<CrumbRow> {
+        let mut rows: Vec<CrumbRow> = self
+            .volumes
+            .iter()
+            .filter(|volume| !network_only || volume.kind == 4)
+            .map(|volume| CrumbRow {
+                label: volume.label.clone(),
+                path: volume.path.clone(),
+                glyph: None,
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            match (
+                self.volumes.iter().find(|volume| volume.path == a.path),
+                self.volumes.iter().find(|volume| volume.path == b.path),
+            ) {
+                (Some(a), Some(b)) => volumes::compare(
+                    a,
+                    b,
+                    &self.settings.volume_sort,
+                    self.settings.volume_descending,
+                ),
+                _ => a.path.cmp(&b.path),
+            }
+        });
+        rows
+    }
+    /// The leftmost breadcrumb chevron: the places Explorer's address bar offers
+    /// above This PC, plus the folders pinned to Quick Access.
+    pub(super) fn root_place_rows(&self) -> Vec<CrumbRow> {
+        let mut rows = Vec::new();
+        let home = shell::known_folder(&windows::Win32::UI::Shell::FOLDERID_Profile)
+            .unwrap_or_else(|| PathBuf::from("C:\\"));
+        rows.push(CrumbRow {
+            label: rust_explorer::i18n::text("主文件夹").to_string(),
+            path: home,
+            glyph: Some("home"),
+        });
+        for (name, path) in self.quick_access_items() {
+            rows.push(CrumbRow {
+                label: rust_explorer::i18n::text(&name).to_string(),
+                path,
+                glyph: Some("folder"),
+            });
+        }
+        rows.extend([
+            CrumbRow {
+                label: rust_explorer::i18n::text("网络").to_string(),
+                path: PathBuf::from("::Network"),
+                glyph: Some("network"),
+            },
+            CrumbRow {
+                label: rust_explorer::i18n::text("回收站").to_string(),
+                path: PathBuf::from("shell:RecycleBinFolder"),
+                glyph: Some("recycle-bin"),
+            },
+            CrumbRow {
+                label: rust_explorer::i18n::text("此电脑").to_string(),
+                path: volumes::computer(),
+                glyph: Some("computer"),
+            },
+            CrumbRow {
+                label: rust_explorer::i18n::text("控制面板").to_string(),
+                path: PathBuf::from(CONTROL_PANEL),
+                glyph: Some("settings"),
+            },
+        ]);
+        rows
     }
     pub(super) fn sync_computer_entries(&mut self) {
         let selected = self.paths();
@@ -987,7 +1076,7 @@ impl Explorer {
                                     .hover(move |s| {
                                         s.bg(rgb(if target { t.selection } else { t.hover }))
                                     })
-                                    .cursor_pointer()
+                                    .cursor_default()
                                     .when(accepts_drop, |d| {
                                         d.child(
                                             canvas(
@@ -1008,7 +1097,7 @@ impl Explorer {
                                             v.confirm_drop(
                                                 drag.paths.clone(),
                                                 drop_path.clone(),
-                                                w.modifiers().control,
+                                                w.modifiers(),
                                                 cx,
                                             );
                                         }))
@@ -1018,7 +1107,7 @@ impl Explorer {
                                                 v.confirm_drop(
                                                     drag.paths().to_vec(),
                                                     external_drop_path.clone(),
-                                                    w.modifiers().control,
+                                                    w.modifiers(),
                                                     cx,
                                                 );
                                             }),
@@ -1386,7 +1475,7 @@ impl Explorer {
                     t.hover
                 }))
             })
-            .cursor_pointer()
+            .cursor_default()
             .child(
                 canvas(
                     move |bounds, _, _| {
@@ -1402,19 +1491,14 @@ impl Explorer {
             )
             .on_drop(cx.listener(move |v, drag: &DragFiles, w, cx| {
                 cx.stop_propagation();
-                v.confirm_drop(
-                    drag.paths.clone(),
-                    drop_path.clone(),
-                    w.modifiers().control,
-                    cx,
-                );
+                v.confirm_drop(drag.paths.clone(), drop_path.clone(), w.modifiers(), cx);
             }))
             .on_drop(cx.listener(move |v, drag: &ExternalPaths, w, cx| {
                 cx.stop_propagation();
                 v.confirm_drop(
                     drag.paths().to_vec(),
                     external_drop_path.clone(),
-                    w.modifiers().control,
+                    w.modifiers(),
                     cx,
                 );
             }))

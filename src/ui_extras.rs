@@ -598,19 +598,40 @@ impl Explorer {
         })
         .detach();
     }
+    /// Logical icon size the current view draws entries at. This PC's volume
+    /// tiles use their own layout metrics, so they need their own number.
+    fn entry_icon_logical(&self) -> f32 {
+        if self.is_home() {
+            match self.view {
+                ViewMode::Tiles => rust_explorer::layout_metrics::DRIVE_TILE_ICON,
+                ViewMode::Details => 20.,
+                ViewMode::Small | ViewMode::List => 16.,
+                ViewMode::Content => 64.,
+                _ => self.view.icon_size(),
+            }
+        } else {
+            self.view.icon_size()
+        }
+    }
     /// Queue the folder's per-item icons (executables, shortcuts, drives) once, so a
     /// scroll does not have to wait for each real icon.
     pub(super) fn prefetch_entry_icons(&self) {
         if self.is_home() && self.volumes.is_empty() {
             return;
         }
-        let stamp = (self.generation, visual::icon_pixels());
+        // The prefetch has to ask for the very bitmap the view will draw: a grid
+        // view renders at `icon_size`, so prefetching the 16 px base icon filled a
+        // different cache key and executable icons still appeared only when they
+        // were scrolled to.
+        let pixels = ((visual::icon_pixels() as f32 * self.entry_icon_logical() / 16.).ceil())
+            .clamp(8., 256.) as u32;
+        let immediate = self.settings.immediate_thumbnails;
+        let stamp = (self.generation, pixels, immediate);
         if self.icon_prefetch.get() == Some(stamp) {
             return;
         }
         self.icon_prefetch.set(Some(stamp));
-        let pixels = visual::icon_pixels();
-        let keys: Vec<_> = self
+        let icons = self
             .entries
             .iter()
             .filter(|entry| {
@@ -625,9 +646,18 @@ impl Explorer {
                     entry.directory,
                     pixels,
                 )
-            })
-            .take(rust_explorer::native_assets::ICON_PREFETCH_LIMIT)
-            .collect();
+            });
+        let keys: Vec<_> = if immediate {
+            // "Load every thumbnail when the folder opens" also covers the real
+            // per-item icons (executables, shortcuts, drive roots).
+            icons.collect()
+        } else {
+            icons
+                .take(rust_explorer::native_assets::ICON_PREFETCH_LIMIT)
+                .collect()
+        };
+        *self.icon_keys.borrow_mut() = keys.clone();
+        self.icon_ready_dirty.set(true);
         visual::prefetch_icons(keys);
     }
     pub(super) fn sync_thumbnails(&self) {
@@ -642,25 +672,56 @@ impl Explorer {
         } else {
             0
         };
+        let immediate = enabled && self.settings.immediate_thumbnails;
         // Eager whole-folder prefetch. It must not sit behind the viewport stamp:
         // the first render of a folder usually hits that early return, which used to
-        // leave the queue with only the visible rows ("a page per scroll").
-        let prefetch_stamp = (self.generation, pixels);
+        // leave the queue with only the visible rows ("a page per scroll"). The
+        // stamp also records the immediate-load option so toggling it re-queues.
+        let prefetch_stamp = (self.generation, pixels, immediate);
         if enabled {
             if !self.entries.is_empty() && self.thumbnail_prefetch.get() != Some(prefetch_stamp) {
                 self.thumbnail_prefetch.set(Some(prefetch_stamp));
+                // The status bar counts every previewable item of the folder.
                 let all: Vec<_> = self
                     .entries
                     .iter()
                     .filter_map(|entry| rust_explorer::thumbnails::Key::from_entry(entry, pixels))
-                    .take(rust_explorer::thumbnails::MAX_PREFETCH)
                     .collect();
-                self.thumbnails.set_all(all);
+                let queued: Vec<_> = if immediate {
+                    // "Load every thumbnail when the folder opens": the whole
+                    // folder goes into the queue, not only the first page.
+                    all.clone()
+                } else {
+                    all.iter()
+                        .take(rust_explorer::thumbnails::MAX_PREFETCH)
+                        .cloned()
+                        .collect()
+                };
+                self.thumbnails.set_all(queued);
+                *self.thumbnail_keys.borrow_mut() = all;
+                self.thumbnail_ready_dirty.set(true);
             }
         } else if self.thumbnail_prefetch.get().is_some() {
             // No previews are shown: drop the queue and stop generating.
             self.thumbnail_prefetch.set(None);
             self.thumbnails.set_all(Vec::new());
+            self.thumbnail_keys.borrow_mut().clear();
+            self.thumbnail_ready.set(0);
+        }
+        if self.thumbnail_ready_dirty.get() {
+            self.thumbnail_ready_dirty.set(false);
+            let keys = self.thumbnail_keys.borrow();
+            self.thumbnail_ready.set(self.thumbnails.ready(&keys));
+        }
+        if self.icon_ready_dirty.get() {
+            self.icon_ready_dirty.set(false);
+            let keys = self.icon_keys.borrow();
+            self.icon_ready.set(visual::ready_icons(&keys));
+        }
+        if immediate {
+            // Everything is already queued in listing order: there is no viewport
+            // tracking, and scrolling must not push new priorities into the queue.
+            return;
         }
         let first = if enabled {
             self.list_scroll
@@ -965,19 +1026,118 @@ impl Explorer {
             )
             .into_any_element()
     }
+    pub(super) fn install_native_drop(&mut self, window: &Window) {
+        let background = if !self.busy
+            && self.dialog.is_none()
+            && self.options.is_none()
+            && !navigation::is_app_virtual(&self.dir())
+        {
+            Some(self.dir())
+        } else {
+            None
+        };
+        if let Some(Ok(target)) = &self.native_drop {
+            *target.background.borrow_mut() = background;
+            target.set_enabled(!self.busy && self.dialog.is_none() && self.options.is_none());
+            return;
+        }
+        if self.native_drop.is_some() {
+            return;
+        }
+        let Some(owner) = native_hwnd(window) else {
+            return;
+        };
+        let current = std::rc::Rc::new(RefCell::new(background));
+        let fallback = current.clone();
+        let bounds = self.file_drop_bounds.clone();
+        let scroll = self.content_scroll.clone();
+        let registration =
+            rust_explorer::native_drag::DropTarget::register(owner, current, move |x, y| {
+                let current = fallback.try_borrow().ok()?.clone();
+                let position = point(px(x), px(y));
+                let regions = bounds.try_borrow().ok()?;
+                if let Some((path, _, directory)) = regions
+                    .iter()
+                    .rev()
+                    .find(|(_, area, _)| area.contains(&position))
+                {
+                    return (*directory && !navigation::is_app_virtual(path)).then(|| path.clone());
+                }
+                scroll
+                    .bounds()
+                    .contains(&position)
+                    .then_some(current)
+                    .flatten()
+            })
+            .map_err(|error| format!("{error:#}"));
+        if let Err(error) = &registration {
+            self.status = error.clone();
+        }
+        self.native_drop = Some(registration);
+    }
+    pub(super) fn begin_native_drag(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        rust_explorer::native_drag::trace("requested");
+        // Defer until GPUI has installed its local payload, then hand ownership
+        // of mouse capture to OLE. The posted native message runs after this
+        // callback returns; its nested message pump holds no App/Entity borrow.
+        cx.defer_in(window, move |view, window, cx| {
+            rust_explorer::native_drag::trace("deferred start");
+            cx.stop_active_drag(window);
+            view.rename_token += 1;
+            view.pending_selection_click = None;
+            view.file_drag = None;
+            if view.busy {
+                return;
+            }
+            unsafe {
+                let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
+            }
+            let result = view
+                .native_drop
+                .as_ref()
+                .and_then(|target| target.as_ref().ok())
+                .ok_or_else(|| anyhow::anyhow!("Windows drop target is unavailable"))
+                .and_then(|target| target.start(&paths));
+            match result {
+                Ok(()) => {}
+                Err(error) => view.status = format!("{error:#}"),
+            }
+            cx.notify();
+        });
+    }
     pub(super) fn confirm_drop(
         &mut self,
         paths: Vec<PathBuf>,
         destination: PathBuf,
-        copy_only: bool,
+        modifiers: Modifiers,
         cx: &mut Context<Self>,
     ) {
-        let mode = if copy_only {
-            shell::TransferMode::Copy
-        } else {
-            self.file_drag.as_ref().map(|d| d.mode).unwrap_or_default()
-        };
-        self.confirm_drop_mode(paths, destination, mode, cx);
+        let mode =
+            rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+        if !rust_explorer::file_drag::allows(&paths, &destination, mode)
+            || navigation::is_app_virtual(&destination)
+            || self.busy
+            || self.options.is_some()
+            || self.dialog.is_some()
+        {
+            return;
+        }
+        self.rename_token += 1;
+        self.pending_selection_click = None;
+        self.run_shell(
+            shell::Request::Transfer {
+                paths,
+                destination,
+                copy_only: mode == shell::TransferMode::Copy,
+                mode,
+            },
+            cx,
+        );
     }
     fn confirm_drop_mode(
         &mut self,
@@ -986,7 +1146,7 @@ impl Explorer {
         mode: shell::TransferMode,
         cx: &mut Context<Self>,
     ) {
-        if paths.is_empty()
+        if !rust_explorer::file_drag::allows(&paths, &destination, mode)
             || navigation::is_app_virtual(&destination)
             || self.busy
             || self.options.is_some()
@@ -1029,23 +1189,27 @@ impl Explorer {
                 Some(self.dir())
             }
             _ => None,
-        }
-        .filter(|target| {
-            !paths
-                .iter()
-                .any(|source| target == source || target.starts_with(source))
-        });
-        let mode = if modifiers.alt {
-            shell::TransferMode::Link
-        } else if modifiers.control {
-            shell::TransferMode::Copy
-        } else if modifiers.shift {
-            shell::TransferMode::Move
+        };
+        let mode =
+            rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+        let target = target.filter(|target| rust_explorer::file_drag::allows(&paths, target, mode));
+        let previews = if let Some(drag) = &self.file_drag {
+            drag.previews.clone()
         } else {
-            shell::TransferMode::Auto
+            paths
+                .iter()
+                .take(3)
+                .filter_map(|path| {
+                    self.entries
+                        .iter()
+                        .find(|entry| &entry.path == path)
+                        .cloned()
+                })
+                .collect()
         };
         self.file_drag = Some(FileDragState {
             paths,
+            previews,
             position,
             target,
             mode,
@@ -1056,27 +1220,13 @@ impl Explorer {
         let Some(target) = &drag.target else {
             return rust_explorer::trf!("{} 个项目 · 不能放置到此处", drag.paths.len());
         };
-        let operation = match drag.mode {
-            shell::TransferMode::Copy => rust_explorer::i18n::text("复制到"),
-            shell::TransferMode::Move => rust_explorer::i18n::text("移动到"),
-            shell::TransferMode::Link => rust_explorer::i18n::text("创建快捷方式到"),
-            shell::TransferMode::Auto => {
-                let target_volume = target
-                    .components()
-                    .next()
-                    .map(|p| p.as_os_str().to_string_lossy().to_lowercase());
-                if drag.paths.iter().all(|path| {
-                    path.components()
-                        .next()
-                        .map(|p| p.as_os_str().to_string_lossy().to_lowercase())
-                        == target_volume
-                }) {
-                    rust_explorer::i18n::text("移动到")
-                } else {
-                    rust_explorer::i18n::text("复制到")
-                }
-            }
-        };
+        let operation =
+            match rust_explorer::file_drag::feedback_mode(&drag.paths, target, drag.mode) {
+                shell::TransferMode::Copy => rust_explorer::i18n::text("复制到"),
+                shell::TransferMode::Move => rust_explorer::i18n::text("移动到"),
+                shell::TransferMode::Link => rust_explorer::i18n::text("创建快捷方式到"),
+                shell::TransferMode::Auto => unreachable!("feedback resolves Auto"),
+            };
         rust_explorer::trf!(
             "{} 个项目 · {operation} {}",
             drag.paths.len(),
@@ -1085,6 +1235,139 @@ impl Explorer {
                 .unwrap_or(target.as_os_str())
                 .to_string_lossy()
         )
+    }
+    pub(super) fn render_file_drag(
+        &self,
+        drag: &FileDragState,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        // Read only already-loaded images. A pointer move must never wait on
+        // thumbnail generation, file metadata or a network location.
+        let mut stack = div().relative().w(ui(104.)).h(ui(104.));
+        for (layer, path) in drag.paths.iter().take(3).enumerate().rev() {
+            let entry = drag.previews.iter().find(|entry| &entry.path == path);
+            let directory = entry.is_some_and(|entry| entry.directory);
+            let key = entry.and_then(|entry| {
+                rust_explorer::thumbnails::Key::from_entry(
+                    entry,
+                    visual::thumbnail_pixels(self.view.icon_size()),
+                )
+            });
+            let picture = key.as_ref().and_then(|key| {
+                let bytes = self.thumbnails.image(key)?;
+                visual::thumbnail_image(key, &bytes)
+            });
+            let presentation = key
+                .as_ref()
+                .and_then(|key| self.thumbnails.presentation(key))
+                .unwrap_or_default();
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .left(ui(layer as f32 * 6.))
+                    .top(ui(layer as f32 * 6.))
+                    .size(ui(88.))
+                    .rounded(ui(3.))
+                    .bg(rgba(if t.dark { 0x30303090 } else { 0xffffff90 }))
+                    .border_1()
+                    .border_color(rgba(if t.dark { 0xffffff40 } else { 0x00000030 }))
+                    .p(ui(4.))
+                    .opacity(0.82)
+                    .child(visual::thumbnail_or_icon(
+                        path,
+                        directory,
+                        t.text,
+                        78.,
+                        picture,
+                        (presentation.width, presentation.height),
+                        directory || presentation.directory,
+                        &self.thumbnail_images,
+                        cx,
+                    )),
+            );
+        }
+        if drag.paths.len() > 1 {
+            stack = stack.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .min_w(ui(24.))
+                    .h(ui(24.))
+                    .px(ui(5.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui(3.))
+                    .bg(rgb(0x0078d4))
+                    .text_color(rgb(0xffffff))
+                    .child(drag.paths.len().to_string()),
+            );
+        }
+        let badge = if drag.target.is_none() {
+            "close"
+        } else {
+            match rust_explorer::file_drag::feedback_mode(
+                &drag.paths,
+                drag.target.as_ref().unwrap(),
+                drag.mode,
+            ) {
+                shell::TransferMode::Copy => "plus",
+                shell::TransferMode::Link => "shortcut",
+                _ => "forward",
+            }
+        };
+        // Keep the complete feedback inside a narrow or high-DPI window.
+        let viewport = window.viewport_size();
+        let width = (f32::from(viewport.width) / self.zoom - 8.).clamp(40., 360.);
+        let left = f32::from(drag.position.x) + 16. * self.zoom;
+        let top = f32::from(drag.position.y) + 20. * self.zoom;
+        div()
+            .absolute()
+            .left(px(left.min(
+                (f32::from(viewport.width) - width * self.zoom - 4.).max(0.),
+            )))
+            .top(px(top.min(
+                (f32::from(viewport.height) - 142. * self.zoom).max(0.),
+            )))
+            .w(ui(width))
+            .flex()
+            .flex_col()
+            .gap(ui(4.))
+            .child(stack)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(ui(6.))
+                    .px(ui(8.))
+                    .py(ui(4.))
+                    .rounded(ui(3.))
+                    .shadow_md()
+                    .border_1()
+                    .border_color(rgb(t.border))
+                    .bg(rgb(t.panel))
+                    .text_color(rgb(t.text))
+                    .child(visual::icon(
+                        badge,
+                        if drag.target.is_some() {
+                            t.accent
+                        } else {
+                            t.muted
+                        },
+                    ))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.file_drag_label(drag)),
+                    ),
+            )
+            .into_any_element()
     }
     pub(super) fn horizontal_scrollbar(
         &self,
@@ -1266,11 +1549,20 @@ impl Explorer {
             parts
         } else if navigation::is_app_virtual(&self.dir()) {
             vec![(navigation::location_name(&self.dir()), self.dir())]
+        } else if let Some(segments) = rust_explorer::network::breadcrumbs(&self.dir()) {
+            // `\\server\share` is one path prefix to Rust; the address bar shows
+            // the server and the share as the two locations they are.
+            let mut parts = vec![(navigation::computer_name(), volumes::computer())];
+            parts.extend(segments);
+            parts
         } else {
             let mut parts = vec![(navigation::computer_name(), volumes::computer())];
             parts.extend(
                 self.dir()
                     .ancestors()
+                    // A root-only `\` is not a location and must not become a
+                    // breadcrumb.
+                    .filter(|part| *part != std::path::Path::new("\\"))
                     .collect::<Vec<_>>()
                     .into_iter()
                     .rev()
@@ -1319,11 +1611,18 @@ impl Explorer {
             .rounded(ui(4.))
             .flex()
             .items_center()
-            .gap_1()
+            // No flex gap: every pixel between two segments belongs to the crumb
+            // or to its chevron, so a click there never falls through to the
+            // address editor.
             .px_2()
             .overflow_hidden()
-            .cursor_pointer()
+            .cursor_default()
             .on_click(cx.listener(|v, _, w, cx| v.focus_address(w, cx)));
+        let root_open = self
+            .popup
+            .as_ref()
+            .is_some_and(|(kind, _)| kind == "crumb-children")
+            && self.crumb_children_path.as_deref() == Some(std::path::Path::new("::RootPlaces"));
         crumbs = crumbs
             .child(
                 div()
@@ -1339,7 +1638,41 @@ impl Explorer {
                         t.text,
                     )),
             )
-            .child(visual::icon("chevron-right", t.muted));
+            // The leftmost chevron offers the places above This PC, like
+            // Explorer's address bar.
+            .child(
+                div()
+                    .id("root-chevron")
+                    .h_full()
+                    .w(ui(24.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui(3.))
+                    .cursor_default()
+                    .hover(move |s| s.bg(rgb(t.hover)))
+                    .child(visual::icon(
+                        if root_open {
+                            "chevron-down"
+                        } else {
+                            "chevron-right"
+                        },
+                        t.muted,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.open_crumb_children(
+                                PathBuf::from("::RootPlaces"),
+                                None,
+                                point(e.position.x, e.position.y + px(22. * v.zoom)),
+                                cx,
+                            );
+                        }),
+                    ),
+            );
         if hidden > 0 {
             crumbs = crumbs
                 .child(
@@ -1364,7 +1697,20 @@ impl Explorer {
                 .child(visual::icon("chevron-right", t.muted));
         }
         let n = parts.len();
+        // The chevron after a segment lists that segment's folders, with the one
+        // that continues the current path marked. The last segment has no
+        // chevron, like Explorer.
+        let next_of: Vec<Option<PathBuf>> = (0..n)
+            .map(|index| parts.get(index + 1).map(|(_, path)| path.clone()))
+            .collect();
         for (index, (label, path)) in parts.into_iter().enumerate() {
+            let target = path.clone();
+            let current = next_of[index].clone();
+            let open = self
+                .popup
+                .as_ref()
+                .is_some_and(|(kind, _)| kind == "crumb-children")
+                && self.crumb_children_path.as_ref() == Some(&path);
             crumbs = crumbs.child(
                 div()
                     .id(("crumb", index))
@@ -1375,7 +1721,7 @@ impl Explorer {
                     .flex()
                     .items_center()
                     .rounded(ui(3.))
-                    .cursor_pointer()
+                    .cursor_default()
                     .hover(move |s| s.bg(rgb(t.hover)))
                     .when(index + 1 < n, |d| d.flex_shrink_0())
                     .child(
@@ -1397,7 +1743,42 @@ impl Explorer {
                         }
                     })),
             );
-            crumbs = crumbs.child(visual::icon("chevron-right", t.muted));
+            if index + 1 == n {
+                continue;
+            }
+            crumbs = crumbs.child(
+                div()
+                    .id(("crumb-chevron", index))
+                    .h_full()
+                    .w(ui(24.))
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(ui(3.))
+                    .cursor_default()
+                    .hover(move |s| s.bg(rgb(t.hover)))
+                    .child(visual::icon(
+                        if open {
+                            "chevron-down"
+                        } else {
+                            "chevron-right"
+                        },
+                        t.muted,
+                    ))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, e: &MouseDownEvent, _, cx| {
+                            cx.stop_propagation();
+                            v.open_crumb_children(
+                                target.clone(),
+                                current.clone(),
+                                point(e.position.x, e.position.y + px(22. * v.zoom)),
+                                cx,
+                            );
+                        }),
+                    ),
+            );
         }
         crumbs
             .child(div().min_w(ui(64.)).h_full().flex_1())
@@ -2565,9 +2946,7 @@ impl Explorer {
             })
             .on_drag(drag, move |drag, _, w, cx| {
                 let _ = source.update(cx, |v, cx| {
-                    v.rename_token += 1;
-                    v.pending_selection_click = None;
-                    v.update_file_drag(drag.paths.clone(), w.mouse_position(), w.modifiers(), cx);
+                    v.begin_native_drag(drag.paths.clone(), w, cx);
                 });
                 cx.new(|_| drag.clone())
             })
@@ -2922,7 +3301,7 @@ impl Explorer {
                 })
             })
             .when(entry.hidden, |d| d.opacity(0.5))
-            .cursor_pointer()
+            .cursor_default()
             .when(self.inline_rename.is_none(), |d| {
                 d.on_drag(
                     DragFiles {
@@ -2934,14 +3313,7 @@ impl Explorer {
                     },
                     move |drag, _, w, cx| {
                         let _ = drag_source.update(cx, |v, cx| {
-                            v.rename_token += 1;
-                            v.pending_selection_click = None;
-                            v.update_file_drag(
-                                drag.paths.clone(),
-                                w.mouse_position(),
-                                w.modifiers(),
-                                cx,
-                            );
+                            v.begin_native_drag(drag.paths.clone(), w, cx);
                         });
                         cx.new(|_| drag.clone())
                     },
@@ -3018,11 +3390,11 @@ impl Explorer {
             row = row
                 .on_drop(cx.listener(move |v, drag: &DragFiles, w, cx| {
                     cx.stop_propagation();
-                    v.confirm_drop(drag.paths.clone(), path.clone(), w.modifiers().control, cx);
+                    v.confirm_drop(drag.paths.clone(), path.clone(), w.modifiers(), cx);
                 }))
-                .on_drop(cx.listener(move |v, drag: &ExternalPaths, _, cx| {
+                .on_drop(cx.listener(move |v, drag: &ExternalPaths, w, cx| {
                     cx.stop_propagation();
-                    v.confirm_drop(drag.paths().to_vec(), external.clone(), false, cx);
+                    v.confirm_drop(drag.paths().to_vec(), external.clone(), w.modifiers(), cx);
                 }));
         } else {
             // A file is not a destination; consume the drop so it cannot
@@ -3162,7 +3534,12 @@ impl Explorer {
                     )
                 })
                 .when(
-                    (has_thumbnail && presentation.shortcut) || entry.link,
+                    rust_explorer::layout_metrics::needs_link_badge(
+                        entry.link,
+                        has_thumbnail,
+                        rust_explorer::preview::is_shortcut(&entry.path),
+                        rust_explorer::preview::is_url_shortcut(&entry.path),
+                    ),
                     |d| d.child(visual::link_badge(self.view.icon_size())),
                 );
             if self.view == ViewMode::Content {
@@ -3616,37 +3993,6 @@ impl Explorer {
             .collect();
         }
         match kind {
-            "system-operations" => self
-                .system_operations
-                .iter()
-                .rev()
-                .flat_map(|op| {
-                    let elapsed = op
-                        .finished
-                        .unwrap_or_else(Instant::now)
-                        .duration_since(op.started)
-                        .as_secs_f32();
-                    let mut items = vec![
-                        MenuItem::new(
-                            "operation-info",
-                            rust_explorer::trf!("{} · {:.1}秒 · {}", op.label, elapsed, op.status),
-                        )
-                        .enable(false),
-                    ];
-                    if op.finished.is_none() {
-                        items.push(MenuItem::new(
-                            format!("operation-stop:{}", op.id),
-                            rust_explorer::i18n::text("停止（请求关闭系统窗口）"),
-                        ));
-                        items.push(MenuItem::new(
-                            format!("operation-force:{}", op.id),
-                            rust_explorer::i18n::text("强行停止（可能已完成部分操作）"),
-                        ));
-                    }
-                    items.push(MenuItem::separator());
-                    items
-                })
-                .collect(),
             "text-menu" => [
                 ("cut", rust_explorer::i18n::text("剪切    Ctrl+X")),
                 ("copy", rust_explorer::i18n::text("复制    Ctrl+C")),
@@ -4301,74 +4647,128 @@ impl Explorer {
         }
         panel.into_any_element()
     }
+    /// Dropdown behind a breadcrumb chevron: the folders of the segment to its
+    /// left, with the one that continues the current path marked.
+    fn render_crumb_children(
+        &self,
+        position: Point<Pixels>,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let t = self.theme;
+        let width_logical = 280.;
+        let width = width_logical * self.zoom;
+        let row = 28. * self.zoom;
+        let height =
+            (self.crumb_children.len().max(1) as f32 * row + 10. * self.zoom).min(420. * self.zoom);
+        let max_y = f32::from(window.viewport_size().height);
+        let max_x = (f32::from(window.viewport_size().width) - width - 8.).max(8.);
+        let x = f32::from(position.x).clamp(8., max_x);
+        let y = if f32::from(position.y) + height > max_y - 8. {
+            (f32::from(position.y) - height).max(40. * self.zoom)
+        } else {
+            f32::from(position.y)
+        };
+        let mut panel = div()
+            .id("crumb-children")
+            .occlude()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(ui(width_logical))
+            .max_h(px(height))
+            .overflow_y_scroll()
+            .track_scroll(&self.crumb_scroll)
+            .p_1()
+            .rounded(ui(8.))
+            .bg(rgb(if t.dark { 0x2b2b2b } else { 0xfafafa }))
+            .border_1()
+            .border_color(rgb(t.border))
+            .shadow_lg()
+            .flex()
+            .flex_col()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            .on_scroll_wheel(cx.listener(|_, _, _, cx| cx.notify()));
+        if self.crumb_children_loading {
+            panel = panel.child(
+                div()
+                    .px_2()
+                    .py_1()
+                    .text_color(rgb(t.muted))
+                    .child(rust_explorer::i18n::text("正在加载…")),
+            );
+        }
+        for (index, row) in self.crumb_children.iter().enumerate() {
+            let path = row.path.clone();
+            let selected = self.crumb_children_current.as_ref() == Some(&row.path);
+            panel = panel.child(
+                div()
+                    .id(("crumb-child", index))
+                    .h(ui(28.))
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .rounded(ui(4.))
+                    .cursor_default()
+                    .when(selected, |d| d.bg(rgb(t.hover)))
+                    .hover(move |s| s.bg(rgb(if t.dark { 0x414141 } else { t.hover })))
+                    .child(match row.glyph {
+                        Some(glyph) => visual::icon_sized(glyph, t.text, 16.),
+                        None => visual::file_icon_sized(&row.path, true, t.text, 16.),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(row.label.clone()),
+                    )
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        cx.stop_propagation();
+                        v.popup = None;
+                        v.crumb_children_path = None;
+                        if path == std::path::Path::new(navigation::CONTROL_PANEL) {
+                            // Its items are Shell virtual folders this app cannot
+                            // operate on: hand the Control Panel to Windows.
+                            v.open_control_panel(cx);
+                            return;
+                        }
+                        v.navigate(path.clone(), cx);
+                    })),
+            );
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|v, _, _, cx| {
+                    cx.stop_propagation();
+                    v.popup = None;
+                    v.crumb_children_path = None;
+                    cx.notify();
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|v, _, _, cx| {
+                    cx.stop_propagation();
+                    v.popup = None;
+                    v.crumb_children_path = None;
+                    cx.notify();
+                }),
+            )
+            .child(panel)
+            .into_any_element()
+    }
     pub(super) fn render_popup(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let (kind, position) = self.popup.clone().unwrap();
-        if kind == "system-operations" {
-            let t = self.theme;
-            let mut panel = div()
-                .id("system-operation-panel")
-                .w(ui(520.))
-                .max_w(px((f32::from(window.viewport_size().width) - 24.).max(120.)))
-                .max_h(px((f32::from(window.viewport_size().height) - 80.).max(80.)))
-                .overflow_y_scroll()
-                .p_3()
-                .rounded(ui(8.))
-                .bg(rgb(t.input))
-                .border_1()
-                .border_color(rgb(t.border))
-                .shadow_lg()
-                .flex()
-                .flex_col()
-                .gap_3()
-                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                .child(
-                    div()
-                        .text_size(ui(15.))
-                        .child(rust_explorer::i18n::text("系统操作详情")),
-                );
-            if self.system_operations.is_empty() {
-                panel = panel.child(rust_explorer::i18n::text("暂无系统操作记录"));
-            }
-            for op in self.system_operations.iter().rev() {
-                let elapsed = op
-                    .finished
-                    .unwrap_or_else(Instant::now)
-                    .duration_since(op.started)
-                    .as_secs_f32();
-                let id = op.id;
-                let mut card = div()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .pb_2()
-                    .border_b_1()
-                    .border_color(rgb(t.border))
-                    .child(op.label.clone())
-                    .child(rust_explorer::trf!("用时：{elapsed:.1} 秒"))
-                    .child(div().whitespace_normal().child(op.status.clone()));
-                if op.finished.is_none() {
-                    card = card.child(div().flex().gap_2()
-                        .child(button(("stop-operation", id), rust_explorer::i18n::text("停止"), t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-stop:{id}"), w, cx))))
-                        .child(button(("force-operation", id), rust_explorer::i18n::text("强行停止"), t).on_click(cx.listener(move |v, _, w, cx| v.menu_command(&format!("operation-force:{id}"), w, cx)))))
-                        .child(div().text_size(ui(11.)).text_color(rgb(t.muted)).child(rust_explorer::i18n::text("强行停止不会回滚已完成的文件操作；提升权限的系统窗口可能需要手动关闭。")));
-                }
-                panel = panel.child(card);
-            }
-            return div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|v, _, _, cx| {
-                        v.popup = None;
-                        cx.notify();
-                    }),
-                )
-                .child(panel)
-                .into_any_element();
+        if kind == "crumb-children" {
+            return self.render_crumb_children(position, window, cx);
         }
         let width_logical = self.menu_width(&kind, window, cx);
         let width = width_logical * self.zoom;
@@ -4538,29 +4938,6 @@ impl Explorer {
         cx.notify();
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
-        if let Some((force, number)) = id
-            .strip_prefix("operation-stop:")
-            .map(|id| (false, id))
-            .or_else(|| id.strip_prefix("operation-force:").map(|id| (true, id)))
-        {
-            if let Ok(number) = number.parse::<u64>() {
-                if let Some(op) = self
-                    .system_operations
-                    .iter_mut()
-                    .find(|op| op.id == number && op.finished.is_none())
-                {
-                    op.control.stop(force);
-                    op.status = if force {
-                        rust_explorer::i18n::text("正在强行停止")
-                    } else {
-                        rust_explorer::i18n::text("正在请求停止")
-                    }
-                    .into();
-                }
-            }
-            cx.notify();
-            return;
-        }
         if let Some(payload) = id.strip_prefix("shell-verb:") {
             match serde_json::from_str::<shell::Request>(payload) {
                 Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
@@ -4913,7 +5290,7 @@ impl Explorer {
                     }
                 }
             }
-            "refresh-folder" => self.reload(cx),
+            "refresh-folder" => self.refresh_current(cx),
             "refresh-quick" => {
                 self.quick_access_tick = Instant::now() - Duration::from_secs(30);
                 self.refresh_quick_access(cx);
@@ -5687,6 +6064,21 @@ impl Explorer {
                     settings.high_performance,
                     cx,
                 ));
+            body = body
+                .child(
+                    div()
+                        .py_2()
+                        .text_color(rgb(t.muted))
+                        .child(rust_explorer::i18n::text("缩略图")),
+                )
+                .child(self.setting_row(
+                    "immediate-thumbnails",
+                    rust_explorer::i18n::text(
+                        "打开文件夹时立即加载所有缩略图（不再随滚动加载当前视图的图标）",
+                    ),
+                    settings.immediate_thumbnails,
+                    cx,
+                ));
             let source = rust_explorer::fluent_icons::resource_status();
             body = body
                 .child(div().py_2().text_color(rgb(t.muted)).child(rust_explorer::i18n::text("界面资源")))
@@ -5862,6 +6254,7 @@ fn toggle_option(settings: &mut Settings, id: &str) {
         "high-performance" => settings.high_performance = !settings.high_performance,
         "compact" => settings.compact = !settings.compact,
         "thumbnails" => settings.thumbnails = !settings.thumbnails,
+        "immediate-thumbnails" => settings.immediate_thumbnails = !settings.immediate_thumbnails,
         "full-system-menu" => settings.full_system_menu = !settings.full_system_menu,
         "full-path" => settings.full_path = !settings.full_path,
         "preview" => settings.preview = !settings.preview,

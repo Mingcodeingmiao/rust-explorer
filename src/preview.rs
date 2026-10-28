@@ -18,6 +18,13 @@ pub fn is_shortcut(path: &Path) -> bool {
         value.eq_ignore_ascii_case("lnk") || value.eq_ignore_ascii_case("url")
     })
 }
+/// `.url` Shell icons already carry the link arrow, so a drawn badge would be a
+/// second arrow. `.lnk` keeps the drawn badge: its large-view thumbnail is the
+/// target icon, which has no overlay of its own.
+pub fn is_url_shortcut(path: &Path) -> bool {
+    path.extension()
+        .is_some_and(|value| value.to_string_lossy().eq_ignore_ascii_case("url"))
+}
 /// Resolve before deciding the allowlisted preview type. Ordinary files avoid
 /// a helper round-trip; shortcuts never execute the destination application.
 pub fn resolve_source(

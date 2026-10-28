@@ -512,6 +512,44 @@ pub fn prewarm_menu_host() {
         *guard = None;
     }
 }
+/// Load the Shell's context-menu handlers into this process before the first
+/// right-click. The first `QueryContextMenu` on a cold process loads every
+/// registered shell extension (≈250 ms–1 s on machines with many of them); the
+/// menu window itself is built in-process, so warming has to happen here rather
+/// than in a helper process.
+pub fn prewarm_in_process_menu() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::thread::Builder::new()
+            .name("shell-menu-prewarm".into())
+            .spawn(|| {
+                let started = std::time::Instant::now();
+                let exe = std::env::current_exe().ok();
+                let folder = exe
+                    .as_ref()
+                    .and_then(|exe| exe.parent().map(Path::to_path_buf))
+                    .unwrap_or_else(std::env::temp_dir);
+                // A selected file warms the file-type handlers, the folder itself
+                // warms the background menu; both share the same extension modules.
+                let warmups: Vec<(Vec<PathBuf>, PathBuf)> = exe
+                    .map(|exe| vec![(vec![exe], folder.clone()), (Vec::new(), folder.clone())])
+                    .unwrap_or_else(|| vec![(Vec::new(), folder.clone())]);
+                for (paths, folder) in warmups {
+                    let result = on_menu_sta(move || {
+                        context_menu_options(
+                            &paths, &folder, 0, 0, None, false, false, true, None, false, None,
+                        )
+                    });
+                    menu_trace(format!(
+                        "prewarm: in-process menu ok={} elapsed={:?}",
+                        result.is_ok(),
+                        started.elapsed()
+                    ));
+                }
+            })
+            .ok();
+    });
+}
 /// Exit this helper as soon as its parent process disappears.
 ///
 /// A menu host can sit inside `TrackPopupMenuEx`, where it cannot observe a
