@@ -16,7 +16,7 @@ Latest published download: [Rust Explorer 0.7.9 part1](https://github.com/Mingco
 - Tabs, breadcrumbs, navigation history and keyboard shortcuts.
 - Eight views, adjustable columns, sorting, grouping, filters and marquee selection; an optional fixed-pool high-performance mode falls back to the traditional implementation for unsupported views.
 - System Quick Access synchronization, resizable panes and drive capacity views. Portable/MTP devices support full breadcrumbs, tree expansion, storage-capacity pages, Shell copy/paste and context menus.
-- Native clipboard/Shell operations, drag/drop confirmation and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
+- Native clipboard/Shell operations, Windows OLE file drag and drop, and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
 - Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
 - Light/dark/system themes, zoom, high-DPI icons and optional Everything integration.
