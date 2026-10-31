@@ -171,8 +171,13 @@ fn main() {
             }
             rust_explorer::shell::serve_menu_requests()
         }
-        Some("--shell-stdin") => rust_explorer::shell::read_request(std::io::stdin().lock())
-            .and_then(rust_explorer::shell::dispatch),
+        Some("--shell-stdin") => {
+            if let Some(name) = args.get(2) {
+                rust_explorer::shell::watch_stop_event(name);
+            }
+            rust_explorer::shell::read_request(std::io::stdin().lock())
+                .and_then(rust_explorer::shell::dispatch)
+        }
         Some("--shell") => args
             .get(2)
             .ok_or_else(|| anyhow::anyhow!("缺少 Shell 请求"))

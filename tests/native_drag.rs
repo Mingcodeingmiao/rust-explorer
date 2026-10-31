@@ -12,6 +12,14 @@ unsafe extern "C" {
         keys: u32,
         effect: *mut u32,
     ) -> i32;
+    fn re_test_drop_handoff(
+        source: *const u16,
+        destination: *const u16,
+        keys: u32,
+        effect: *mut u32,
+        marked: bool,
+        queued: *mut u32,
+    ) -> i32;
 }
 fn wide(path: &Path) -> Vec<u16> {
     path.as_os_str().encode_wide().chain(Some(0)).collect()
@@ -91,5 +99,39 @@ fn transfer_fixture(root: &Path) {
         );
         assert_eq!(source.exists(), expected_effect == 1);
         assert_eq!(effect, expected_effect);
+    }
+    // Returning early is safe only for our own source, which leaves the entire
+    // move to the helper. A foreign source must see a completed Shell transfer.
+    for marked in [false, true] {
+        let name = if marked {
+            "owned-source.txt"
+        } else {
+            "foreign-source.txt"
+        };
+        let source = root.join(name);
+        std::fs::write(&source, b"deferred transfer contract").unwrap();
+        let mut effect = 0;
+        let mut queued = 0;
+        let hr = unsafe {
+            re_test_drop_handoff(
+                wide(&source).as_ptr(),
+                wide(&destination).as_ptr(),
+                8,
+                &mut effect,
+                marked,
+                &mut queued,
+            )
+        };
+        assert!(hr >= 0, "drop handoff failed: 0x{:08X}", hr as u32);
+        assert_eq!(effect, 1);
+        assert_eq!(queued, u32::from(marked));
+        assert!(source.exists());
+        assert_eq!(destination.join(name).exists(), !marked);
+        if !marked {
+            assert_eq!(
+                std::fs::read(destination.join(name)).unwrap(),
+                b"deferred transfer contract"
+            );
+        }
     }
 }

@@ -12,6 +12,7 @@ unsafe extern "C" {
     fn re_register_file_drop(
         owner: isize,
         callback: extern "C" fn(i32, f32, f32, *mut u16, u32, *mut c_void) -> i32,
+        drop: extern "C" fn(*const *const u16, u32, *const u16, u32, *mut c_void),
         context: *mut c_void,
         registration: *mut *mut c_void,
     ) -> i32;
@@ -32,11 +33,66 @@ pub fn trace(message: &str) {
     }
 }
 
+/// One completed native drop. The transfer itself runs in the cancellable
+/// helper, never on the UI thread that is still inside OLE's Drop callback.
+pub struct DropRequest {
+    pub paths: Vec<PathBuf>,
+    pub destination: PathBuf,
+    pub effect: u32,
+}
+
 struct Context {
     resolve: Box<dyn Fn(f32, f32) -> Option<PathBuf>>,
     completed: Cell<bool>,
     enabled: Cell<bool>,
     source_tx: mpsc::Sender<Result<u32, String>>,
+    drop_tx: mpsc::Sender<DropRequest>,
+}
+fn wide_text(mut pointer: *const u16) -> Option<String> {
+    if pointer.is_null() {
+        return None;
+    }
+    let start = pointer;
+    let mut length = 0usize;
+    while length < 32768 {
+        if unsafe { *pointer } == 0 {
+            let text = unsafe { std::slice::from_raw_parts(start, length) };
+            return Some(String::from_utf16_lossy(text));
+        }
+        pointer = unsafe { pointer.add(1) };
+        length += 1;
+    }
+    None
+}
+extern "C" fn drop_callback(
+    paths: *const *const u16,
+    count: u32,
+    destination: *const u16,
+    effect: u32,
+    context: *mut c_void,
+) {
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if paths.is_null() || destination.is_null() || context.is_null() || count == 0 {
+            return;
+        }
+        let context = unsafe { &*(context as *const Context) };
+        let mut collected = Vec::with_capacity(count as usize);
+        for index in 0..count as usize {
+            let pointer = unsafe { *paths.add(index) };
+            let Some(text) = wide_text(pointer) else {
+                return;
+            };
+            collected.push(PathBuf::from(text));
+        }
+        let Some(destination) = wide_text(destination) else {
+            return;
+        };
+        let _ = context.drop_tx.send(DropRequest {
+            paths: collected,
+            destination: PathBuf::from(destination),
+            effect,
+        });
+    }));
 }
 extern "C" fn callback(
     kind: i32,
@@ -94,6 +150,7 @@ pub struct DropTarget {
     context: *mut Context,
     pub background: Rc<RefCell<Option<PathBuf>>>,
     source_rx: mpsc::Receiver<Result<u32, String>>,
+    drop_rx: mpsc::Receiver<DropRequest>,
 }
 impl DropTarget {
     pub fn register(
@@ -102,15 +159,24 @@ impl DropTarget {
         resolve: impl Fn(f32, f32) -> Option<PathBuf> + 'static,
     ) -> anyhow::Result<Self> {
         let (source_tx, source_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
         let context = Box::into_raw(Box::new(Context {
             resolve: Box::new(resolve),
             completed: Cell::new(false),
             enabled: Cell::new(true),
             source_tx,
+            drop_tx,
         }));
         let mut registration = std::ptr::null_mut();
-        let hr =
-            unsafe { re_register_file_drop(owner, callback, context.cast(), &mut registration) };
+        let hr = unsafe {
+            re_register_file_drop(
+                owner,
+                callback,
+                drop_callback,
+                context.cast(),
+                &mut registration,
+            )
+        };
         anyhow::ensure!(hr >= 0, "RegisterDragDrop failed: 0x{:08X}", hr as u32);
         Ok(Self {
             owner,
@@ -118,6 +184,7 @@ impl DropTarget {
             context,
             background,
             source_rx,
+            drop_rx,
         })
     }
     pub fn take_completed(&self) -> bool {
@@ -130,6 +197,9 @@ impl DropTarget {
     }
     pub fn source_result(&self) -> Option<Result<u32, String>> {
         self.source_rx.try_recv().ok()
+    }
+    pub fn take_drop(&self) -> Option<DropRequest> {
+        self.drop_rx.try_recv().ok()
     }
     pub fn start(&self, paths: &[PathBuf]) -> anyhow::Result<()> {
         anyhow::ensure!(!paths.is_empty(), "No files selected for dragging");
@@ -154,5 +224,44 @@ impl Drop for DropTarget {
         unsafe {
             re_unregister_file_drop(self.owner, self.registration);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn drop_callback_copies_wide_paths_and_effect() {
+        let (source_tx, _source_rx) = mpsc::channel();
+        let (drop_tx, drop_rx) = mpsc::channel();
+        let context = Box::into_raw(Box::new(Context {
+            resolve: Box::new(|_, _| None),
+            completed: Cell::new(false),
+            enabled: Cell::new(true),
+            source_tx,
+            drop_tx,
+        }));
+        let source = "C:\\opt\\mingw64"
+            .encode_utf16()
+            .chain(Some(0))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            wide_text(source.as_ptr()),
+            Some("C:\\opt\\mingw64".to_string())
+        );
+        let destination = "R:\\".encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+        let pointers = [source.as_ptr()];
+        drop_callback(
+            pointers.as_ptr(),
+            1,
+            destination.as_ptr(),
+            1,
+            context.cast(),
+        );
+        let request = drop_rx.try_recv().expect("drop request");
+        assert_eq!(request.paths, vec![PathBuf::from("C:\\opt\\mingw64")]);
+        assert_eq!(request.destination, PathBuf::from("R:\\"));
+        assert_eq!(request.effect, 1);
+        unsafe { drop(Box::from_raw(context)) };
     }
 }

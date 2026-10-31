@@ -228,7 +228,6 @@ struct CrumbRow {
 }
 
 struct Explorer {
-    next_operation: u64,
     marquee: Option<Marquee>,
     settings: Settings,
     options: Option<Settings>,
@@ -977,7 +976,6 @@ impl Explorer {
             descending: false,
             loading: false,
             busy: false,
-            next_operation: 0,
             system_menu_active: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
@@ -1058,6 +1056,14 @@ impl Explorer {
                             .is_some_and(|target| target.take_completed())
                         {
                             this.reload(cx);
+                        }
+                        let dropped = this
+                            .native_drop
+                            .as_ref()
+                            .and_then(|target| target.as_ref().ok())
+                            .and_then(|target| target.take_drop());
+                        if let Some(drop) = dropped {
+                            this.accept_native_drop(drop, cx);
                         }
                         if let Some(request) = launch_hwnd.and_then(rust_explorer::instance::take) {
                             this.accept_launch(request, cx);
@@ -2257,8 +2263,7 @@ impl Explorer {
         if !passive && !concurrent {
             self.busy = true;
         }
-        self.next_operation += 1;
-        let operation_id = self.next_operation;
+        let operation_id = rust_explorer::operations::next_id();
         let control = shell::OperationControl::default();
         let label = shell::operation_label(&request);
         let details = operation_details(&request);

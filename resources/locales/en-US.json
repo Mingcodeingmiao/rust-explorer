@@ -215,6 +215,8 @@
 "缩略图": "Thumbnails",
 "打开文件夹时立即加载所有缩略图（不再随滚动加载当前视图的图标）": "Load all thumbnails when a folder opens (stop loading icons for the current view while scrolling)",
   "暂无系统操作记录": "No system operation history",
+  "清除事件": "Clear events",
+  "显示主程序": "Show main window",
   "用时：{elapsed:.1} 秒": "Elapsed: {elapsed:.1} seconds",
   "强行停止": "Force stop",
   "强行停止不会回滚已完成的文件操作；提升权限的系统窗口可能需要手动关闭。": "Force stop does not roll back completed file operations; elevated system dialogs may need manual closure.",
