@@ -1139,6 +1139,40 @@ impl Explorer {
             cx,
         );
     }
+    /// Native OLE drops are queued by the window procedure and executed here,
+    /// after Drop has already returned to the source application.
+    pub(super) fn accept_native_drop(
+        &mut self,
+        drop: rust_explorer::native_drag::DropRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let mode = match drop.effect & 0x7 {
+            1 => shell::TransferMode::Copy,
+            2 => shell::TransferMode::Move,
+            4 => shell::TransferMode::Link,
+            _ => return,
+        };
+        if drop.paths.is_empty()
+            || !rust_explorer::file_drag::allows(&drop.paths, &drop.destination, mode)
+            || navigation::is_app_virtual(&drop.destination)
+            || self.busy
+            || self.options.is_some()
+            || self.dialog.is_some()
+        {
+            return;
+        }
+        self.rename_token += 1;
+        self.pending_selection_click = None;
+        self.run_shell(
+            shell::Request::Transfer {
+                paths: drop.paths,
+                destination: drop.destination,
+                copy_only: mode == shell::TransferMode::Copy,
+                mode,
+            },
+            cx,
+        );
+    }
     fn confirm_drop_mode(
         &mut self,
         paths: Vec<PathBuf>,

@@ -1468,7 +1468,11 @@ pub fn dispatch(request: Request) -> Result<()> {
                 None
             } else {
                 anyhow::ensure!(destination.is_dir(), "目标文件夹不存在");
-                Some(std::fs::canonicalize(&destination)?)
+                // Some virtual/RAM volumes reject GetFinalPathNameByHandle
+                // with ERROR_INVALID_FUNCTION. The path is still a valid
+                // IFileOperation destination, so only the containment check
+                // loses its junction-resolved form.
+                Some(std::fs::canonicalize(&destination).unwrap_or_else(|_| destination.clone()))
             };
             if let Some(target) = &target {
                 // Resolve junctions before rejecting a drop onto itself or a descendant.

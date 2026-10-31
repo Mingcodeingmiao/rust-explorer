@@ -2,6 +2,7 @@
 #include "OpenInFolder.h"
 #include <new>
 #include <cstdio>
+#include <cwctype>
 #include <commctrl.h>
 
 static void drag_trace(const char* stage) {
@@ -12,6 +13,7 @@ static void drag_trace(const char* stage) {
 }
 
 using ResolveDrop = int (*)(int, float, float, wchar_t*, unsigned, void*);
+using DropFiles = void (*)(const wchar_t* const*, unsigned, const wchar_t*, unsigned, void*);
 // Optimized Shell moves can return NONE even though the target already moved
 // the files. Use the logical effect for UI refresh only; NEVER rewrite the
 // raw effect returned to an external source (it could delete the files twice).
@@ -29,6 +31,78 @@ static DWORD logical_effect(IDataObject* data, DWORD fallback) {
     }
     ReleaseStgMedium(&medium);
     return effect;
+}
+static std::wstring normalized_path(std::wstring path) {
+    for (auto& ch : path) {
+        if (ch == L'/') ch = L'\\';
+        ch = static_cast<wchar_t>(towlower(ch));
+    }
+    while (path.size() > 3 && path.back() == L'\\') path.pop_back();
+    return path;
+}
+static std::wstring parent_path(const std::wstring& path) {
+    const auto slash = path.find_last_of(L'\\');
+    if (slash == std::wstring::npos) return {};
+    if (slash == 2 && path[1] == L':') return path.substr(0, 3);
+    return path.substr(0, slash);
+}
+static bool is_within(const std::wstring& child, const std::wstring& parent) {
+    return child == parent ||
+           (child.size() > parent.size() &&
+            child.compare(0, parent.size(), parent) == 0 &&
+            child[parent.size()] == L'\\');
+}
+static bool same_volume(const std::wstring& source, const std::wstring& destination) {
+    wchar_t source_root[32768]{};
+    wchar_t destination_root[32768]{};
+    return GetVolumePathNameW(source.c_str(), source_root, 32768) &&
+           GetVolumePathNameW(destination.c_str(), destination_root, 32768) &&
+           _wcsicmp(source_root, destination_root) == 0;
+}
+static bool read_hdrop_paths(IDataObject* data, std::vector<std::wstring>& paths) {
+    FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (FAILED(data->GetData(&format, &medium))) return false;
+    bool found = false;
+    if (medium.tymed == TYMED_HGLOBAL && medium.hGlobal) {
+        const auto drop = static_cast<HDROP>(medium.hGlobal);
+        const auto count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        for (UINT index = 0; index < count; ++index) {
+            const auto length = DragQueryFileW(drop, index, nullptr, 0);
+            if (!length) continue;
+            std::wstring path(length + 1, L'\0');
+            if (!DragQueryFileW(drop, index, path.data(), length + 1)) continue;
+            path.resize(length);
+            paths.push_back(std::move(path));
+        }
+        found = !paths.empty();
+    }
+    ReleaseStgMedium(&medium);
+    return found;
+}
+static DWORD drop_effect(DWORD keys, const std::vector<std::wstring>& paths,
+                         const std::wstring& destination) {
+    const bool control = (keys & MK_CONTROL) != 0;
+    const bool shift = (keys & MK_SHIFT) != 0;
+    const bool alt = (keys & MK_ALT) != 0;
+    if (alt || (control && shift)) return DROPEFFECT_LINK;
+    if (control) return DROPEFFECT_COPY;
+    if (shift) return DROPEFFECT_MOVE;
+    for (const auto& path : paths) {
+        if (!same_volume(path, destination)) return DROPEFFECT_COPY;
+    }
+    return DROPEFFECT_MOVE;
+}
+static bool allows_drop(const std::vector<std::wstring>& paths,
+                        const std::wstring& destination, DWORD effect) {
+    const auto target = normalized_path(destination);
+    if (target.empty()) return false;
+    for (const auto& path : paths) {
+        const auto source = normalized_path(path);
+        if (source.empty() || is_within(target, source)) return false;
+        if (effect == DROPEFFECT_MOVE && parent_path(source) == target) return false;
+    }
+    return true;
 }
 static constexpr UINT START_FILE_DRAG = WM_APP + 0x637;
 static constexpr UINT_PTR DRAG_SUBCLASS = 0x52454444;
@@ -64,6 +138,7 @@ class FileDropTarget final : public IDropTarget {
     LONG refs_ = 1;
     HWND owner_;
     ResolveDrop resolve_;
+    DropFiles drop_;
     void* context_;
     IDataObject* data_ = nullptr;
     IDropTarget* target_ = nullptr;
@@ -136,8 +211,8 @@ public:
         swprintf(error, 96, L"Windows drag/drop failed: 0x%08X", static_cast<unsigned>(hr));
         resolve_(FAILED(hr) ? 4 : 3, static_cast<float>(effect), 0, error, 96, context_);
     }
-    FileDropTarget(HWND owner, ResolveDrop resolve, void* context)
-        : owner_(owner), resolve_(resolve), context_(context) {
+    FileDropTarget(HWND owner, ResolveDrop resolve, DropFiles drop, void* context)
+        : owner_(owner), resolve_(resolve), drop_(drop), context_(context) {
         CoCreateInstance(CLSID_DragDropHelper, nullptr, CLSCTX_INPROC_SERVER,
                          IID_PPV_ARGS(&helper_));
     }
@@ -182,6 +257,38 @@ public:
     HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
         if (!effect) return E_POINTER;
         auto hr = locate(keys, point, effect);
+        // Our own windows must never call the Shell directory target's Drop:
+        // that target runs the whole copy on this thread, which is also the
+        // GPUI thread shared by every Rust Explorer window. Extract the paths
+        // and hand the transfer to the cancellable helper instead, then return
+        // from Drop immediately.
+        if (SUCCEEDED(hr) && drop_ && !path_.empty()) {
+            std::vector<std::wstring> paths;
+            if (read_hdrop_paths(data, paths)) {
+                auto chosen = drop_effect(keys, paths, path_);
+                if (!allows_drop(paths, path_, chosen)) chosen = DROPEFFECT_NONE;
+                if (chosen != DROPEFFECT_NONE) {
+                    std::vector<const wchar_t*> pointers;
+                    pointers.reserve(paths.size());
+                    for (const auto& path : paths) pointers.push_back(path.c_str());
+                    drop_(pointers.data(), static_cast<unsigned>(pointers.size()),
+                          path_.c_str(), chosen, context_);
+                    *effect = chosen;
+                } else {
+                    *effect = DROPEFFECT_NONE;
+                }
+                if (target_) {
+                    target_->DragLeave();
+                    target_->Release();
+                    target_ = nullptr;
+                }
+                POINT p{point.x, point.y};
+                if (helper_) helper_->Drop(data, &p, *effect);
+                reset();
+                if (*effect != DROPEFFECT_NONE) resolve_(1, 0, 0, nullptr, 0, context_);
+                return S_OK;
+            }
+        }
         if (SUCCEEDED(hr) && target_) hr = target_->Drop(data, keys, point, effect);
         else *effect = DROPEFFECT_NONE;
         // Drop terminates the delegate's drag lifecycle; do not call DragLeave again.
@@ -218,14 +325,14 @@ static LRESULT CALLBACK DragSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     return result;
 }
 
-extern "C" HRESULT re_register_file_drop(HWND owner, ResolveDrop callback, void* context,
-                                         void** registration) noexcept {
+extern "C" HRESULT re_register_file_drop(HWND owner, ResolveDrop callback, DropFiles drop,
+                                         void* context, void** registration) noexcept {
     if (!owner || !callback || !registration) {
         if (callback && context) callback(2, 0, 0, nullptr, 0, context);
         return E_INVALIDARG;
     }
     *registration = nullptr;
-    auto target = new (std::nothrow) FileDropTarget(owner, callback, context);
+    auto target = new (std::nothrow) FileDropTarget(owner, callback, drop, context);
     if (!target) { callback(2, 0, 0, nullptr, 0, context); return E_OUTOFMEMORY; }
     // GPUI registers a CF_HDROP-only target. Replace it on the same UI STA.
     HRESULT hr = RevokeDragDrop(owner);
@@ -290,7 +397,8 @@ extern "C" HRESULT re_test_file_drop(const wchar_t* source, const wchar_t* desti
                                 wcscpy(buffer, path); return 1;
                             };
                             ComPtr<IDropTarget> target;
-                            *target.put() = new FileDropTarget(hwnd, callback, const_cast<wchar_t*>(destination));
+                            *target.put() = new FileDropTarget(hwnd, callback, nullptr,
+                                                               const_cast<wchar_t*>(destination));
                             *effect = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
                             POINTL point{};
                             hr = target->DragEnter(data.get(), keys | MK_LBUTTON, point, effect);

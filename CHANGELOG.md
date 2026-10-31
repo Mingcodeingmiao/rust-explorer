@@ -2,7 +2,8 @@
 
 ## [Unreleased]
 
-- 拖放期间在 OLE 模态循环内定时请求重绘源窗口，避免 GPUI 停在最后一帧、看起来像卡死；仍保留 Shell 数据对象和窗口 STA 边界。
+- 修复 Rust Explorer 窗口之间拖动文件夹时两个窗口一起卡死：窗口自己的 OLE Drop 不再调用 Shell 目录目标的同步复制，而是提取 `CF_HDROP` 路径后立即返回，由可取消 helper 异步执行 `Transfer`；源窗口退出 OLE 拖放循环，目标窗口也不再在 UI 线程复制。OLE 模态循环期间仍定时请求重绘源窗口，避免 GPUI 停在最后一帧。
+- 修复 R: 等虚拟/RAM 盘根目录无法作为复制/移动目标的问题：`GetFinalPathNameByHandle` 返回 `ERROR_INVALID_FUNCTION` 时，保留原始目标路径继续执行 Shell 文件操作，而不是直接失败。
 - 系统文件操作的“停止”改为命名事件加 `IFileOperationProgressSink` 协作取消：不再只向进度窗口投递 `WM_CLOSE`，因此没有进度窗口的删除/复制也能在下一个回调处中止。实测 13,878 个文件的永久删除在开始后 20 ms 请求停止，未删除任何文件，helper 以 `0x80270000` 退出。
 
 ## [0.7.9-part1] - 2026-10-28

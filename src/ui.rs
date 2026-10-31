@@ -1059,6 +1059,14 @@ impl Explorer {
                         {
                             this.reload(cx);
                         }
+                        let dropped = this
+                            .native_drop
+                            .as_ref()
+                            .and_then(|target| target.as_ref().ok())
+                            .and_then(|target| target.take_drop());
+                        if let Some(drop) = dropped {
+                            this.accept_native_drop(drop, cx);
+                        }
                         if let Some(request) = launch_hwnd.and_then(rust_explorer::instance::take) {
                             this.accept_launch(request, cx);
                         }
