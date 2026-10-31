@@ -34,6 +34,15 @@ const KEEP: usize = 32;
 
 static RECORDS: OnceLock<Mutex<Vec<OperationRecord>>> = OnceLock::new();
 static VERSION: AtomicU64 = AtomicU64::new(0);
+/// Process-wide operation ids. Window-local counters reused id 1 in every
+/// window, so finishing one window's copy could leave another window's record
+/// "running" forever.
+static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+
+/// Allocate an id that is unique across every Explorer window.
+pub fn next_id() -> u64 {
+    NEXT_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 fn records() -> &'static Mutex<Vec<OperationRecord>> {
     RECORDS.get_or_init(|| Mutex::new(Vec::new()))
@@ -93,6 +102,15 @@ pub fn set_status(id: u64, status: String) {
         && let Some(record) = records.iter_mut().find(|record| record.id == id)
     {
         record.status = status;
+    }
+    changed();
+}
+
+/// Remove finished history while keeping running operations visible so their
+/// stop controls remain available.
+pub fn clear_finished() {
+    if let Ok(mut records) = records().lock() {
+        records.retain(|record| record.finished.is_none());
     }
     changed();
 }
@@ -219,6 +237,30 @@ mod tests {
             finish(id, "已完成".into());
         }
         assert!(snapshot().len() <= KEEP);
+        reset();
+    }
+
+    #[test]
+    fn operation_ids_are_unique_across_windows() {
+        let first = next_id();
+        let second = next_id();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn clear_finished_keeps_running_operations() {
+        reset();
+        begin(1, "复制".into(), String::new(), OperationControl::default());
+        finish(1, "已完成".into());
+        begin(2, "删除".into(), String::new(), OperationControl::default());
+        clear_finished();
+        let records = snapshot();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].id, 2);
+        assert!(records[0].finished.is_none());
+        finish(2, "已完成".into());
+        clear_finished();
+        assert!(snapshot().is_empty());
         reset();
     }
 

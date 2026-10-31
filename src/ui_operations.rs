@@ -62,6 +62,7 @@ impl Render for OperationsWindow {
             .flex_1()
             .min_h_0()
             .overflow_y_scroll()
+            .scrollbar_width(ui(10.))
             .track_scroll(&self.scroll)
             .p_3()
             .flex()
@@ -108,15 +109,52 @@ impl Render for OperationsWindow {
                                 .child(rust_explorer::i18n::text("系统操作详情")),
                         ),
                     )
-                    .when(running > 0, |d| {
-                        d.child(
-                            button("operations-stop-all", rust_explorer::i18n::text("停止"), t)
-                                .on_click(cx.listener(|_, _, _, cx| {
-                                    rust_explorer::operations::stop_all(false);
-                                    cx.notify();
-                                })),
-                        )
-                    }),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                button(
+                                    "operations-clear",
+                                    rust_explorer::i18n::text("清除事件"),
+                                    t,
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
+                                        rust_explorer::operations::clear_finished();
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .child(
+                                button(
+                                    "operations-show-main",
+                                    rust_explorer::i18n::text("显示主程序"),
+                                    t,
+                                )
+                                .on_click(cx.listener(
+                                    |_, _, _, cx| {
+                                        let _ = open_explorer(None, cx);
+                                    },
+                                )),
+                            )
+                            .when(running > 0, |d| {
+                                d.child(
+                                    button(
+                                        "operations-stop-all",
+                                        rust_explorer::i18n::text("停止"),
+                                        t,
+                                    )
+                                    .on_click(cx.listener(
+                                        |_, _, _, cx| {
+                                            rust_explorer::operations::stop_all(false);
+                                            cx.notify();
+                                        },
+                                    )),
+                                )
+                            }),
+                    ),
             )
             .child(list)
     }
