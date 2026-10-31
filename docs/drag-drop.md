@@ -5,7 +5,8 @@
 ## 当前实现
 
 - 使用 Shell 创建的 `IDataObject` 传递多文件数据，包含系统资源管理器等程序使用的 `CF_HDROP` 格式。
-- 每个 Rust Explorer 窗口独立注册 `IDropTarget`，根据指针所在目录项、导航项或内容空白区选择目标。放置到 Rust Explorer 窗口时不调用 Shell 目录目标的同步 `Drop`：先提取 `CF_HDROP` 路径，再投递到可取消的 `Transfer` helper，`Drop` 立即返回；复制/移动因此不再占用 GPUI 的 UI 线程。系统资源管理器等外部目标仍由各自的 Drop 实现处理。
+- 每个 Rust Explorer 窗口独立注册 `IDropTarget`，根据指针所在目录项、导航项或内容空白区选择目标。带 `RustExplorer.DeferredTransfer.v1` 来源标记的本程序拖放先提取 `CF_HDROP` 路径，再投递到可取消的 `Transfer` helper，`Drop` 立即返回；复制/移动因此不再占用 GPUI 的 UI 线程。其他来源仍由 Shell 目录目标同步完成；外部目标由各自的 Drop 实现处理。
+- 来源标记表示源程序不会根据返回的 MOVE 自行删除文件，完整移动由 helper 执行。没有该约定的外部源可能在 Drop 返回后删除原件，所以不能将任意 `CF_HDROP` 都提前返回成功。来源分流测试覆盖：带标记仅入队、未标记先完成真实 Shell 复制。
 - 拖动启动投递到窗口自身的 STA 消息循环。GPUI 输入回调返回后进入 `SHDoDragDrop`，避免带着 App/Entity 借用进入嵌套消息泵。
 - OLE 拖放循环期间每 30 ms 向源窗口投递一次重绘请求。`SHDoDragDrop` 会阻塞 GPUI 的常规事件循环，没有这个请求时窗口会停在拖动开始前的最后一帧；重绘请求只触发 GPUI 的 `WM_PAINT`，不放宽 STA 或 COM 生命周期约束。
 - 跨进程目标（例如系统资源管理器）的 `IDropTarget::Drop` 仍可能同步完成复制。此时 `SHDoDragDrop` 在复制结束前不会返回；源窗口依靠重绘定时器保持显示，目标窗口的响应由目标程序自己的 Drop 实现决定。Rust Explorer 自己的窗口不再走这条同步路径。
@@ -19,7 +20,7 @@
 - `scripts/check.ps1`：格式检查、144 项核心测试（另 1 项忽略）、1 项快捷方式集成测试、1 项原生 OLE 集成测试和全部目标编译检查通过。
 - OLE 集成测试使用全新临时目录，验证 Shell 数据对象的 `CF_HDROP`、中文文件名、复制保留源文件、移动移除源文件及目标文件字节内容。
 - Windows 实机：单个测试目录拖入目标目录成功；多选两个文档一次拖入目标目录成功；源列表自动刷新。
-- 2026-10-31 双 Rust Explorer 窗口：`C:\opt\mingw64` → `R:\`，13,878 个文件/752.5 MB。`Drop` 在复制完成前返回，helper 在后台完成复制，源/目标窗口均保持响应。该轮同时修正了沿用 Shell 目录目标同步 Drop 的实现。
+- 2026-10-31 贡献者报告双 Rust Explorer 窗口测试：13,878 个文件/752.5 MB，复制到 RAM 盘。`Drop` 在复制完成前返回，helper 在后台完成复制，源/目标窗口均保持响应。该记录是贡献者的指定环境测量，并非通用性能保证。
 - 独立测试目录启动成功，无需额外配置 MSYS2 PATH。
 
 ## 验证边界与人工测试

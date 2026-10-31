@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.8.0。** 修复多窗口拖放与系统操作状态冲突，系统操作详情窗口新增清除事件、显示主程序和滚动条，并完善可取消的系统文件操作。详见 [更新记录](CHANGELOG.md)。
+**当前版本为 0.8.0。** 修复多窗口拖放与系统操作状态冲突，系统操作详情窗口新增清除事件、显示主程序和滚动条，并完善可取消的系统文件操作。详见 [0.8.0 中文发行说明](docs/v0.8.0.md)。
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-最新已发布下载：[Rust Explorer 0.7.9 part1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.7.9-part1)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
+最新已发布下载：[Rust Explorer 0.8.0](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.0)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
