@@ -7,6 +7,8 @@
 - 使用 Shell 创建的 `IDataObject` 传递多文件数据，包含系统资源管理器等程序使用的 `CF_HDROP` 格式。
 - 每个 Rust Explorer 窗口独立注册 `IDropTarget`，根据指针所在目录项、导航项或内容空白区选择目标。放置交给系统目录的 Shell `IDropTarget` 执行，支持不同窗口和与系统资源管理器之间的数据传递。
 - 拖动启动投递到窗口自身的 STA 消息循环。GPUI 输入回调返回后进入 `SHDoDragDrop`，避免带着 App/Entity 借用进入嵌套消息泵。
+- OLE 拖放循环期间每 30 ms 向源窗口投递一次重绘请求。`SHDoDragDrop` 会阻塞 GPUI 的常规事件循环，没有这个请求时窗口会停在拖动开始前的最后一帧；重绘请求只触发 GPUI 的 `WM_PAINT`，不放宽 STA 或 COM 生命周期约束。
+- 跨进程目标（例如系统资源管理器）的 `IDropTarget::Drop` 仍可能同步完成复制。此时 `SHDoDragDrop` 在复制结束前不会返回；源窗口保持重绘，但目标窗口的响应由目标程序自己的 Drop 实现决定。
 - 复制、移动、快捷方式由 Shell 协商，图像、光标和落点反馈使用系统拖放机制。
 - Shell 优化移动可能返回原始效果 0，但实际已经移动。读取 `Logical Performed DropEffect` 用于刷新，不改写返回给外部源的原始效果，也不重复删除源文件。
 - COM 对象、PIDL、窗口子类和 Rust 回调上下文按窗口 STA 生命周期释放，窗口关闭时撤销注册。

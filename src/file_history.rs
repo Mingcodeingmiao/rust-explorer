@@ -704,6 +704,7 @@ pub fn apply(transaction: Transaction) -> Result<()> {
     }
     unsafe {
         let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+        let _cancel = crate::shell::attach_cancellation(&op)?;
         op.SetOperationFlags(FILEOPERATION_FLAGS(
             FOFX_RECYCLEONDELETE.0 | FOF_WANTNUKEWARNING.0 | FOF_RENAMEONCOLLISION.0,
         ))?;

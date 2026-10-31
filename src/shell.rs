@@ -12,7 +12,7 @@ use windows::{
         System::{Com::*, DataExchange::*, Memory::*, Ole::*},
         UI::{Shell::*, WindowsAndMessaging::*},
     },
-    core::{BOOL, Interface, PCSTR, PCWSTR, w},
+    core::{BOOL, HRESULT, Interface, PCSTR, PCWSTR, Ref, implement, w},
 };
 #[path = "namespace_rename.rs"]
 mod namespace_rename;
@@ -66,6 +66,186 @@ impl OperationControl {
 }
 thread_local! {
     static OPERATION_CONTROL: RefCell<Option<OperationControl>> = const { RefCell::new(None) };
+}
+/// Set by the helper's watchdog thread when the parent signals Stop through the
+/// named event. The progress sink polls this flag while the Shell is inside
+/// `PerformOperations`; posting WM_CLOSE alone misses operations that never
+/// display a progress window.
+static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+fn stop_requested() -> bool {
+    STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
+}
+/// `--shell-stdin <event>`: wake when the parent asks this one-shot helper to
+/// stop, even while the Shell operation owns the STA thread.
+pub fn watch_stop_event(name: &str) {
+    use windows::Win32::System::Threading::{
+        INFINITE, OpenEventW, SYNCHRONIZATION_ACCESS_RIGHTS, WaitForSingleObject,
+    };
+    let name = wide(name);
+    let Ok(event) = (unsafe {
+        OpenEventW(
+            SYNCHRONIZATION_ACCESS_RIGHTS(0x0010_0000),
+            false,
+            PCWSTR(name.as_ptr()),
+        )
+    }) else {
+        return;
+    };
+    // HANDLE is a raw pointer and therefore not Send; the watch thread owns it
+    // exclusively until it closes the handle.
+    let raw = event.0 as isize;
+    std::thread::spawn(move || {
+        let event = HANDLE(raw as *mut _);
+        unsafe {
+            let _ = WaitForSingleObject(event, INFINITE);
+            let _ = CloseHandle(event);
+        }
+        STOP_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+/// Cooperative cancellation for `IFileOperation`. Returning
+/// `COPYENGINE_E_USER_CANCELLED` from any sink callback aborts the queued
+/// operation without killing the helper process mid-write.
+#[implement(IFileOperationProgressSink)]
+struct CancelSink;
+impl CancelSink_Impl {
+    fn check(&self) -> windows::core::Result<()> {
+        if stop_requested() {
+            Err(windows::core::Error::from_hresult(
+                COPYENGINE_E_USER_CANCELLED,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+}
+#[allow(non_snake_case)]
+impl IFileOperationProgressSink_Impl for CancelSink_Impl {
+    fn StartOperations(&self) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn FinishOperations(&self, _: HRESULT) -> windows::core::Result<()> {
+        Ok(())
+    }
+    fn PreRenameItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PostRenameItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PreMoveItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PostMoveItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PreCopyItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PostCopyItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PreDeleteItem(&self, _: u32, _: Ref<'_, IShellItem>) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PostDeleteItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PreNewItem(&self, _: u32, _: Ref<'_, IShellItem>, _: &PCWSTR) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PostNewItem(
+        &self,
+        _: u32,
+        _: Ref<'_, IShellItem>,
+        _: &PCWSTR,
+        _: &PCWSTR,
+        _: u32,
+        _: HRESULT,
+        _: Ref<'_, IShellItem>,
+    ) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn UpdateProgress(&self, _: u32, _: u32) -> windows::core::Result<()> {
+        // The copy engine calls this while a large folder is being processed;
+        // it is the only callback that can interrupt that inner loop.
+        self.check()
+    }
+    fn ResetTimer(&self) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn PauseTimer(&self) -> windows::core::Result<()> {
+        self.check()
+    }
+    fn ResumeTimer(&self) -> windows::core::Result<()> {
+        self.check()
+    }
+}
+/// Keeps the cancel sink advised for the whole lifetime of an operation.
+pub(crate) struct Cancellation {
+    op: IFileOperation,
+    cookie: u32,
+}
+pub(crate) fn attach_cancellation(op: &IFileOperation) -> Result<Cancellation> {
+    let sink: IFileOperationProgressSink = CancelSink.into();
+    let cookie = unsafe { op.Advise(&sink)? };
+    Ok(Cancellation {
+        op: op.clone(),
+        cookie,
+    })
+}
+impl Drop for Cancellation {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = self.op.Unadvise(self.cookie);
+        }
+    }
 }
 /// ⚠️ 警告（WARNING，勿回退）：**右键菜单绝对不要走"一次性 helper + 可取消"的请求路径**。
 ///
@@ -929,9 +1109,37 @@ fn execute_one_shot(request: Request) -> Result<String> {
         payload.len() <= MAX_REQUEST_BYTES,
         "系统操作请求超过 32 MiB，未执行操作"
     );
+    // A named manual-reset event is the cancellation channel. WM_CLOSE is only
+    // a best-effort close for the Shell's progress dialog; operations that never
+    // create that dialog need the in-helper progress sink to abort.
+    struct CancelEvent(windows::Win32::Foundation::HANDLE, String);
+    impl Drop for CancelEvent {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    static EVENT_SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let cancel_event = {
+        use windows::Win32::System::Threading::CreateEventW;
+        let sequence = EVENT_SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let name = format!(
+            "Local\\RustExplorer.Stop.{}.{}",
+            std::process::id(),
+            sequence
+        );
+        let name_wide = wide(&name);
+        unsafe { CreateEventW(None, true, false, PCWSTR(name_wide.as_ptr())) }
+            .ok()
+            .map(|handle| CancelEvent(handle, name))
+    };
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--shell-stdin")
-        .stdin(Stdio::piped())
+    cmd.arg("--shell-stdin");
+    if let Some(event) = &cancel_event {
+        cmd.arg(&event.1);
+    }
+    cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     use std::os::windows::process::CommandExt;
@@ -980,11 +1188,21 @@ fn execute_one_shot(request: Request) -> Result<String> {
             if let Some(control) = &control {
                 if control.stopping() && !stopped {
                     stopped = true;
+                    if let Some(event) = &cancel_event {
+                        unsafe {
+                            let _ = windows::Win32::System::Threading::SetEvent(event.0);
+                        }
+                    }
                     unsafe {
                         close_process_windows(child.id());
                     }
                 }
                 if control.force.load(std::sync::atomic::Ordering::Relaxed) {
+                    if let Some(event) = &cancel_event {
+                        unsafe {
+                            let _ = windows::Win32::System::Threading::SetEvent(event.0);
+                        }
+                    }
                     child.kill().context("无法强行停止系统操作进程")?;
                     break child.wait()?;
                 }
@@ -1272,6 +1490,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                     .iter()
                     .any(|path| crate::shell_folder::is_shell_path(path));
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            let _cancel = attach_cancellation(&op)?;
             let _history = if shell_namespace {
                 None
             } else {
@@ -1508,6 +1727,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                     .any(|path| crate::shell_folder::is_shell_path(path));
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .context("创建文件操作")?;
+            let _cancel = attach_cancellation(&op)?;
             // Portable-device operations have no meaningful filesystem undo
             // record; let the Shell perform the copy/delete directly.
             let _history = if shell_namespace {
@@ -1539,6 +1759,7 @@ pub fn dispatch(request: Request) -> Result<()> {
         Request::PermanentDelete { paths } => unsafe {
             crate::file_history::barrier("Permanent deletion cannot be undone");
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            let _cancel = attach_cancellation(&op)?;
             // Deliberately omit ALLOWUNDO, ADDUNDORECORD and RECYCLEONDELETE.
             // Never retry this operation through Request::Delete on failure.
             op.SetOperationFlags(FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0))?;
@@ -1566,6 +1787,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                 .any(|path| crate::shell_folder::is_shell_path(path));
             let recycle = !shell_namespace && can_recycle(&paths);
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            let _cancel = attach_cancellation(&op)?;
             let _history = if recycle {
                 Some(crate::file_history::Recorder::attach(&op, &paths)?)
             } else {
@@ -1596,6 +1818,7 @@ pub fn dispatch(request: Request) -> Result<()> {
             crate::fs::valid_name(&name)?;
             let shell_namespace = crate::shell_folder::is_shell_path(&path);
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            let _cancel = attach_cancellation(&op)?;
             let _history = if shell_namespace {
                 None
             } else {

@@ -32,6 +32,7 @@ static DWORD logical_effect(IDataObject* data, DWORD fallback) {
 }
 static constexpr UINT START_FILE_DRAG = WM_APP + 0x637;
 static constexpr UINT_PTR DRAG_SUBCLASS = 0x52454444;
+static constexpr UINT_PTR DRAG_REPAINT_TIMER = 0x52445254;
 extern "C" HRESULT re_drag_files(HWND, const wchar_t* const*, unsigned, DWORD*) noexcept;
 
 // Finish reliably even if the cursor crosses into another application's window.
@@ -203,6 +204,12 @@ static LRESULT CALLBACK DragSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
     if (msg == START_FILE_DRAG) {
         target->run_pending();
         result = 0;
+    } else if (msg == WM_TIMER && wp == DRAG_REPAINT_TIMER) {
+        // OLE owns the UI thread inside its modal drag loop. Without an
+        // explicit paint request the GPUI window keeps its last frame and
+        // looks hung while the pointer is over another application.
+        InvalidateRect(hwnd, nullptr, FALSE);
+        result = 0;
     } else {
         if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, DragSubclass, DRAG_SUBCLASS);
         result = DefSubclassProc(hwnd, msg, wp, lp);
@@ -330,11 +337,13 @@ extern "C" HRESULT re_drag_files(HWND owner, const wchar_t* const* paths, unsign
                     if (SUCCEEDED(hr)) {
                         ComPtr<IDropSource> source;
                         *source.put() = new FileDropSource();
+                        SetTimer(owner, DRAG_REPAINT_TIMER, 30, nullptr);
                         drag_trace("enter drag loop");
                         // Called from our window subclass after the GPUI input
                         // callback has returned, so OLE may safely pump messages.
                         hr = SHDoDragDrop(owner, data.get(), source.get(),
                             DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK, effect);
+                        KillTimer(owner, DRAG_REPAINT_TIMER);
                         if (hr == DRAGDROP_S_DROP) *effect = logical_effect(data.get(), *effect);
                         drag_trace("exit drag loop");
                     }
