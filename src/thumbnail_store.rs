@@ -468,19 +468,27 @@ pub fn remember_missing(index: &Path) {
     });
 }
 
+fn clear_transaction(db: &Connection) -> Result<rusqlite::Transaction<'_>> {
+    // Acquire the write lock before the first DELETE. Other helper connections
+    // must see either the old cache or the fully cleared cache, never half of it.
+    let tx = rusqlite::Transaction::new_unchecked(db, rusqlite::TransactionBehavior::Immediate)?;
+    tx.execute("DELETE FROM thumbnails", [])?;
+    tx.execute("DELETE FROM icons", [])?;
+    tx.execute("DELETE FROM previews", [])?;
+    tx.execute("DELETE FROM images", [])?;
+    tx.execute_batch(
+        "UPDATE thumbnail_totals SET rows=0,bytes=0;
+         UPDATE icon_totals SET rows=0,bytes=0;
+         UPDATE preview_totals SET rows=0,bytes=0;",
+    )?;
+    Ok(tx)
+}
+
 pub fn clear() -> Result<()> {
     let index = directory().join("clear.cache");
     with_db(&index, |db, _| {
-        db.execute("DELETE FROM thumbnails", [])?;
-        db.execute("DELETE FROM icons", [])?;
-        db.execute("DELETE FROM previews", [])?;
-        db.execute("DELETE FROM images", [])?;
-        db.execute_batch(
-            "UPDATE thumbnail_totals SET rows=0,bytes=0;
-             UPDATE icon_totals SET rows=0,bytes=0;
-             UPDATE preview_totals SET rows=0,bytes=0;
-             PRAGMA wal_checkpoint(TRUNCATE);",
-        )?;
+        clear_transaction(db)?.commit()?;
+        db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")?;
         Ok(())
     })
 }
@@ -493,6 +501,81 @@ pub(crate) fn close_thread_connection() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_serializes_writers_and_can_roll_back_as_a_unit() {
+        let root = std::env::temp_dir().join(format!(
+            "re-sqlite-atomic-clear-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let clearer = open(&root).unwrap();
+        let writer = open(&root).unwrap();
+        writer.busy_timeout(Duration::ZERO).unwrap();
+        let insert = |db: &Connection| {
+            let tx = db.unchecked_transaction().unwrap();
+            tx.execute(
+                "INSERT INTO images(hash,png,byte_count) VALUES('owned-image',?1,13)",
+                [b"owned-fixture".as_slice()],
+            )
+            .unwrap();
+            tx.execute("INSERT INTO icons(key,image_hash,byte_count,last_access) VALUES('owned-key','owned-image',13,0)", []).unwrap();
+            tx.commit().unwrap();
+        };
+        insert(&writer);
+        let tx = clear_transaction(&clearer).unwrap();
+        // A helper cannot insert an icon after metadata deletion but before blob
+        // deletion, the interleaving that used to leave an orphan icon record.
+        let blocked = writer.execute_batch("BEGIN IMMEDIATE").unwrap_err();
+        assert!(matches!(blocked, rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::DatabaseBusy));
+        // WAL readers still see the complete old cache until commit.
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT count(*) FROM icons JOIN images ON icons.image_hash=images.hash",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        drop(tx);
+        assert_eq!(
+            clearer
+                .query_row("SELECT rows FROM icon_totals", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+
+        clear_transaction(&clearer).unwrap().commit().unwrap();
+        insert(&writer);
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT count(*) FROM icons WHERE image_hash NOT IN (SELECT hash FROM images)",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            writer
+                .query_row("SELECT rows,bytes FROM icon_totals", [], |r| Ok((
+                    r.get::<_, i64>(0)?,
+                    r.get::<_, i64>(1)?
+                )))
+                .unwrap(),
+            (1, 13)
+        );
+        drop(writer);
+        drop(clearer);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn icons_and_previews_round_trip_without_files() {

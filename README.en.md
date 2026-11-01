@@ -4,12 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.0** fixes cross-window drag/drop and operation-status conflicts, adds Clear events, Show main window and a scrollbar to the operations window, and improves cancellable system file operations. See the [release notes (Chinese)](docs/v0.8.0.md).
+Version **0.8.1** fixes repeated busy-cursor feedback on hover, stale operation records after closing a window, and concurrent undo/redo handling. It also makes cache clearing atomic, moves drive-icon classification off the UI thread, and updates running-operation timers. See the [release notes (Chinese)](docs/v0.8.1.md).
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Latest published download: [Rust Explorer 0.8.0](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.0). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
+Latest published download: [Rust Explorer 0.8.1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.1). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
 
 ## Features
 

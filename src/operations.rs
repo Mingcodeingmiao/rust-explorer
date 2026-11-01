@@ -11,7 +11,7 @@ use std::{
         Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// One operation as shown in the operations window and the status bar.
@@ -27,6 +27,45 @@ pub struct OperationRecord {
     pub finished: Option<Instant>,
     pub status: String,
     pub control: OperationControl,
+    kind: OperationKind,
+}
+
+/// History must not race a mutation in any folder window. Read-only work may
+/// overlap; the owning view separately waits until its receipts are applied.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationKind {
+    ReadOnly,
+    Mutation,
+    History,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeginError {
+    Limit,
+    HistoryBusy,
+}
+
+/// Owned by the worker, never by the window receiving its result. Even a panic
+/// or an abandoned task must release the process-wide running-operation slot.
+pub struct Completion {
+    id: Option<u64>,
+}
+impl Completion {
+    pub fn new(id: u64) -> Self {
+        Self { id: Some(id) }
+    }
+    pub fn finish(mut self, status: String) {
+        if let Some(id) = self.id.take() {
+            finish(id, status);
+        }
+    }
+}
+impl Drop for Completion {
+    fn drop(&mut self) {
+        if let Some(id) = self.id.take() {
+            finish(id, crate::i18n::text("失败").into());
+        }
+    }
 }
 
 /// Finished records kept for the history in the window.
@@ -59,10 +98,32 @@ fn changed() {
 
 /// Record a newly started operation. Oldest finished records are dropped when the
 /// history is full.
-pub fn begin(id: u64, label: String, details: String, control: OperationControl) {
-    let Ok(mut records) = records().lock() else {
-        return;
-    };
+pub fn try_begin(
+    id: u64,
+    label: String,
+    details: String,
+    control: OperationControl,
+    kind: OperationKind,
+) -> Result<(), BeginError> {
+    let mut records = records().lock().map_err(|_| BeginError::Limit)?;
+    let running: Vec<_> = records
+        .iter()
+        .filter(|record| record.finished.is_none())
+        .collect();
+    if running.len() >= 8 {
+        return Err(BeginError::Limit);
+    }
+    if (kind == OperationKind::History
+        && running
+            .iter()
+            .any(|record| record.kind != OperationKind::ReadOnly))
+        || (kind == OperationKind::Mutation
+            && running
+                .iter()
+                .any(|record| record.kind == OperationKind::History))
+    {
+        return Err(BeginError::HistoryBusy);
+    }
     while records.len() >= KEEP {
         match records.iter().position(|record| record.finished.is_some()) {
             Some(index) => {
@@ -80,9 +141,11 @@ pub fn begin(id: u64, label: String, details: String, control: OperationControl)
         finished: None,
         status: crate::i18n::text("正在进行").to_string(),
         control,
+        kind,
     });
     drop(records);
     changed();
+    Ok(())
 }
 
 /// Mark an operation as finished with its final status text.
@@ -202,9 +265,104 @@ pub fn snapshot() -> Vec<OperationRecord> {
         .unwrap_or_default()
 }
 
+/// A visible operation clock ticks at most once a second; an idle window needs
+/// no time-driven repaint at all.
+pub fn elapsed_refresh_due(since_last_update: Duration, running: bool) -> bool {
+    running && since_last_update >= Duration::from_secs(1)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn begin(id: u64, label: String, details: String, control: OperationControl) {
+        try_begin(id, label, details, control, OperationKind::Mutation).unwrap();
+    }
+
+    fn start(id: u64, kind: OperationKind) -> Result<(), BeginError> {
+        try_begin(
+            id,
+            String::new(),
+            String::new(),
+            OperationControl::default(),
+            kind,
+        )
+    }
+
+    #[test]
+    fn completed_worker_releases_slot_even_when_its_window_is_gone() {
+        reset();
+        start(101, OperationKind::ReadOnly).unwrap();
+        let completion = Completion::new(101);
+        let (result, window) = std::sync::mpsc::channel();
+        drop(window);
+        std::thread::spawn(move || {
+            completion.finish("已完成".into());
+            assert!(result.send(()).is_err());
+        })
+        .join()
+        .unwrap();
+        assert_eq!(running(), 0);
+        assert!(snapshot()[0].finished.is_some());
+
+        start(102, OperationKind::Mutation).unwrap();
+        // Dropping an abandoned worker also releases its slot.
+        drop(Completion::new(102));
+        assert_eq!(running(), 0);
+        reset();
+    }
+
+    #[test]
+    fn history_and_mutations_cannot_overlap_across_windows() {
+        reset();
+        start(1, OperationKind::Mutation).unwrap();
+        start(2, OperationKind::Mutation).unwrap();
+        assert_eq!(
+            start(3, OperationKind::History),
+            Err(BeginError::HistoryBusy)
+        );
+        finish(1, String::new());
+        assert_eq!(
+            start(3, OperationKind::History),
+            Err(BeginError::HistoryBusy)
+        );
+        finish(2, String::new());
+        start(3, OperationKind::History).unwrap();
+        assert_eq!(
+            start(4, OperationKind::Mutation),
+            Err(BeginError::HistoryBusy)
+        );
+        assert_eq!(
+            start(5, OperationKind::History),
+            Err(BeginError::HistoryBusy)
+        );
+        // Properties do not produce history and need not block undo/redo.
+        start(6, OperationKind::ReadOnly).unwrap();
+        assert_eq!(running(), 2);
+        finish(3, String::new());
+        start(4, OperationKind::Mutation).unwrap();
+        reset();
+    }
+
+    #[test]
+    fn admission_limit_is_atomic_and_released_on_completion() {
+        reset();
+        for id in 1..=8 {
+            start(id, OperationKind::Mutation).unwrap();
+        }
+        assert_eq!(start(9, OperationKind::Mutation), Err(BeginError::Limit));
+        finish(1, String::new());
+        start(9, OperationKind::Mutation).unwrap();
+        assert_eq!(running(), 8);
+        reset();
+    }
+
+    #[test]
+    fn elapsed_clock_ticks_only_while_running() {
+        assert!(!elapsed_refresh_due(Duration::from_millis(999), true));
+        assert!(elapsed_refresh_due(Duration::from_secs(1), true));
+        assert!(!elapsed_refresh_due(Duration::from_secs(60), false));
+    }
 
     fn reset() {
         if let Ok(mut records) = records().lock() {

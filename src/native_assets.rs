@@ -37,11 +37,13 @@ fn session_epoch() -> u64 {
 /// Make every network root ask the Shell for its icon again.
 pub fn refresh_network_icons() {
     NETWORK_ICON_EPOCH.fetch_add(1, Ordering::Relaxed);
+    clear_drive_network_probe();
 }
 
 /// Make every drive root ask the Shell for its icon again.
 pub fn refresh_drive_icons() {
     DRIVE_ICON_EPOCH.fetch_add(1, Ordering::Relaxed);
+    clear_drive_network_probe();
 }
 
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Serialize, Deserialize)]
@@ -138,7 +140,7 @@ impl IconRequest {
             epoch: if shell_root || custom_folder {
                 icon_epoch(30)
             } else if drive_root {
-                let base = if crate::network::is_network_root(path) {
+                let base = if drive_is_network(path) {
                     icon_epoch(60).wrapping_add(session_epoch())
                 } else {
                     session_epoch()
@@ -175,6 +177,30 @@ fn folder_has_own_artwork(path: &Path) -> bool {
 thread_local! {
     static FOLDER_ARTWORK: std::cell::RefCell<FolderArtwork> =
         std::cell::RefCell::new(FolderArtwork::new(crate::system_icons::folder_has_custom_icon));
+    static DRIVE_NETWORK: std::cell::RefCell<Option<FolderArtwork>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+/// GetDriveType and the mapped-drive registry lookup belong on bounded workers,
+/// just like desktop.ini probes. Render only reads the remembered answer.
+fn drive_is_network(path: &Path) -> bool {
+    if matches!(path.components().next(), Some(std::path::Component::Prefix(prefix))
+        if matches!(prefix.kind(), std::path::Prefix::UNC(..) | std::path::Prefix::VerbatimUNC(..)))
+    {
+        return true;
+    }
+    DRIVE_NETWORK.with(|slot| {
+        slot.borrow_mut()
+            .get_or_insert_with(|| FolderArtwork::new(crate::network::is_network_root))
+            .get(path)
+    })
+}
+fn clear_drive_network_probe() {
+    DRIVE_NETWORK.with(|slot| {
+        if let Some(cache) = slot.borrow_mut().as_mut() {
+            cache.clear();
+        }
+    });
 }
 struct FolderArtwork {
     cache: std::collections::HashMap<PathBuf, bool>,
@@ -253,7 +279,10 @@ impl FolderArtwork {
     }
 }
 pub fn poll_folder_artwork() -> bool {
-    FOLDER_ARTWORK.with(|cache| cache.borrow_mut().drain())
+    let folders = FOLDER_ARTWORK.with(|cache| cache.borrow_mut().drain());
+    let drives =
+        DRIVE_NETWORK.with(|slot| slot.borrow_mut().as_mut().is_some_and(FolderArtwork::drain));
+    folders || drives
 }
 pub fn clear_folder_artwork() {
     FOLDER_ARTWORK.with(|cache| cache.borrow_mut().clear());
@@ -1229,6 +1258,56 @@ mod cache_tests {
         assert_eq!(text.path, PathBuf::from("file.txt"));
         assert_eq!(text.path, upper.path);
     }
+    #[test]
+    fn slow_drive_classification_never_runs_on_the_render_thread() {
+        static RELEASE: AtomicBool = AtomicBool::new(false);
+        static STARTED: AtomicBool = AtomicBool::new(false);
+        fn blocked_probe(_: &Path) -> bool {
+            STARTED.store(true, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !RELEASE.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            true
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                RELEASE.store(true, Ordering::SeqCst);
+                DRIVE_NETWORK.with(|slot| *slot.borrow_mut() = None);
+            }
+        }
+        RELEASE.store(false, Ordering::SeqCst);
+        STARTED.store(false, Ordering::SeqCst);
+        let _reset = Reset;
+        DRIVE_NETWORK.with(|slot| *slot.borrow_mut() = Some(FolderArtwork::new(blocked_probe)));
+        let path = Path::new(r"Z:\");
+        let first = IconRequest::file(path, true, 96);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !STARTED.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let start = Instant::now();
+        assert_eq!(IconRequest::file(path, true, 96).epoch, first.epoch);
+        assert!(start.elapsed() < Duration::from_millis(500));
+        RELEASE.store(true, Ordering::SeqCst);
+        loop {
+            let ready = DRIVE_NETWORK.with(|slot| {
+                let mut slot = slot.borrow_mut();
+                let cache = slot.as_mut().unwrap();
+                cache.drain();
+                cache.cache.get(path) == Some(&true)
+            });
+            if ready {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert_ne!(IconRequest::file(path, true, 96).epoch, first.epoch);
+    }
+
     #[test]
     fn slow_folder_artwork_probe_does_not_block_request_construction() {
         static RELEASE: AtomicBool = AtomicBool::new(false);
