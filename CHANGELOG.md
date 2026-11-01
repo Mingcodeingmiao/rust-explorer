@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+- 修复 Issue #44：鼠标经过文件或文件夹时，悬停信息、图标和缩略图查询会启动 GUI 子系统 helper，触发 Windows 启动反馈圆圈。后台只读 helper 使用 `STARTF_FORCEOFFFEEDBACK`，保留超时、终止和标准流通信；通过句柄白名单避免继承其他 helper 的管道。菜单与交互式系统文件操作仍使用各自既有路径。详见[修复记录](docs/issue-44-hover-feedback.md)。
+
 ## [0.8.0] - 2026-10-31
 
 整合 [PR #43](https://github.com/Mingcodeingmiao/rust-explorer/pull/43)。安装、验证范围与已知问题见 [0.8.0 中文发行说明](docs/v0.8.0.md)。

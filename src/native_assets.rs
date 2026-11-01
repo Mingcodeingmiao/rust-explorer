@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     io::Read,
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -800,15 +799,11 @@ fn call(request: Request, timeout: Duration, cancel: &Arc<AtomicBool>) -> Result
     if cancel.load(Ordering::Relaxed) {
         bail!("请求已取消");
     }
-    let mut cmd = Command::new(std::env::current_exe()?);
-    cmd.arg("--native-asset")
-        .arg(serde_json::to_string(&request)?)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    use std::os::windows::process::CommandExt;
-    cmd.creation_flags(0x08000000);
-    let mut child = cmd.spawn()?;
+    let mut child = crate::background_process::spawn(
+        ["--native-asset", &serde_json::to_string(&request)?],
+        false,
+        true,
+    )?;
     let stdout = child.stdout.take().context("原生图像输出不可用")?;
     let stderr = child.stderr.take().context("原生图像错误输出不可用")?;
     let reader = std::thread::spawn(move || {
@@ -1016,7 +1011,7 @@ pub fn thumbnail_server() -> Result<()> {
 }
 
 struct ThumbnailProcess {
-    child: std::process::Child,
+    child: crate::background_process::Child,
     requests: std::sync::mpsc::SyncSender<Vec<u8>>,
     replies: std::sync::mpsc::Receiver<String>,
 }
@@ -1037,17 +1032,11 @@ impl ThumbnailSession {
         let _ = self.ensure_process();
     }
     fn ensure_process(&mut self) -> Result<()> {
-        use std::{io::BufRead, os::windows::process::CommandExt};
+        use std::io::BufRead;
         if self.process.is_some() {
             return Ok(());
         }
-        let mut child = Command::new(std::env::current_exe()?)
-            .arg("--thumbnail-server")
-            .creation_flags(0x08000000)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = crate::background_process::spawn(["--thumbnail-server"], true, false)?;
         let mut input = child.stdin.take().context("缩略图服务输入不可用")?;
         let stdout = child.stdout.take().context("缩略图服务输出不可用")?;
         let (tx, replies) = std::sync::mpsc::sync_channel(1);
