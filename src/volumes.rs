@@ -2,7 +2,6 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     path::{Path, PathBuf},
-    process::{Command, Stdio},
     time::{Duration, Instant},
 };
 use windows::{Win32::Storage::FileSystem::*, core::PCWSTR};
@@ -249,14 +248,7 @@ pub fn bounded<T: serde::de::DeserializeOwned>(
     json: &str,
     timeout: Duration,
 ) -> Result<T> {
-    use std::os::windows::process::CommandExt;
-    let mut child = Command::new(std::env::current_exe()?)
-        .arg(flag)
-        .arg(json)
-        .creation_flags(0x08000000)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
+    let mut child = crate::background_process::spawn([flag, json], false, true)?;
     let stdout = child.stdout.take().context("helper stdout")?;
     let stderr = child.stderr.take().context("helper stderr")?;
     let read = std::thread::spawn(move || {

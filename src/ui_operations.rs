@@ -8,8 +8,9 @@ use super::*;
 pub(super) struct OperationsWindow {
     theme: Theme,
     zoom: f32,
-    /// Last observed `operations::version()`, so the poll only re-renders on change.
+    /// Repaint on record changes, plus a one-second clock while work is running.
     version: u64,
+    last_tick: Instant,
     scroll: ScrollHandle,
 }
 
@@ -27,8 +28,14 @@ impl OperationsWindow {
                     .await;
                 let updated = this.update(cx, |this, cx| {
                     let version = rust_explorer::operations::version();
-                    if version != this.version {
+                    let now = Instant::now();
+                    let tick = rust_explorer::operations::elapsed_refresh_due(
+                        now.duration_since(this.last_tick),
+                        rust_explorer::operations::running() > 0,
+                    );
+                    if version != this.version || tick {
                         this.version = version;
+                        this.last_tick = now;
                         cx.notify();
                     }
                 });
@@ -42,6 +49,7 @@ impl OperationsWindow {
             theme,
             zoom,
             version: rust_explorer::operations::version(),
+            last_tick: Instant::now(),
             scroll: ScrollHandle::new(),
         }
     }

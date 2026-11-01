@@ -371,7 +371,8 @@ struct Explorer {
     system_menu_active: bool,
     undo_stack: Vec<rust_explorer::file_history::Transaction>,
     redo_stack: Vec<rust_explorer::file_history::Transaction>,
-    pending_history: Option<bool>,
+    pending_mutations: usize,
+    replaying_history: bool,
     status: String,
     error: Option<String>,
     focus: FocusHandle,
@@ -979,7 +980,8 @@ impl Explorer {
             system_menu_active: false,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
-            pending_history: None,
+            pending_mutations: 0,
+            replaying_history: false,
             status: String::new(),
             error: None,
             focus: cx.focus_handle(),
@@ -2176,7 +2178,11 @@ impl Explorer {
         }
     }
     fn replay_history(&mut self, redo: bool, cx: &mut Context<Self>) {
-        if self.busy || self.dialog.is_some() || self.options.is_some() {
+        if self.busy
+            || self.pending_mutations > 0
+            || self.dialog.is_some()
+            || self.options.is_some()
+        {
             return;
         }
         let stack = if redo {
@@ -2185,8 +2191,7 @@ impl Explorer {
             &self.undo_stack
         };
         if let Some(transaction) = stack.last().cloned() {
-            self.pending_history = Some(redo);
-            self.run_shell(shell::Request::History { transaction }, cx);
+            self.run_shell_with_history(shell::Request::History { transaction }, Some(redo), cx);
         }
     }
     fn limit_history(&mut self) -> bool {
@@ -2212,13 +2217,14 @@ impl Explorer {
         released
     }
     fn run_shell(&mut self, request: shell::Request, cx: &mut Context<Self>) {
-        if rust_explorer::operations::running() >= 8 {
-            self.error = Some(
-                rust_explorer::i18n::text("同时运行的系统操作过多，请先停止或关闭现有操作").into(),
-            );
-            cx.notify();
-            return;
-        }
+        self.run_shell_with_history(request, None, cx);
+    }
+    fn run_shell_with_history(
+        &mut self,
+        request: shell::Request,
+        history_direction: Option<bool>,
+        cx: &mut Context<Self>,
+    ) {
         let invalidates_usage = matches!(
             &request,
             shell::Request::EmptyRecycleBin
@@ -2257,17 +2263,55 @@ impl Explorer {
                 | shell::Request::ThemedMenu { .. }
                 | shell::Request::ComputerMenu { .. }
         );
+        let operation_id = rust_explorer::operations::next_id();
+        let control = shell::OperationControl::default();
+        let label = shell::operation_label(&request);
+        let details = operation_details(&request);
+        use rust_explorer::operations::{BeginError, Completion, OperationKind};
+        // This request only fingerprints an item that was already created. It
+        // must not be rejected because another window is undoing its own work.
+        let recording_created = matches!(&request, shell::Request::RecordCreated { .. });
+        let kind = if history_direction.is_some() {
+            OperationKind::History
+        } else if passive || recording_created {
+            OperationKind::ReadOnly
+        } else {
+            OperationKind::Mutation
+        };
+        // Keep the history stable until the UI has applied all prior receipts,
+        // not merely until their background workers have exited.
+        let mutation_receipt = kind == OperationKind::Mutation || recording_created;
+        if self.replaying_history && mutation_receipt {
+            return;
+        }
+        if let Err(error) = rust_explorer::operations::try_begin(
+            operation_id,
+            label,
+            details,
+            control.clone(),
+            kind,
+        ) {
+            if error == BeginError::Limit {
+                self.error = Some(
+                    rust_explorer::i18n::text("同时运行的系统操作过多，请先停止或关闭现有操作")
+                        .into(),
+                );
+            }
+            cx.notify();
+            return;
+        }
+        let completion = Completion::new(operation_id);
+        if mutation_receipt {
+            self.pending_mutations += 1;
+        } else if kind == OperationKind::History {
+            self.replaying_history = true;
+        }
         if system_menu {
             self.system_menu_active = true;
         }
         if !passive && !concurrent {
             self.busy = true;
         }
-        let operation_id = rust_explorer::operations::next_id();
-        let control = shell::OperationControl::default();
-        let label = shell::operation_label(&request);
-        let details = operation_details(&request);
-        rust_explorer::operations::begin(operation_id, label, details, control.clone());
         self.error = None;
         let recycle_menu = match &request {
             shell::Request::Menu { folder, .. } | shell::Request::ThemedMenu { folder, .. } => {
@@ -2337,25 +2381,29 @@ impl Explorer {
                     );
                 }
             }
+            let status = if rust_explorer::operations::stopping(operation_id) {
+                rust_explorer::i18n::text("已停止（请确认部分操作结果）").to_string()
+            } else if let Err(error) = &result {
+                rust_explorer::trf!("失败：{error:#}")
+            } else if let Some(error) = history.as_ref().and_then(|history| history.error.as_ref())
+            {
+                rust_explorer::trf!("失败：{error}")
+            } else {
+                rust_explorer::i18n::text("已完成").to_string()
+            };
+            completion.finish(status);
+            if invalidates_usage {
+                disk_usage::invalidate_cache();
+            }
             (result, history)
         });
         cx.spawn(async move |view, cx| {
             let (result, history) = task.await;
             view.update(cx, |this, cx| {
-                let status = if rust_explorer::operations::stopping(operation_id) {
-                    rust_explorer::i18n::text("已停止（请确认部分操作结果）").to_string()
-                } else if let Err(error) = &result {
-                    rust_explorer::trf!("失败：{error:#}")
-                } else if let Some(error) =
-                    history.as_ref().and_then(|history| history.error.as_ref())
-                {
-                    rust_explorer::trf!("失败：{error}")
-                } else {
-                    rust_explorer::i18n::text("已完成").to_string()
-                };
-                rust_explorer::operations::finish(operation_id, status);
-                if invalidates_usage {
-                    disk_usage::invalidate_cache();
+                if mutation_receipt {
+                    this.pending_mutations = this.pending_mutations.saturating_sub(1);
+                } else if kind == OperationKind::History {
+                    this.replaying_history = false;
                 }
                 if system_menu {
                     this.system_menu_active = false;
@@ -2364,7 +2412,7 @@ impl Explorer {
                     this.busy = false;
                 }
                 if let Some(response) = history {
-                    let direction = this.pending_history.take();
+                    let direction = history_direction;
                     if response.warning.is_some() {
                         this.undo_stack.clear();
                         this.redo_stack.clear();
@@ -2425,9 +2473,6 @@ impl Explorer {
                     }
                     cx.notify();
                     return;
-                }
-                if result.is_err() {
-                    this.pending_history = None;
                 }
                 if let Some(name) = result
                     .as_ref()
