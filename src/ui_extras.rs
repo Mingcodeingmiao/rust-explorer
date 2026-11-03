@@ -4204,7 +4204,7 @@ impl Explorer {
                     "submenu:new-menu",
                     rust_explorer::i18n::text("新建                         ›"),
                 )
-                .enable(!navigation::is_virtual(&self.dir())),
+                .enable(self.can_create_folder()),
                 MenuItem::new(
                     "submenu:access-menu",
                     rust_explorer::i18n::text("授予访问权限                 ›"),
@@ -4393,6 +4393,12 @@ impl Explorer {
             ])
             .collect(),
             "new-menu" => {
+                if self.dir().to_string_lossy().starts_with("mtp:") {
+                    return vec![MenuItem::new(
+                        "new-folder",
+                        rust_explorer::i18n::text("文件夹"),
+                    )];
+                }
                 let mut items = vec![
                     MenuItem::new("new-folder", rust_explorer::i18n::text("文件夹")),
                     MenuItem::new("new-shortcut", rust_explorer::i18n::text("快捷方式")),
@@ -4416,7 +4422,7 @@ impl Explorer {
                             "submenu:new-menu",
                             rust_explorer::i18n::text("新建                         ›"),
                         )
-                        .enable(!navigation::is_virtual(&self.dir())),
+                        .enable(self.can_create_folder()),
                         "view-menu" => MenuItem::new(
                             "submenu:view-menu",
                             rust_explorer::i18n::text("查看                         ›"),
@@ -4445,8 +4451,7 @@ impl Explorer {
                                                     &entry.path,
                                                 )
                                             })
-                                            || (!self.is_home()
-                                                && !navigation::is_shell_folder(&self.dir()))),
+                                            || (!self.is_home() && self.can_create_folder())),
                                 )
                         }
                         "share" => MenuItem::new("file-share", rust_explorer::i18n::text("共享"))

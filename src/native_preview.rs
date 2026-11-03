@@ -272,6 +272,7 @@ fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap>
 /// device photos/folders, recycled files). Runs where COM is already
 /// initialized; `item` is created through the Shell ID list.
 pub fn shell_item_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap> {
+    let _session = crate::mtp_session::Session::for_path(path)?;
     use windows::core::Interface;
     let item = crate::shell_folder::item(path)?;
     let factory: IShellItemImageFactory = item.cast().context("此位置不提供 Windows 缩略图")?;

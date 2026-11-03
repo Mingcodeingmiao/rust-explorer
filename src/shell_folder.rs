@@ -281,6 +281,12 @@ fn file_time(value: FILETIME) -> Option<SystemTime> {
     Some(UNIX_EPOCH + Duration::from_secs(seconds - 11_644_473_600))
 }
 
+pub(crate) fn entry(path: &Path) -> Result<Entry> {
+    let _session = crate::mtp_session::Session::for_path(path)?;
+    let _com = Com::new()?;
+    item_entry(&item(path)?).context("无法读取便携设备项目")
+}
+
 fn item_entry(item: &IShellItem) -> Option<Entry> {
     let name = unsafe { display_name(item, SIGDN_NORMALDISPLAY) }?;
     let path = unsafe { item_pidl(item) }
@@ -359,17 +365,24 @@ fn enumerate_item(item: &IShellItem) -> Result<Vec<IShellItem>> {
         let enumeration: IEnumShellItems = item
             .BindToHandler(None, &BHID_EnumItems)
             .context("Windows 无法枚举此位置")?;
+        collect_enumeration(&enumeration)
+    }
+}
+
+fn collect_enumeration(enumeration: &IEnumShellItems) -> Result<Vec<IShellItem>> {
+    unsafe {
         let mut result = Vec::new();
         loop {
             let mut batch = [None; 1];
             let mut fetched = 0;
-            let _ = enumeration.Next(&mut batch, Some(&mut fetched));
+            enumeration
+                .Next(&mut batch, Some(&mut fetched))
+                .ok()
+                .context("枚举 Shell 项目失败，不能视为完整目录")?;
             if fetched == 0 {
                 break;
             }
-            if let Some(item) = batch[0].take() {
-                result.push(item);
-            }
+            result.push(batch[0].take().context("Shell 枚举返回了无效项目")?);
         }
         Ok(result)
     }
@@ -580,6 +593,16 @@ pub fn resolve_display_path(text: &str) -> Result<PathBuf> {
 
 /// Enumerate a portable device or other Shell namespace folder.
 pub fn list(path: &Path) -> Result<Listing> {
+    list_impl(path, false)
+}
+
+/// Transfer verification and deletion must never treat a skipped item as absent.
+pub(crate) fn list_complete(path: &Path) -> Result<Listing> {
+    list_impl(path, true)
+}
+
+fn list_impl(path: &Path, strict: bool) -> Result<Listing> {
+    let _session = crate::mtp_session::Session::for_path(path)?;
     let _com = Com::new()?;
     let root = item(path)?;
     let items = enumerate(path)?;
@@ -595,9 +618,16 @@ pub fn list(path: &Path) -> Result<Listing> {
         // name; the listing, title and address bar only show its own name.
         name = filename.to_string_lossy().into_owned();
     }
-    let entries = items
-        .iter()
-        .filter_map(|item| item_entry(item).map(|entry| (item, entry)))
+    let mut parsed = Vec::new();
+    for item in &items {
+        if let Some(entry) = item_entry(item) {
+            parsed.push((item, entry));
+        } else {
+            anyhow::ensure!(!strict, "目录包含无法读取的项目，操作已停止");
+        }
+    }
+    let entries = parsed
+        .into_iter()
         .map(|(item, mut entry)| {
             if recycle {
                 if let Ok(properties) = item.cast::<IShellItem2>() {
@@ -683,6 +713,7 @@ pub fn list(path: &Path) -> Result<Listing> {
 /// Items shown under This PC that do not expose a filesystem path. This
 /// includes MTP phones, cameras and other portable devices.
 pub fn device_paths() -> Result<Vec<(String, PathBuf)>> {
+    let _session = crate::mtp_session::Session::acquire()?;
     let _com = Com::new()?;
     let this_pc = Path::new(THIS_PC);
     let mut result = Vec::new();
@@ -759,6 +790,7 @@ pub fn parent_from_chain(path: &Path, chain: &[(String, PathBuf)]) -> Option<Pat
 
 /// Resolve a parent through Shell, never by parsing a filesystem separator.
 pub fn parent(path: &Path) -> Result<PathBuf> {
+    let _session = crate::mtp_session::Session::for_path(path)?;
     if path
         .to_string_lossy()
         .eq_ignore_ascii_case("shell:RecycleBinFolder")
@@ -793,6 +825,43 @@ pub fn parent(path: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[windows::core::implement(IEnumShellItems)]
+    struct FailedEnumeration;
+    #[allow(non_snake_case)]
+    impl windows::Win32::UI::Shell::IEnumShellItems_Impl for FailedEnumeration_Impl {
+        fn Next(
+            &self,
+            _: u32,
+            _: *mut Option<IShellItem>,
+            fetched: *mut u32,
+        ) -> windows::core::Result<()> {
+            if !fetched.is_null() {
+                unsafe {
+                    *fetched = 0;
+                }
+            }
+            Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_ACCESSDENIED,
+            ))
+        }
+        fn Skip(&self, _: u32) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn Reset(&self) -> windows::core::Result<()> {
+            Ok(())
+        }
+        fn Clone(&self) -> windows::core::Result<IEnumShellItems> {
+            Ok(FailedEnumeration.into())
+        }
+    }
+    #[test]
+    fn enumeration_error_is_not_a_successful_empty_directory() {
+        let enumeration: IEnumShellItems = FailedEnumeration.into();
+        assert!(
+            collect_enumeration(&enumeration).is_err(),
+            "failed enumeration must stop transfer verification"
+        );
+    }
     #[test]
     fn shell_sta_guard_rejects_a_thread_already_initialized_as_mta() {
         std::thread::spawn(|| {

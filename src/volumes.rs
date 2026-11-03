@@ -305,12 +305,11 @@ pub fn remember_snapshot(volumes: &[Volume]) {
 }
 /// Last portable-device enumeration. The Shell namespace walk is the slow part of
 /// a snapshot (and it can time out while the phone is busy), so the result is kept
-/// for a minute: a window opened in that time shows the phone immediately instead
-/// of letting it disappear and come back. A disconnect is reflected on the next
-/// enumeration after this window.
+/// until the next successful enumeration. A long transfer may own the device
+/// session for more than a minute; a timeout must not erase a connected phone.
+/// A successful enumeration (including an empty one) reflects disconnection.
 static DEVICE_CACHE: std::sync::Mutex<Option<(std::time::Instant, Vec<(String, PathBuf)>)>> =
     std::sync::Mutex::new(None);
-const DEVICE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn cached_devices() -> Vec<(String, PathBuf)> {
     let Ok(guard) = DEVICE_CACHE.lock() else {
@@ -318,7 +317,6 @@ fn cached_devices() -> Vec<(String, PathBuf)> {
     };
     guard
         .as_ref()
-        .filter(|(taken, _)| taken.elapsed() < DEVICE_TTL)
         .map(|(_, devices)| devices.clone())
         .unwrap_or_default()
 }
@@ -451,6 +449,18 @@ pub fn compare(a: &Volume, b: &Volume, column: &str, descending: bool) -> std::c
 #[cfg(test)]
 mod ordering_tests {
     use super::*;
+    #[test]
+    fn a_busy_device_keeps_its_last_successful_enumeration_until_a_new_success() {
+        let previous = DEVICE_CACHE.lock().unwrap().take();
+        *DEVICE_CACHE.lock().unwrap() = Some((
+            Instant::now() - Duration::from_secs(120),
+            vec![("owned fixture".into(), "mtp-root:fixture".into())],
+        ));
+        assert_eq!(cached_devices().len(), 1);
+        remember_devices(&[]);
+        assert!(cached_devices().is_empty());
+        *DEVICE_CACHE.lock().unwrap() = previous;
+    }
     fn volume(letter: &str, label: &str, total: Option<u64>, free: Option<u64>) -> Volume {
         Volume {
             path: letter.into(),

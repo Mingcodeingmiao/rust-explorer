@@ -2228,6 +2228,7 @@ impl Explorer {
         let invalidates_usage = matches!(
             &request,
             shell::Request::EmptyRecycleBin
+                | shell::Request::NewFolder { .. }
                 | shell::Request::History { .. }
                 | shell::Request::RecordCreated { .. }
                 | shell::Request::Copy { .. }
@@ -2547,6 +2548,23 @@ impl Explorer {
                     return;
                 }
                 let native_refresh = result.as_ref().is_ok_and(|value| value == "refresh");
+                if let Some(created) = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|value| value.trim().strip_prefix("created-folder:"))
+                {
+                    match serde_json::from_str::<PathBuf>(created) {
+                        Ok(path) => {
+                            this.pending_select = Some(path);
+                            this.reload(cx);
+                        }
+                        Err(error) => {
+                            this.error = Some(error.to_string());
+                            cx.notify();
+                        }
+                    }
+                    return;
+                }
                 if let Err(e) = result {
                     this.error = Some(e.to_string());
                     if deletion {
@@ -2762,14 +2780,15 @@ impl Explorer {
         cx.notify();
     }
     pub(crate) fn can_paste(&self) -> bool {
-        // The device storage selector is not a writable folder. The storage
-        // root itself is also intentionally not a paste target.
-        if self.is_device_root()
-            || (self.dir().to_string_lossy().starts_with("mtp:") && self.shell_chain.len() == 2)
-        {
+        // The device selector is not writable; an actual storage root is a
+        // normal Shell folder and accepts files, just like its subfolders.
+        if self.is_device_root() {
             return false;
         }
         self.shell_clipboard.is_some() || shell::has_file_clipboard()
+    }
+    pub(crate) fn can_create_folder(&self) -> bool {
+        !navigation::is_virtual(&self.dir()) || self.dir().to_string_lossy().starts_with("mtp:")
     }
     fn paste(&mut self, cx: &mut Context<Self>) {
         // A native Shell Copy/Cut writes the system clipboard. If that happened
@@ -2780,10 +2799,9 @@ impl Explorer {
             self.shell_clipboard = None;
         }
         if navigation::is_app_virtual(&self.dir()) || !self.can_paste() {
-            if self.is_device_root()
-                || (self.dir().to_string_lossy().starts_with("mtp:") && self.shell_chain.len() == 2)
-            {
-                self.status = rust_explorer::i18n::text("便携设备存储根目录不允许粘贴").into();
+            if self.is_device_root() {
+                self.status =
+                    rust_explorer::i18n::text("请先进入便携设备的内部存储或存储卡").into();
             }
             cx.notify();
             return;
@@ -2820,6 +2838,12 @@ impl Explorer {
         }
     }
     fn show_dialog(&mut self, dialog: Dialog, window: &mut Window, cx: &mut Context<Self>) {
+        if matches!(dialog, Dialog::NewFolder) && self.dir().to_string_lossy().starts_with("mtp:") {
+            if !self.busy {
+                self.run_shell(shell::Request::NewFolder { folder: self.dir() }, cx);
+            }
+            return;
+        }
         // Renaming a drive or "This PC" is valid on the virtual pages too (that is
         // where those names live); creating items is not.
         let rename = matches!(
@@ -5005,7 +5029,7 @@ impl Render for Explorer {
                 .inset_0(),
             );
             let enabled = match id {
-                "new-folder" => !navigation::is_virtual(&self.dir()),
+                "new-folder" => self.can_create_folder(),
                 "paste" => self.can_paste(),
                 "rename" => {
                     let drive = self
@@ -5014,7 +5038,7 @@ impl Render for Explorer {
                         .and_then(|index| self.entries.get(*index))
                         .is_some_and(|entry| volume_label::is_drive_root(&entry.path));
                     self.selected.len() == 1
-                        && (drive || (!self.is_home() && !navigation::is_shell_folder(&self.dir())))
+                        && (drive || (!self.is_home() && self.can_create_folder()))
                 }
                 "share" => {
                     self.selected.len() == 1

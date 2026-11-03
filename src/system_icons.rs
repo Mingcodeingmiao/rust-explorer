@@ -141,6 +141,7 @@ pub fn folder_has_custom_icon(path: &Path) -> bool {
 /// Obtain Explorer's associated file-type icon without reading normal files.
 /// Executables, shortcuts and .ico files retain their per-item Shell icon.
 pub fn file_icon(path: &Path, directory: bool, size: u32) -> Result<IconBitmap> {
+    let _session = crate::mtp_session::Session::for_path(path)?;
     // Internet shortcuts (`.url` with `IconFile=`) and several shell handlers are
     // COM servers. Without an apartment the Shell silently returns the generic
     // page for them, so ask for one STA apartment when this thread has none. A
