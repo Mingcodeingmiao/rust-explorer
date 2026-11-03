@@ -15,6 +15,7 @@ pub mod instance;
 pub mod launch_request;
 pub mod layout_metrics;
 pub mod list_layout;
+mod mtp_session;
 pub mod native_assets;
 pub mod native_drag;
 pub mod native_preview;

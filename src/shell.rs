@@ -14,6 +14,8 @@ use windows::{
     },
     core::{BOOL, HRESULT, Interface, PCSTR, PCWSTR, Ref, implement, w},
 };
+#[path = "mtp_transfer.rs"]
+mod mtp_transfer;
 #[path = "namespace_rename.rs"]
 mod namespace_rename;
 #[path = "native_menu.rs"]
@@ -72,7 +74,7 @@ thread_local! {
 /// `PerformOperations`; posting WM_CLOSE alone misses operations that never
 /// display a progress window.
 static STOP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-fn stop_requested() -> bool {
+pub(crate) fn stop_requested() -> bool {
     STOP_REQUESTED.load(std::sync::atomic::Ordering::Relaxed)
 }
 /// `--shell-stdin <event>`: wake when the parent asks this one-shot helper to
@@ -290,6 +292,7 @@ pub fn execute_controlled(request: Request, control: OperationControl) -> Result
 }
 pub fn operation_label(request: &Request) -> String {
     let name = match request {
+        Request::NewFolder { .. } => "新建文件夹",
         Request::Menu { .. } | Request::ThemedMenu { .. } | Request::ComputerMenu { .. } => {
             "系统右键菜单"
         }
@@ -363,6 +366,9 @@ pub enum TransferMode {
 }
 #[derive(Serialize, Deserialize, Clone)]
 pub enum Request {
+    NewFolder {
+        folder: PathBuf,
+    },
     EmptyRecycleBin,
     History {
         transaction: crate::file_history::Transaction,
@@ -1428,8 +1434,65 @@ mod protocol_tests {
     }
 }
 pub fn dispatch(request: Request) -> Result<()> {
+    let uses_device = match &request {
+        Request::NewFolder { folder } => crate::mtp_session::is_device(folder),
+        Request::Copy {
+            paths, destination, ..
+        }
+        | Request::Transfer {
+            paths, destination, ..
+        } => {
+            crate::mtp_session::is_device(destination)
+                || paths.iter().any(|path| crate::mtp_session::is_device(path))
+        }
+        Request::Delete { paths } | Request::PermanentDelete { paths } => {
+            paths.iter().any(|path| crate::mtp_session::is_device(path))
+        }
+        Request::Rename { path, .. } => crate::mtp_session::is_device(path),
+        _ => false,
+    };
+    let _session = if uses_device {
+        Some(crate::mtp_session::Session::acquire()?)
+    } else {
+        None
+    };
     let _com = Com::new()?;
     match request {
+        Request::NewFolder { folder } => unsafe {
+            let listing = crate::shell_folder::list(&folder)?;
+            let base = crate::i18n::text("新建文件夹");
+            let name = (1u64..)
+                .map(|n| format!("{base} {n}"))
+                .find(|name| {
+                    !listing
+                        .entries
+                        .iter()
+                        .any(|entry| entry.name.eq_ignore_ascii_case(name))
+                })
+                .context("无法分配文件夹名称")?;
+            let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
+            let cancel = attach_cancellation(&op)?;
+            let destination = item(&folder)?;
+            op.NewItem(
+                &destination,
+                windows::Win32::Storage::FileSystem::FILE_ATTRIBUTE_DIRECTORY.0,
+                PCWSTR(wide(&name).as_ptr()),
+                PCWSTR::null(),
+                None,
+            )?;
+            op.PerformOperations()?;
+            anyhow::ensure!(!op.GetAnyOperationsAborted()?.as_bool(), "操作已取消");
+            drop(cancel);
+            drop(op);
+            drop(destination);
+            let created = crate::shell_folder::list(&folder)?
+                .entries
+                .into_iter()
+                .find(|entry| entry.name == name && entry.directory)
+                .context("新建文件夹未完成")?;
+            println!("created-folder:{}", serde_json::to_string(&created.path)?);
+            Ok(())
+        },
         Request::EmptyRecycleBin => unsafe {
             // Keep Windows confirmation, progress and errors enabled.
             SHEmptyRecycleBinW(None, PCWSTR::null(), 0).map_err(Into::into)
@@ -1463,6 +1526,10 @@ pub fn dispatch(request: Request) -> Result<()> {
             copy_only,
             mode,
         } => unsafe {
+            if mtp_transfer::needed(&paths, &destination) {
+                anyhow::ensure!(mode != TransferMode::Link, "无法在便携设备上创建快捷方式");
+                return mtp_transfer::transfer(&paths, &destination, mode == TransferMode::Move);
+            }
             let destination_shell = crate::shell_folder::is_shell_path(&destination);
             let target = if destination_shell {
                 None
@@ -1725,6 +1792,9 @@ pub fn dispatch(request: Request) -> Result<()> {
             destination,
             moving,
         } => unsafe {
+            if mtp_transfer::needed(&paths, &destination) {
+                return mtp_transfer::transfer(&paths, &destination, moving);
+            }
             let shell_namespace = crate::shell_folder::is_shell_path(&destination)
                 || paths
                     .iter()
@@ -1762,6 +1832,9 @@ pub fn dispatch(request: Request) -> Result<()> {
         },
         Request::PermanentDelete { paths } => unsafe {
             crate::file_history::barrier("Permanent deletion cannot be undone");
+            if paths.iter().all(|path| crate::mtp_session::is_device(path)) {
+                return mtp_transfer::delete(&paths);
+            }
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)?;
             let _cancel = attach_cancellation(&op)?;
             // Deliberately omit ALLOWUNDO, ADDUNDORECORD and RECYCLEONDELETE.
@@ -1786,6 +1859,10 @@ pub fn dispatch(request: Request) -> Result<()> {
             Ok(())
         },
         Request::Delete { paths } => unsafe {
+            if paths.iter().all(|path| crate::mtp_session::is_device(path)) {
+                crate::file_history::barrier("Portable device deletion cannot be undone");
+                return mtp_transfer::delete(&paths);
+            }
             let shell_namespace = paths
                 .iter()
                 .any(|path| crate::shell_folder::is_shell_path(path));
