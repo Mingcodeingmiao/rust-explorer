@@ -122,6 +122,13 @@ struct Tab {
     view: ViewMode,
 }
 #[derive(Clone)]
+struct TabListing {
+    path: PathBuf,
+    entries: Arc<Vec<Entry>>,
+    status: String,
+    options: (bool, bool, bool, Sort, bool),
+}
+#[derive(Clone)]
 struct DragFiles {
     paths: Vec<PathBuf>,
 }
@@ -318,6 +325,10 @@ struct Explorer {
     /// The operations window, reused (and re-activated) by the status bar.
     operations_window: Option<WindowHandle<operations_window::OperationsWindow>>,
     tab_drag: Option<Arc<AtomicBool>>,
+    tab_press: Option<(usize, Point<Pixels>)>,
+    tab_listings: std::collections::HashMap<u64, TabListing>,
+    restoring_tab: bool,
+    tab_watchers: std::collections::HashMap<u64, notify::RecommendedWatcher>,
     tab_tip: Option<crate::tab_tip::TabTip>,
     /// Scale the tab card was built for (zoom × monitor DPI).
     tab_tip_scale: f32,
@@ -412,8 +423,8 @@ struct Explorer {
     cancel: Arc<AtomicBool>,
     generation: u64,
     watcher: Option<notify::RecommendedWatcher>,
-    watch_rx: mpsc::Receiver<()>,
-    watch_tx: mpsc::Sender<()>,
+    watch_rx: mpsc::Receiver<PathBuf>,
+    watch_tx: mpsc::Sender<PathBuf>,
     places: Vec<(String, PathBuf)>,
     _subscriptions: Vec<Subscription>,
 }
@@ -919,6 +930,10 @@ impl Explorer {
             own_window: Some(window.window_handle()),
             operations_window: None,
             tab_drag: None,
+            tab_press: None,
+            tab_listings: Default::default(),
+            restoring_tab: false,
+            tab_watchers: Default::default(),
             tab_tip: None,
             tab_tip_scale: 1.0,
             // Do not paint the cheap `basic` labels first: mapped drives would
@@ -1140,7 +1155,12 @@ impl Explorer {
                             this.icon_ready_dirty.set(true);
                             cx.notify();
                         }
-                        this.watch_pending |= this.watch_rx.try_iter().count() > 0;
+                        let active_path = this.dir();
+                        for changed in this.watch_rx.try_iter() {
+                            this.tab_listings
+                                .retain(|_, listing| listing.path != changed);
+                            this.watch_pending |= changed == active_path;
+                        }
                         if this.watch_pending
                             && this.dialog.is_none()
                             && this.options.is_none()
@@ -1247,7 +1267,13 @@ impl Explorer {
             self.tabs[index].reveal_targets = request.select;
         }
         self.tabs[index].query.clear();
-        self.switch_tab(index, cx);
+        // A reveal is an explicit request, even if its tab is already active.
+        self.tab_listings.remove(&self.tabs[index].id);
+        if index == self.active {
+            self.activate_tab(index, cx);
+        } else {
+            self.switch_tab(index, cx);
+        }
         if let Some(handle) = self.own_window {
             let focus = self.focus.clone();
             cx.defer(move |cx| {
@@ -1424,7 +1450,60 @@ impl Explorer {
         .detach();
         cx.notify();
     }
+    fn restore_listing_state(&mut self) {
+        if let Some(restore) = self.pending_restore.take() {
+            for path in &restore.selection {
+                if let Some(index) = self.entries.iter().position(|entry| &entry.path == path) {
+                    self.selected.insert(index);
+                }
+            }
+            let focus = restore
+                .focus
+                .as_ref()
+                .and_then(|path| self.entries.iter().position(|entry| &entry.path == path));
+            if let Some(index) = focus {
+                self.selected.insert(index);
+                self.anchor = index;
+                self.focus_item = Some(self.entries[index].path.clone());
+                self.keyboard_cursor = self.focus_item.clone();
+                // A remembered row is restored as it was, even
+                // when the selection is outside it. Only a
+                // folder opened at its top (navigation to the
+                // parent that selects the folder just left, or
+                // a reveal from outside) has to bring the item
+                // into view.
+                if restore.row <= 0. {
+                    self.reveal_scroll = self.focus_item.clone();
+                }
+            }
+            if restore.row > 0. {
+                self.pending_scroll_row = Some(restore.row);
+            }
+        }
+    }
     fn reload(&mut self, cx: &mut Context<Self>) {
+        let tab_id = self.tabs[self.active].id;
+        let options = (
+            self.hidden,
+            self.settings.protected,
+            self.settings.folders_first,
+            self.sort,
+            self.descending,
+        );
+        let restored = std::mem::take(&mut self.restoring_tab)
+            .then(|| self.tab_listings.get(&tab_id).cloned())
+            .flatten()
+            .filter(|listing| {
+                listing.path == self.dir()
+                    && self.tabs[self.active].query.is_empty()
+                    && listing.options == options
+                    && !self.watch_pending
+            });
+        self.watch_pending = false;
+        if restored.is_none() {
+            self.tab_listings.remove(&tab_id);
+            self.tab_watchers.remove(&tab_id);
+        }
         let path = self.dir();
         let scope = (
             self.tabs[self.active].id,
@@ -1491,6 +1570,16 @@ impl Explorer {
             self.list_scroll.reset(0);
         }
         self.clear_preview();
+        if let Some(listing) = restored {
+            self.status = listing.status;
+            self.watcher = self.tab_watchers.remove(&self.tabs[self.active].id);
+            self.entries = listing.entries;
+            self.loading = false;
+            self.rebuild_rows();
+            self.restore_listing_state();
+            cx.notify();
+            return;
+        }
         let query = self.tabs[self.active].query.clone();
         if navigation::is_app_virtual(&path) && query.trim().is_empty() {
             // The virtual pages are built synchronously and have no listing to
@@ -1621,11 +1710,12 @@ impl Explorer {
                 if !folders_first {
                     entries.sort_by(|a, b| compare_entries(a, b, sort, descending));
                 }
+                let watched_path = path.clone();
                 let watcher = notify::recommended_watcher(
                     move |event: Result<notify::Event, notify::Error>| {
                         if let Ok(event) = event {
                             if !matches!(event.kind, notify::EventKind::Access(_)) {
-                                let _ = tx.send(());
+                                let _ = tx.send(watched_path.clone());
                             }
                         }
                     },
@@ -1691,6 +1781,19 @@ impl Explorer {
                             }
                         }
                         this.entries = Arc::new(entries);
+                        if !navigation::is_virtual(&result_path)
+                            && this.tabs[this.active].query.is_empty()
+                        {
+                            this.tab_listings.insert(
+                                this.tabs[this.active].id,
+                                TabListing {
+                                    path: result_path.clone(),
+                                    entries: this.entries.clone(),
+                                    status: status.clone(),
+                                    options,
+                                },
+                            );
+                        }
                         this.usage = disk_usage::cached_sizes(
                             this.entries
                                 .iter()
@@ -1724,40 +1827,7 @@ impl Explorer {
                                 this.pending_rename = true;
                             }
                         }
-                        // Back/forward/up and tab switches: reselect what was
-                        // selected here and restore the remembered first visible
-                        // row exactly. The restored viewport wins over the
-                        // selection, which used to be scrolled to the top.
-                        if let Some(restore) = this.pending_restore.take() {
-                            for path in &restore.selection {
-                                if let Some(index) =
-                                    this.entries.iter().position(|entry| &entry.path == path)
-                                {
-                                    this.selected.insert(index);
-                                }
-                            }
-                            let focus = restore.focus.as_ref().and_then(|path| {
-                                this.entries.iter().position(|entry| &entry.path == path)
-                            });
-                            if let Some(index) = focus {
-                                this.selected.insert(index);
-                                this.anchor = index;
-                                this.focus_item = Some(this.entries[index].path.clone());
-                                this.keyboard_cursor = this.focus_item.clone();
-                                // A remembered row is restored as it was, even
-                                // when the selection is outside it. Only a
-                                // folder opened at its top (navigation to the
-                                // parent that selects the folder just left, or
-                                // a reveal from outside) has to bring the item
-                                // into view.
-                                if restore.row <= 0. {
-                                    this.reveal_scroll = this.focus_item.clone();
-                                }
-                            }
-                            if restore.row > 0. {
-                                this.pending_scroll_row = Some(restore.row);
-                            }
-                        }
+                        this.restore_listing_state();
                         this.status = status;
                         this.watcher = watcher;
                     }
@@ -3314,6 +3384,12 @@ impl Explorer {
         if index >= self.tabs.len() {
             return;
         }
+        if index == self.active {
+            return;
+        }
+        if let Some(watcher) = self.watcher.take() {
+            self.tab_watchers.insert(self.tabs[self.active].id, watcher);
+        }
         // Save the outgoing tab before changing `dir()`/`active`.
         self.remember_history_state();
         self.tabs[self.active].view = self.view;
@@ -3348,6 +3424,7 @@ impl Explorer {
                 offset_in_item: px(0.),
             });
         }
+        self.restoring_tab = true;
         self.reload(cx);
     }
     fn close_tab(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -3360,6 +3437,8 @@ impl Explorer {
             return;
         }
         let closed_active = index == self.active;
+        self.tab_watchers.remove(&self.tabs[index].id);
+        self.tab_listings.remove(&self.tabs[index].id);
         self.tabs.remove(index);
         if index < self.active {
             self.active -= 1;

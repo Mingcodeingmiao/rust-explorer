@@ -1799,6 +1799,18 @@ pub fn dispatch(request: Request) -> Result<()> {
                 || paths
                     .iter()
                     .any(|path| crate::shell_folder::is_shell_path(path));
+            // Let Windows choose its localized copy name and reserve it as
+            // part of the operation, including when another copy races us.
+            let in_place_copy = !moving
+                && !shell_namespace
+                && !paths.is_empty()
+                && std::fs::canonicalize(&destination).is_ok_and(|destination| {
+                    paths.iter().all(|path| {
+                        path.parent()
+                            .and_then(|parent| std::fs::canonicalize(parent).ok())
+                            .is_some_and(|parent| parent == destination)
+                    })
+                });
             let op: IFileOperation = CoCreateInstance(&FileOperation, None, CLSCTX_INPROC_SERVER)
                 .context("创建文件操作")?;
             let _cancel = attach_cancellation(&op)?;
@@ -1812,7 +1824,11 @@ pub fn dispatch(request: Request) -> Result<()> {
             let flags = if shell_namespace {
                 FILEOPERATION_FLAGS(FOF_NOCONFIRMATION.0)
             } else {
-                FILEOPERATION_FLAGS(FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0)
+                let mut flags = FOF_ALLOWUNDO.0 | FOFX_ADDUNDORECORD.0;
+                if in_place_copy {
+                    flags |= FOF_RENAMEONCOLLISION.0 | FOFX_PRESERVEFILEEXTENSIONS.0;
+                }
+                FILEOPERATION_FLAGS(flags)
             };
             op.SetOperationFlags(flags).context("设置文件操作标志")?;
             let dst: IShellItem = item(&destination).context("解析目标文件夹")?;
