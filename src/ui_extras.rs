@@ -2540,6 +2540,13 @@ impl Explorer {
                             v.tab_press = Some((index, event.position));
                         }),
                     )
+                    .capture_any_mouse_up(cx.listener(move |v, event: &MouseUpEvent, _, _| {
+                        if event.button == MouseButton::Left
+                            && v.tab_press.is_some_and(|(pressed, _)| pressed == index)
+                        {
+                            v.tab_press = None;
+                        }
+                    }))
                     .child(
                         canvas(|_, _, _| (), {
                             let entity = cx.entity().downgrade();

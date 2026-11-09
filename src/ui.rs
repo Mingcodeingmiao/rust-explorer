@@ -1267,7 +1267,13 @@ impl Explorer {
             self.tabs[index].reveal_targets = request.select;
         }
         self.tabs[index].query.clear();
-        self.switch_tab(index, cx);
+        // A reveal is an explicit request, even if its tab is already active.
+        self.tab_listings.remove(&self.tabs[index].id);
+        if index == self.active {
+            self.activate_tab(index, cx);
+        } else {
+            self.switch_tab(index, cx);
+        }
         if let Some(handle) = self.own_window {
             let focus = self.focus.clone();
             cx.defer(move |cx| {
