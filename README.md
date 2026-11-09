@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.8.1。** 修复鼠标悬停时加载圆圈反复闪现、关闭窗口后的操作状态残留和撤销并发问题；完善缓存清理一致性、驱动器图标后台查询与操作计时。详见 [0.8.1 中文发行说明](docs/v0.8.1.md)。
+**当前版本为 0.8.3。** 切回已加载的目录标签时恢复列表、选中项和滚动位置。标签拖动增加了起步阈值，原目录复制粘贴使用 Windows 的副本命名和递增编号。[0.8.3 中文发行说明](docs/v0.8.3.md)
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-最新已发布下载：[Rust Explorer 0.8.1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.1)。请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版；已启用文件夹关联时先恢复系统默认，再迁移并重新启用，参见[恢复说明](docs/default-folder-browser.md)。
+请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.3](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.3) · [恢复说明](docs/default-folder-browser.md)
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -22,7 +22,7 @@
 
 - 多标签、前进/后退/上级、面包屑地址栏与快捷键。
 - 八种查看模式、列宽调整、排序、分组、筛选、框选与多选；可选高性能固定组件池模式，不支持大图标/中图标/超大图标/内容视图时自动回退传统实现。
-- 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面；可浏览 MTP/便携设备（如 Android 手机）并通过 Shell 命名空间复制、删除项目，支持完整面包屑、左侧树展开、磁盘容量页和 MTP 项目右键菜单。
+- 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面。支持浏览 MTP 设备（如 Android 手机）、向内部存储根目录粘贴、新建、重命名、复制、移动和删除。设备内复制和移动使用电脑临时空间。[MTP 发行说明](docs/v0.8.2.md)
 - 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；本地文件通过 Windows OLE 与 Shell 协商拖放操作。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
 - 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单；文件夹菜单提供新标签页/新窗口打开，空白菜单提供粘贴。
 - 图片、视频单帧、PDF、字体与文件夹缩略图，链接箭头和隐藏文件半透明。

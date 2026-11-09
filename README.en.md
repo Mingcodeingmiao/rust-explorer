@@ -4,18 +4,18 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.1** fixes repeated busy-cursor feedback on hover, stale operation records after closing a window, and concurrent undo/redo handling. It also makes cache clearing atomic, moves drive-icon classification off the UI thread, and updates running-operation timers. See the [release notes (Chinese)](docs/v0.8.1.md).
+Version **0.8.3** restores the file list, selection, and scroll position when you return to a loaded directory tab. A movement threshold prevents accidental tab drags, and pasting into the source folder creates numbered copies using Windows naming rules. [0.8.3 release notes (Chinese)](docs/v0.8.3.md)
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Latest published download: [Rust Explorer 0.8.1](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.1). Fully unzip the Windows x64 package and verify SHA256SUMS.txt. Exit the old version; if folder associations are enabled, restore the system default before moving and re-enabling them. See the [recovery guide](docs/default-folder-browser.md).
+Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.3](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.3) · [Recovery guide](docs/default-folder-browser.md)
 
 ## Features
 
 - Tabs, breadcrumbs, navigation history and keyboard shortcuts.
 - Eight views, adjustable columns, sorting, grouping, filters and marquee selection; an optional fixed-pool high-performance mode falls back to the traditional implementation for unsupported views.
-- System Quick Access synchronization, resizable panes and drive capacity views. Portable/MTP devices support full breadcrumbs, tree expansion, storage-capacity pages, Shell copy/paste and context menus.
+- System Quick Access synchronization, resizable panes, and drive capacity views. Browse MTP devices such as Android phones, paste into internal storage, and create, rename, copy, move, or delete items. Copies and moves within the device use temporary space on the PC. [MTP release notes (Chinese)](docs/v0.8.2.md)
 - Native clipboard/Shell operations, Windows OLE file drag and drop, and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
 - Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
