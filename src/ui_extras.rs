@@ -2278,6 +2278,9 @@ impl Explorer {
                         }
                         let index = destination
                             .tab_drop_index(point.x as f32 / (dpi.max(1.) * destination.zoom));
+                        if index <= destination.active {
+                            destination.active += 1;
+                        }
                         destination.tabs.insert(index, tab);
                         destination.switch_tab(index, cx);
                         true
@@ -2315,12 +2318,7 @@ impl Explorer {
             }
             return;
         }
-        self.tabs.remove(index);
-        if index < self.active {
-            self.active -= 1;
-        }
-        self.active = self.active.min(self.tabs.len() - 1);
-        self.switch_tab(self.active, cx);
+        self.close_tab(index, cx);
     }
     fn accept_tab(&mut self, drag: &DragTab, index: usize, cx: &mut Context<Self>) {
         drag.accepted.store(true, Ordering::Relaxed);
@@ -2339,6 +2337,9 @@ impl Explorer {
             }
         } else {
             let insert = index.min(self.tabs.len());
+            if insert <= self.active {
+                self.active += 1;
+            }
             self.tabs.insert(insert, drag.tab.clone());
             self.switch_tab(insert, cx);
             let id = drag.tab.id;
@@ -2532,6 +2533,40 @@ impl Explorer {
                     .on_mouse_down(
                         MouseButton::Middle,
                         cx.listener(move |v, _, _, cx| v.close_tab(index, cx)),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |v, event: &MouseDownEvent, _, _| {
+                            v.tab_press = Some((index, event.position));
+                        }),
+                    )
+                    .child(
+                        canvas(|_, _, _| (), {
+                            let entity = cx.entity().downgrade();
+                            move |_, _, window, _| {
+                                let entity = entity.clone();
+                                window.on_mouse_event(
+                                    move |event: &MouseMoveEvent, phase, _, cx| {
+                                        if phase == DispatchPhase::Capture
+                                            && event.pressed_button == Some(MouseButton::Left)
+                                        {
+                                            let _ = entity.update(cx, |v, cx| {
+                                                if let Some((pressed, origin)) = v.tab_press {
+                                                    if pressed == index
+                                                        && (event.position - origin).magnitude()
+                                                            < 8.
+                                                    {
+                                                        cx.stop_propagation();
+                                                    }
+                                                }
+                                            });
+                                        }
+                                    },
+                                );
+                            }
+                        })
+                        .absolute()
+                        .size_0(),
                     )
                     .on_drag(drag, move |drag, _, _, cx| {
                         let flag = drag.accepted.clone();
