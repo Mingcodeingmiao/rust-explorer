@@ -149,7 +149,7 @@ pub fn link_from_attributes(path: &Path, attributes: u32) -> bool {
     matches!(data.dwReserved0, 0xA0000003 | 0xA000000C)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Sort {
     Name,
     Original,
