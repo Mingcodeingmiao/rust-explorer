@@ -316,7 +316,7 @@ pub(super) fn open_explorer_request(
                     // presentation for the folder it now shows instead of keeping
                     // the previous one (e.g. This PC's tiles + type grouping).
                     let dir = v.dir();
-                    v.apply_listing_defaults(&dir);
+                    v.apply_listing_defaults(&dir, cx);
                 }
                 v.reload(cx);
             });
@@ -875,9 +875,9 @@ impl Explorer {
                                 if levels[next] != v.view {
                                     v.view = levels[next];
                                     v.settings.view = v.view;
-                                    if v.settings.remember_views {
-                                        v.settings.folder_views.insert(v.dir(), v.view);
-                                    }
+                                    v.remember_folder_view(cx, |prefs| {
+                                        prefs.mode = Some(levels[next])
+                                    });
                                     v.content_scroll.set_offset(point(px(0.), px(0.)));
                                     v.list_scroll.scroll_to(ListOffset::default());
                                     v.invalidate_list();
@@ -1818,8 +1818,10 @@ impl Explorer {
             .child(div().min_w(ui(64.)).h_full().flex_1())
             .into_any_element()
     }
-    pub(super) fn save_settings(&self, _: &mut Context<Self>) {
-        self.settings.enqueue_save();
+    pub(super) fn save_settings(&self, cx: &mut Context<Self>) {
+        let mut settings = self.settings.clone();
+        settings.folder_views = cx.global::<SavedFolderViews>().0.clone();
+        settings.enqueue_save();
     }
     pub(super) fn rebuild_rows(&mut self) {
         shell::menu_trace(format!(
@@ -2167,7 +2169,7 @@ impl Explorer {
         .detach();
         cx.notify();
     }
-    fn sort_current(&mut self, column: Sort, descending: bool) {
+    fn sort_current(&mut self, column: Sort, descending: bool, cx: &mut Context<Self>) {
         self.sort = column;
         self.descending = descending;
         if volumes::is_computer(&self.dir()) || self.dir() == PathBuf::from("::Network") {
@@ -2179,7 +2181,14 @@ impl Explorer {
             .into();
             self.settings.volume_descending = descending;
             self.sync_computer_entries();
-            self.settings.enqueue_save();
+            self.save_settings(cx);
+            return;
+        }
+        if self.remember_folder_view(cx, |prefs| prefs.sort = Some((column, descending))) {
+            self.save_settings(cx);
+        }
+        if self.loading {
+            self.reload(cx);
             return;
         }
         let selected = self.paths();
@@ -2807,6 +2816,7 @@ impl Explorer {
                             } else {
                                 false
                             },
+                            cx,
                         );
                         cx.notify();
                     }))
@@ -5080,9 +5090,6 @@ impl Explorer {
                 folders.len(),
                 folders
             ));
-            // No presentation is copied from this window: a folder is always listed
-            // the way the settings resolve it (saved per-folder view, else the
-            // built-in default). See `resolved_view` in ui.rs.
             self.popup = None;
             self.submenu = None;
             self.nested_submenu = None;
@@ -5093,7 +5100,7 @@ impl Explorer {
                 } else {
                     let tab = Tab {
                         id: next_tab_id(),
-                        view: resolved_view(&self.settings, &path),
+                        view: built_in_view(&path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -5208,9 +5215,7 @@ impl Explorer {
                 self.high_performance_row.set(0.);
                 self.list_scroll.scroll_to(ListOffset::default());
                 self.settings.view = *view;
-                if self.settings.remember_views {
-                    self.settings.folder_views.insert(self.dir(), *view);
-                }
+                self.remember_folder_view(cx, |prefs| prefs.mode = Some(*view));
                 self.rebuild_rows();
                 self.save_settings(cx);
             }
@@ -5218,12 +5223,16 @@ impl Explorer {
             return;
         }
         if let Some(id) = id.strip_prefix("sort:") {
-            self.sort_current(column_sort(id), self.descending);
+            self.sort_current(column_sort(id), self.descending, cx);
             cx.notify();
             return;
         }
         if let Some(id) = id.strip_prefix("group:") {
             self.group = id.into();
+            if self.remember_folder_view(cx, |prefs| prefs.group = Some(id.into())) {
+                self.save_settings(cx);
+            }
+            self.collapsed_groups.clear();
             self.rebuild_rows();
             cx.notify();
             return;
@@ -5303,7 +5312,7 @@ impl Explorer {
                 if let Some(path) = self.paths().first() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
-                        view: resolved_view(&self.settings, &path),
+                        view: built_in_view(&path),
                         history: History::new(path.clone()),
                         query: String::new(),
                         global: false,
@@ -5323,7 +5332,7 @@ impl Explorer {
                 for path in folders {
                     let tab = Tab {
                         id: next_tab_id(),
-                        view: resolved_view(&self.settings, &path),
+                        view: built_in_view(&path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -5401,7 +5410,7 @@ impl Explorer {
                 if let Some(path) = self.context_target.clone() {
                     self.tabs.push(Tab {
                         id: next_tab_id(),
-                        view: resolved_view(&self.settings, &path),
+                        view: built_in_view(&path),
                         history: History::new(path),
                         query: String::new(),
                         global: false,
@@ -5415,7 +5424,7 @@ impl Explorer {
                     let _ = open_explorer(
                         Some(Tab {
                             id: next_tab_id(),
-                            view: resolved_view(&self.settings, &path),
+                            view: built_in_view(&path),
                             history: History::new(path),
                             query: String::new(),
                             global: false,
@@ -5529,8 +5538,16 @@ impl Explorer {
                 }
                 self.load_preview(cx);
             }
-            "ascending" => self.sort_current(self.sort, false),
-            "descending" => self.sort_current(self.sort, true),
+            "ascending" => {
+                self.sort_current(self.sort, false, cx);
+                cx.notify();
+                return;
+            }
+            "descending" => {
+                self.sort_current(self.sort, true, cx);
+                cx.notify();
+                return;
+            }
             "reset-columns" => {
                 let defaults = if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
                     rust_explorer::settings::default_recycle_columns()
@@ -5591,11 +5608,12 @@ impl Explorer {
             "options" => {
                 self.options = Some(self.settings.clone());
                 self.options_page = 0;
+                self.reset_folder_views = false;
             }
             "new-window" => {
                 let tab = Tab {
                     id: next_tab_id(),
-                    view: resolved_view(&self.settings, &self.dir()),
+                    view: built_in_view(&self.dir()),
                     history: History::new(self.dir()),
                     query: String::new(),
                     global: false,
@@ -5679,11 +5697,11 @@ impl Explorer {
     }
     fn apply_options(&mut self, close: bool, cx: &mut Context<Self>) {
         if let Some(settings) = self.options.clone() {
-            let view = if settings.view != self.settings.view {
-                settings.view
-            } else {
-                self.view
-            };
+            let reset = std::mem::take(&mut self.reset_folder_views);
+            if reset {
+                cx.global_mut::<SavedFolderViews>().0.clear();
+            }
+            let remember_changed = settings.remember_views != self.settings.remember_views;
             self.settings = settings;
             rust_explorer::i18n::set_language(&self.settings.language);
             self.language_menu_open = false;
@@ -5691,7 +5709,9 @@ impl Explorer {
             self.tree_children.clear();
             self.hidden = self.settings.hidden;
             self.preview_open = self.settings.preview;
-            self.view = view;
+            if (reset || remember_changed) && self.tabs[self.active].query.trim().is_empty() {
+                self.apply_listing_defaults(&self.dir(), cx);
+            }
             self.save_settings(cx);
             self.reload(cx);
             if close {
@@ -6184,8 +6204,8 @@ impl Explorer {
                 .justify_start()
                 .on_click(cx.listener(|v, _, _, cx| {
                     if let Some(s) = &mut v.options {
-                        s.folder_views.clear();
                         s.columns = Settings::default().columns;
+                        v.reset_folder_views = true;
                     }
                     cx.notify();
                 })),
@@ -6284,6 +6304,7 @@ impl Explorer {
                             .child(button("options-defaults", rust_explorer::i18n::text("还原默认值"), t).on_click(
                                 cx.listener(|v, _, _, cx| {
                                     v.options = Some(Settings::default());
+                                    v.reset_folder_views = true;
                                     cx.notify();
                                 }),
                             ))

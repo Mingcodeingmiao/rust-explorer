@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.8.3。** 切回已加载的目录标签时恢复列表、选中项和滚动位置。标签拖动增加了起步阈值，原目录复制粘贴使用 Windows 的副本命名和递增编号。[0.8.3 中文发行说明](docs/v0.8.3.md)
+**当前版本为 0.8.4。** 开启「记住每个文件夹的查看方式」后，视图、排序列、升降序和分组依据会按文件夹保存，重新打开或重启后恢复。[0.8.4 中文发行说明](docs/v0.8.4.md)
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.3](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.3) · [恢复说明](docs/default-folder-browser.md)
+请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.4](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.4) · [恢复说明](docs/default-folder-browser.md)
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 

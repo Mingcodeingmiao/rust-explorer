@@ -1,8 +1,46 @@
+use crate::fs::Sort;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::{OnceLock, mpsc};
 
 #[cfg(test)]
 mod interaction_defaults_tests {
+    use super::{FolderView, Settings, ViewMode};
+    use crate::fs::Sort;
+    use std::path::Path;
+
+    #[test]
+    fn folder_views_round_trip_with_legacy_view_modes() {
+        let mut settings: Settings =
+            serde_json::from_str(r#"{"folder_views":{"C:\\Pictures":"Large"}}"#).unwrap();
+        assert_eq!(
+            settings.folder_views[Path::new(r"C:\Pictures")],
+            FolderView {
+                mode: Some(ViewMode::Large),
+                ..FolderView::default()
+            }
+        );
+        settings.folder_views.insert(
+            r"C:\Documents".into(),
+            FolderView {
+                mode: Some(ViewMode::List),
+                sort: Some((Sort::Modified, true)),
+                group: Some("kind".into()),
+            },
+        );
+        settings.folder_views.insert(
+            "::ThisPC".into(),
+            FolderView {
+                group: Some(String::new()),
+                ..FolderView::default()
+            },
+        );
+        let decoded: Settings =
+            serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(decoded.folder_views, settings.folder_views);
+    }
+
     #[test]
     fn language_defaults_to_english_and_round_trips() {
         let settings: super::Settings = serde_json::from_str("{}").unwrap();
@@ -69,6 +107,49 @@ impl ViewMode {
         }
     }
 }
+
+pub type FolderViews = BTreeMap<PathBuf, FolderView>;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(from = "StoredFolderView")]
+pub struct FolderView {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<ViewMode>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sort: Option<(Sort, bool)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StoredFolderView {
+    Legacy(ViewMode),
+    Listing {
+        mode: Option<ViewMode>,
+        sort: Option<(Sort, bool)>,
+        group: Option<String>,
+    },
+}
+
+impl From<StoredFolderView> for FolderView {
+    fn from(stored: StoredFolderView) -> Self {
+        match stored {
+            StoredFolderView::Legacy(mode) => Self {
+                mode: Some(mode),
+                ..Self::default()
+            },
+            StoredFolderView::Listing { mode, sort, group } => Self { mode, sort, group },
+        }
+    }
+}
+
+enum SettingsWrite {
+    Save(Box<Settings>),
+    Flush(mpsc::Sender<()>),
+}
+static SETTINGS_WRITER: OnceLock<mpsc::Sender<SettingsWrite>> = OnceLock::new();
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -107,7 +188,7 @@ pub struct Settings {
     pub volume_columns: Vec<(String, f32)>,
     pub volume_sort: String,
     pub volume_descending: bool,
-    pub folder_views: std::collections::BTreeMap<PathBuf, ViewMode>,
+    pub folder_views: FolderViews,
     pub favorites: Vec<PathBuf>,
     pub show_computer: bool,
     pub show_network: bool,
@@ -249,21 +330,38 @@ impl Settings {
         }
     }
     pub fn enqueue_save(&self) {
-        static WRITER: std::sync::OnceLock<std::sync::mpsc::Sender<Settings>> =
-            std::sync::OnceLock::new();
-        let sender = WRITER.get_or_init(|| {
-            let (tx, rx) = std::sync::mpsc::channel::<Settings>();
+        let sender = SETTINGS_WRITER.get_or_init(|| {
+            let (tx, rx) = mpsc::channel::<SettingsWrite>();
             std::thread::spawn(move || {
-                while let Ok(mut settings) = rx.recv() {
-                    for newer in rx.try_iter() {
-                        settings = newer;
+                while let Ok(first) = rx.recv() {
+                    let mut pending = None;
+                    for request in std::iter::once(first).chain(rx.try_iter()) {
+                        match request {
+                            SettingsWrite::Save(settings) => pending = Some(settings),
+                            SettingsWrite::Flush(done) => {
+                                if let Some(settings) = pending.take() {
+                                    settings.save();
+                                }
+                                let _ = done.send(());
+                            }
+                        }
                     }
-                    settings.save();
+                    if let Some(settings) = pending {
+                        settings.save();
+                    }
                 }
             });
             tx
         });
-        let _ = sender.send(self.clone());
+        let _ = sender.send(SettingsWrite::Save(Box::new(self.clone())));
+    }
+    pub fn flush_pending_saves() {
+        if let Some(writer) = SETTINGS_WRITER.get() {
+            let (done, flushed) = mpsc::channel();
+            if writer.send(SettingsWrite::Flush(done)).is_ok() {
+                let _ = flushed.recv();
+            }
+        }
     }
 }
 

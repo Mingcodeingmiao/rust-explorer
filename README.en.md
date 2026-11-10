@@ -4,12 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.3** restores the file list, selection, and scroll position when you return to a loaded directory tab. A movement threshold prevents accidental tab drags, and pasting into the source folder creates numbered copies using Windows naming rules. [0.8.3 release notes (Chinese)](docs/v0.8.3.md)
+Version **0.8.4** remembers each folder’s view, sort column, sort direction, and grouping when folder view memory is enabled. These settings are restored when you reopen the folder or restart the app. [0.8.4 release notes (Chinese)](docs/v0.8.4.md)
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.3](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.3) · [Recovery guide](docs/default-folder-browser.md)
+Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.4](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.4) · [Recovery guide](docs/default-folder-browser.md)
 
 ## Features
 

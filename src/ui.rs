@@ -6,7 +6,7 @@ use rust_explorer::{
     disk_usage::{self, Usage},
     list_layout::{self, ListCell},
     new_file,
-    settings::{Settings, ViewMode},
+    settings::{FolderView, FolderViews, Settings, ViewMode},
     volume_label,
     volumes::{self, Volume},
 };
@@ -238,6 +238,7 @@ struct Explorer {
     marquee: Option<Marquee>,
     settings: Settings,
     options: Option<Settings>,
+    reset_folder_views: bool,
     options_page: usize,
     language_menu_open: bool,
     association_busy: bool,
@@ -436,22 +437,60 @@ impl Drop for Explorer {
     }
 }
 
-/// How a folder should be listed: the view saved for it in the settings file,
-/// otherwise the built-in default for that kind of folder. This is resolved every
-/// time a folder is listed, so a window never depends on what another window used.
-fn resolved_view(settings: &rust_explorer::settings::Settings, path: &std::path::Path) -> ViewMode {
-    let saved = settings.folder_views.get(path).copied();
-    let fallback = built_in_view(path);
-    let resolved = if settings.remember_views {
-        saved.unwrap_or(fallback)
-    } else {
-        fallback
-    };
-    view_trace(format!(
-        "resolved folder={:?} remember={} saved={:?} default={:?} -> {:?}",
-        path, settings.remember_views, saved, fallback, resolved
-    ));
-    resolved
+// Windows share the latest folder preferences, including changes still queued for disk.
+struct SavedFolderViews(FolderViews);
+impl Global for SavedFolderViews {}
+
+struct ListingPresentation {
+    view: ViewMode,
+    sort: Sort,
+    descending: bool,
+    group: String,
+}
+impl ListingPresentation {
+    fn resolve(settings: &Settings, path: &std::path::Path, cx: &App) -> Self {
+        let saved = settings
+            .remember_views
+            .then(|| cx.global::<SavedFolderViews>().0.get(path))
+            .flatten();
+        let fixed_view = rust_explorer::shell_folder::is_recycle_bin_path(path)
+            || path.to_string_lossy().starts_with("mtp-root:");
+        let view = if fixed_view {
+            built_in_view(path)
+        } else {
+            saved
+                .and_then(|prefs| prefs.mode)
+                .unwrap_or_else(|| built_in_view(path))
+        };
+        let computer = volumes::is_computer(path);
+        let (sort, descending) = if computer || path == std::path::Path::new("::Network") {
+            let sort = match settings.volume_sort.as_str() {
+                "kind" => Sort::Kind,
+                "total" | "free" => Sort::Size,
+                _ => Sort::Name,
+            };
+            (sort, settings.volume_descending)
+        } else {
+            saved
+                .and_then(|prefs| prefs.sort)
+                .unwrap_or((Sort::Name, false))
+        };
+        let group = saved
+            .and_then(|prefs| prefs.group.clone())
+            .unwrap_or_else(|| {
+                if computer {
+                    "kind".into()
+                } else {
+                    String::new()
+                }
+            });
+        Self {
+            view,
+            sort,
+            descending,
+            group,
+        }
+    }
 }
 fn built_in_view(path: &std::path::Path) -> ViewMode {
     if volumes::is_computer(path) {
@@ -572,6 +611,11 @@ impl Explorer {
             // fall back to English inside `Language::system`.
             settings.language = rust_explorer::i18n::Language::system().tag().into();
             settings.save();
+        }
+        if !cx.has_global::<SavedFolderViews>() {
+            cx.set_global(SavedFolderViews(std::mem::take(&mut settings.folder_views)));
+        } else {
+            settings.folder_views.clear();
         }
         rust_explorer::i18n::set_language(&settings.language);
         let initial = launch
@@ -770,11 +814,12 @@ impl Explorer {
                     }
                     InputEvent::Changed => {
                         let query = input.read(cx).value();
-                        if !query.trim().is_empty() && this.tabs[this.active].query.is_empty() {
+                        let was_searching = !this.tabs[this.active].query.trim().is_empty();
+                        if !query.trim().is_empty() && !was_searching {
                             this.view = ViewMode::Details;
                         }
-                        if query.trim().is_empty() && !this.tabs[this.active].query.is_empty() {
-                            this.view = resolved_view(&this.settings, &this.dir());
+                        if query.trim().is_empty() && was_searching {
+                            this.apply_listing_defaults(&this.dir(), cx);
                         }
                         this.tabs[this.active].query = query.clone();
                         this.cancel.store(true, Ordering::Relaxed);
@@ -794,7 +839,7 @@ impl Explorer {
                         .detach();
                     }
                     InputEvent::Cancel => {
-                        this.view = resolved_view(&this.settings, &this.dir());
+                        this.apply_listing_defaults(&this.dir(), cx);
                         this.tabs[this.active].query.clear();
                         this.search
                             .update(cx, |v, cx| v.set_value(String::new(), cx));
@@ -837,12 +882,16 @@ impl Explorer {
             }
             settings.quick_access_initialized = true;
             settings.quick_access_system_migrated = true;
+            settings.folder_views = cx.global::<SavedFolderViews>().0.clone();
             settings.enqueue_save();
+            settings.folder_views.clear();
         }
-        let mut view = resolved_view(&settings, &initial);
-        if initial.to_string_lossy().starts_with("mtp-root:") {
-            view = ViewMode::Tiles;
-        }
+        let ListingPresentation {
+            view,
+            sort,
+            descending,
+            group,
+        } = ListingPresentation::resolve(&settings, &initial, cx);
         view_trace(format!(
             "new window initial={:?} remember={} -> view={:?}",
             initial, settings.remember_views, view
@@ -851,6 +900,7 @@ impl Explorer {
             marquee: None,
             view,
             options: None,
+            reset_folder_views: false,
             options_page: 0,
             language_menu_open: false,
             association_busy: false,
@@ -897,11 +947,7 @@ impl Explorer {
             filter_folder: PathBuf::new(),
             group_members: Default::default(),
             collapsed_groups: Default::default(),
-            group: if volumes::is_computer(&initial) {
-                "kind".into()
-            } else {
-                String::new()
-            },
+            group,
             usage: HashMap::new(),
             usage_cancel: Arc::new(AtomicBool::new(false)),
             usage_rx,
@@ -988,8 +1034,8 @@ impl Explorer {
             file_drop_bounds: Default::default(),
             native_drop: None,
             anchor: 0,
-            sort: Sort::Name,
-            descending: false,
+            sort,
+            descending,
             loading: false,
             busy: false,
             system_menu_active: false,
@@ -1252,7 +1298,7 @@ impl Explorer {
         );
         let index = index.unwrap_or_else(|| {
             let folder = request.folder.clone();
-            let view = resolved_view(&self.settings, &folder);
+            let view = built_in_view(&folder);
             self.tabs.push(Tab {
                 id: next_tab_id(),
                 history: History::new(request.folder),
@@ -1285,28 +1331,36 @@ impl Explorer {
         }
         cx.notify();
     }
-    /// Resolve how the given folder should be listed and reset the grouping that
-    /// belongs to that kind of folder. A window built for one folder and then
-    /// pointed at another must not keep the first folder's presentation.
-    pub(super) fn apply_listing_defaults(&mut self, path: &std::path::Path) {
-        self.view = resolved_view(&self.settings, path);
-        if rust_explorer::shell_folder::is_recycle_bin_path(path) {
-            self.view = ViewMode::Details;
-        }
-        if path.to_string_lossy().starts_with("mtp-root:") {
-            self.view = ViewMode::Tiles;
-        }
-        // Grouping is a property of the folder being listed, not of the window:
-        // This PC groups by type, an ordinary folder starts ungrouped.
-        self.group = if volumes::is_computer(path) {
-            "kind".into()
-        } else {
-            String::new()
-        };
+    fn apply_listing_defaults(&mut self, path: &std::path::Path, cx: &App) {
+        let listing = ListingPresentation::resolve(&self.settings, path, cx);
+        self.view = listing.view;
+        self.sort = listing.sort;
+        self.descending = listing.descending;
+        // A group collapsed in one folder must not hide items in another
+        // folder that happens to use the same grouping and group names.
+        self.collapsed_groups.clear();
+        self.group = listing.group;
         view_trace(format!(
             "listing defaults for {:?} -> view={:?} group={:?}",
             path, self.view, self.group
         ));
+    }
+    fn remember_folder_view(
+        &self,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut FolderView),
+    ) -> bool {
+        if !self.settings.remember_views || !self.tabs[self.active].query.trim().is_empty() {
+            return false;
+        }
+        let path = self.dir();
+        update(
+            cx.global_mut::<SavedFolderViews>()
+                .0
+                .entry(path)
+                .or_default(),
+        );
+        true
     }
     fn navigate(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if path == std::path::Path::new(navigation::CONTROL_PANEL) {
@@ -1320,33 +1374,16 @@ impl Explorer {
             self.submenu = None;
             self.nested_submenu = None;
         }
-        if self.settings.remember_views {
-            self.view = resolved_view(&self.settings, &path);
-            view_trace(format!(
-                "navigate {:?} -> view={:?} group={:?}",
-                path, self.view, self.group
-            ));
-        }
-        if rust_explorer::shell_folder::is_recycle_bin_path(&path) {
-            self.view = ViewMode::Details;
-            view_trace(format!("navigate {:?} is recycling bin -> Details", path));
-        }
-        if volumes::is_computer(&path) && !volumes::is_computer(&self.dir()) {
-            self.group = "kind".into();
-            if !self.settings.remember_views {
-                self.view = ViewMode::Tiles;
-            }
-        } else if volumes::is_computer(&self.dir()) && !volumes::is_computer(&path) {
-            self.group.clear();
-        }
-        if path.to_string_lossy().starts_with("mtp-root:") {
-            // Portable-device roots show storage volumes like drive tiles.
-            self.view = ViewMode::Tiles;
-            self.group.clear();
-        }
         // Remember where the folder we are leaving was scrolled to and what was
         // selected there; going back restores both, like Explorer.
         self.remember_history_state();
+        if self.settings.remember_views
+            || navigation::is_virtual(&path)
+            || navigation::is_virtual(&self.dir())
+            || !self.tabs[self.active].query.trim().is_empty()
+        {
+            self.apply_listing_defaults(&path, cx);
+        }
         self.pending_restore = None;
         self.pending_scroll_row = None;
         self.tabs[self.active].history.push(path);
@@ -2088,7 +2125,7 @@ impl Explorer {
         if self.focus_existing_tab(&path, cx) {
             return;
         }
-        let view = resolved_view(&self.settings, &path);
+        let view = built_in_view(&path);
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
@@ -2139,7 +2176,7 @@ impl Explorer {
             query: String::new(),
             global: false,
             reveal_targets: Vec::new(),
-            view: resolved_view(&self.settings, &path),
+            view: built_in_view(&path),
         };
         match disposition {
             OpenDisposition::Current => self.navigate(path, cx),
@@ -3369,7 +3406,7 @@ impl Explorer {
         } else {
             self.dir()
         };
-        let view = resolved_view(&self.settings, &path);
+        let view = built_in_view(&path);
         self.tabs.push(Tab {
             id: next_tab_id(),
             history: History::new(path),
@@ -3399,19 +3436,16 @@ impl Explorer {
         if index >= self.tabs.len() {
             return;
         }
-        let was_computer = volumes::is_computer(&self.dir());
         self.active = index;
         self.external_reveal = self.tabs[index].reveal_targets.clone();
         self.reveal_pending = !self.external_reveal.is_empty();
         self.reveal_scroll = None;
-        self.view = self.tabs[index].view;
-        if !was_computer && volumes::is_computer(&self.dir()) {
-            self.group = "kind".into();
-        } else if was_computer && !volumes::is_computer(&self.dir()) {
-            self.group.clear();
+        let query = self.tabs[index].query.clone();
+        self.apply_listing_defaults(&self.dir(), cx);
+        if !self.settings.remember_views || !query.trim().is_empty() {
+            self.view = self.tabs[index].view;
         }
         self.tab_scroll.scroll_to_item(index);
-        let query = self.tabs[index].query.clone();
         self.search.update(cx, |v, cx| v.set_value(query, cx));
         self.apply_remembered_state();
         if self
@@ -3712,7 +3746,7 @@ impl Explorer {
             // The destination owns its presentation: resolve it from saved
             // folder views, then the built-in default. Never inherit the view
             // of the folder we are leaving.
-            self.apply_listing_defaults(&self.dir());
+            self.apply_listing_defaults(&self.dir(), cx);
             self.apply_remembered_state();
             self.reload(cx);
         }
@@ -3720,7 +3754,7 @@ impl Explorer {
     fn go_forward(&mut self, cx: &mut Context<Self>) {
         self.remember_history_state();
         if self.tabs[self.active].history.forward() {
-            self.apply_listing_defaults(&self.dir());
+            self.apply_listing_defaults(&self.dir(), cx);
             self.apply_remembered_state();
             self.reload(cx);
         }
@@ -4366,9 +4400,7 @@ impl Render for Explorer {
                     let requested = ViewMode::ALL[action.index].0;
                     v.view = requested;
                     v.settings.view = v.view;
-                    if v.settings.remember_views {
-                        v.settings.folder_views.insert(v.dir(), v.view);
-                    }
+                    v.remember_folder_view(cx, |prefs| prefs.mode = Some(requested));
                     v.content_scroll.set_offset(point(px(0.), px(0.)));
                     v.invalidate_list();
                     v.save_settings(cx);
@@ -6434,4 +6466,5 @@ pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
                 .expect(rust_explorer::i18n::text("无法创建窗口"));
             cx.activate(true);
         });
+    Settings::flush_pending_saves();
 }
