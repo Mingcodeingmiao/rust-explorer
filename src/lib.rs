@@ -3,7 +3,6 @@ pub mod breadcrumb_layout;
 pub mod content_layout;
 pub mod default_browser;
 pub mod disk_usage;
-pub mod external_tools;
 pub mod file_drag;
 pub mod file_filter;
 pub mod file_hints;

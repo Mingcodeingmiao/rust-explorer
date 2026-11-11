@@ -239,7 +239,6 @@ struct Explorer {
     settings: Settings,
     options: Option<Settings>,
     reset_folder_views: bool,
-    bandizip: Option<PathBuf>,
     menu_action_hover: Option<&'static str>,
     options_page: usize,
     language_menu_open: bool,
@@ -903,7 +902,6 @@ impl Explorer {
             view,
             options: None,
             reset_folder_views: false,
-            bandizip: None,
             menu_action_hover: None,
             options_page: 0,
             language_menu_open: false,
@@ -1093,17 +1091,6 @@ impl Explorer {
             let _ = weak.update(cx, |_, cx| cx.notify());
         });
         window.focus(&this.focus);
-        let discover_bandizip = cx
-            .background_executor()
-            .spawn(async { rust_explorer::external_tools::bandizip() });
-        cx.spawn(async move |view, cx| {
-            let executable = discover_bandizip.await;
-            let _ = view.update(cx, |this, cx| {
-                this.bandizip = executable;
-                cx.notify();
-            });
-        })
-        .detach();
         let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
             loop {
@@ -2755,8 +2742,11 @@ impl Explorer {
             self.system_menu(cx);
             return;
         }
-        if self.settings.full_system_menu
-            && !(navigation::is_virtual(&self.dir()) && self.selected.is_empty())
+        // Let the Shell query registered handlers for this exact selection.
+        // Do not substitute a hand-maintained list of third-party applications.
+        if !navigation::is_virtual(&self.dir())
+            || (self.settings.full_system_menu
+                && !(navigation::is_virtual(&self.dir()) && self.selected.is_empty()))
         {
             self.system_menu(cx);
             return;

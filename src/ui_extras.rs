@@ -4217,32 +4217,8 @@ impl Explorer {
                         )
                     });
                 }
-                if self.bandizip.is_some() && !navigation::is_virtual(&self.dir()) {
-                    items.insert(
-                        items.len() - 1,
-                        MenuItem::new("submenu:bandizip-menu", "Bandizip"),
-                    );
-                }
                 items
             }
-            "bandizip-menu" => vec![
-                MenuItem::new(
-                    "bandizip:compress",
-                    rust_explorer::i18n::text("Bandizip 新建压缩包…"),
-                ),
-                MenuItem::new(
-                    "bandizip:extract",
-                    rust_explorer::i18n::text("Bandizip 解压到…"),
-                )
-                .enable(
-                    self.selected.len() == 1
-                        && self
-                            .selected
-                            .first()
-                            .and_then(|i| self.entries.get(*i))
-                            .is_some_and(|e| !e.directory),
-                ),
-            ],
             "access-menu" => {
                 let path = self
                     .selected
@@ -5169,21 +5145,6 @@ impl Explorer {
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
         self.menu_action_hover = None;
-        if let Some(action) = id.strip_prefix("bandizip:") {
-            self.popup = None;
-            self.submenu = None;
-            if let Some(executable) = &self.bandizip {
-                if let Err(error) = rust_explorer::external_tools::launch_bandizip(
-                    executable,
-                    &self.paths(),
-                    action == "extract",
-                ) {
-                    self.error = Some(error.to_string());
-                }
-            }
-            cx.notify();
-            return;
-        }
         if let Some(payload) = id.strip_prefix("shell-verb:") {
             match serde_json::from_str::<shell::Request>(payload) {
                 Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
