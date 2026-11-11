@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.8.4。** 开启「记住每个文件夹的查看方式」后，视图、排序列、升降序和分组依据会按文件夹保存，重新打开或重启后恢复。[0.8.4 中文发行说明](docs/v0.8.4.md)
+**当前版本为 0.8.5。** 文件右键菜单底部集中显示剪切、复制、重命名、共享和删除，补充悬浮淡入与按下反馈。安装 Bandizip 后可从菜单打开新建压缩包和选择解压目标对话框。[0.8.5 中文发行说明](docs/v0.8.5.md)
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.4](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.4) · [恢复说明](docs/default-folder-browser.md)
+请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.5](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.5) · [恢复说明](docs/default-folder-browser.md)
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -25,6 +25,7 @@
 - 系统快速访问同步、可调宽导航和预览窗格、驱动器容量页面。支持浏览 MTP 设备（如 Android 手机）、向内部存储根目录粘贴、新建、重命名、复制、移动和删除。设备内复制和移动使用电脑临时空间。[MTP 发行说明](docs/v0.8.2.md)
 - 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；本地文件通过 Windows OLE 与 Shell 协商拖放操作。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
 - 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单；文件夹菜单提供新标签页/新窗口打开，空白菜单提供粘贴。
+- 简洁文件菜单提供底部常用操作栏和可选 Bandizip 集成。第三方软件的系统注册菜单可从「显示完整系统菜单」访问。
 - 图片、视频单帧、PDF、字体与文件夹缩略图，链接箭头和隐藏文件半透明。
 - 明色/暗色/跟随系统主题、界面缩放和高 DPI 图标。
 - 可选 Everything 搜索；不可用时明确回退到当前文件夹名称筛选。

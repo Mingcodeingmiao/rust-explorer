@@ -4,12 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.4** remembers each folder’s view, sort column, sort direction, and grouping when folder view memory is enabled. These settings are restored when you reopen the folder or restart the app. [0.8.4 release notes (Chinese)](docs/v0.8.4.md)
+Version **0.8.5** groups Cut, Copy, Rename, Share, and Delete at the bottom of the file context menu, with hover fade and pressed feedback. If Bandizip is installed, the menu can open its archive creation and extraction destination dialogs. [0.8.5 release notes (Chinese)](docs/v0.8.5.md)
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.4](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.4) · [Recovery guide](docs/default-folder-browser.md)
+Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.5](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.5) · [Recovery guide](docs/default-folder-browser.md)
 
 ## Features
 
@@ -18,6 +18,7 @@ Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old vers
 - System Quick Access synchronization, resizable panes, and drive capacity views. Browse MTP devices such as Android phones, paste into internal storage, and create, rename, copy, move, or delete items. Copies and moves within the device use temporary space on the PC. [MTP release notes (Chinese)](docs/v0.8.2.md)
 - Native clipboard/Shell operations, Windows OLE file drag and drop, and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
 - Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
+- A compact file menu with a bottom action bar and optional Bandizip integration. Registered third-party Shell extensions remain accessible through Show full system menu.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
 - Light/dark/system themes, zoom, high-DPI icons and optional Everything integration.
 
