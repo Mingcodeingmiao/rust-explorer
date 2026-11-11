@@ -239,6 +239,8 @@ struct Explorer {
     settings: Settings,
     options: Option<Settings>,
     reset_folder_views: bool,
+    bandizip: Option<PathBuf>,
+    menu_action_hover: Option<&'static str>,
     options_page: usize,
     language_menu_open: bool,
     association_busy: bool,
@@ -901,6 +903,8 @@ impl Explorer {
             view,
             options: None,
             reset_folder_views: false,
+            bandizip: None,
+            menu_action_hover: None,
             options_page: 0,
             language_menu_open: false,
             association_busy: false,
@@ -1089,6 +1093,17 @@ impl Explorer {
             let _ = weak.update(cx, |_, cx| cx.notify());
         });
         window.focus(&this.focus);
+        let discover_bandizip = cx
+            .background_executor()
+            .spawn(async { rust_explorer::external_tools::bandizip() });
+        cx.spawn(async move |view, cx| {
+            let executable = discover_bandizip.await;
+            let _ = view.update(cx, |this, cx| {
+                this.bandizip = executable;
+                cx.notify();
+            });
+        })
+        .detach();
         let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
             loop {
@@ -2699,6 +2714,7 @@ impl Explorer {
         cx.notify();
     }
     fn menu(&mut self, cx: &mut Context<Self>) {
+        self.menu_action_hover = None;
         if self.busy {
             return;
         }
@@ -2764,6 +2780,7 @@ impl Explorer {
         cx.notify();
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu_action_hover = None;
         rust_explorer::shell::menu_trace(format!(
             "app: system_menu() rb_down={}",
             (unsafe {

@@ -4164,7 +4164,7 @@ impl Explorer {
                     );
                     return items;
                 }
-                vec![
+                let mut items = vec![
                     MenuItem::new("file-open", rust_explorer::i18n::text("打开")),
                     MenuItem::new("file-tab", rust_explorer::i18n::text("在新标签页中打开"))
                         .enable(folder),
@@ -4204,8 +4204,45 @@ impl Explorer {
                         .enable(!navigation::is_shell_folder(&self.dir())),
                     MenuItem::new("system-menu", rust_explorer::i18n::text("显示完整系统菜单"))
                         .enable(!navigation::is_shell_folder(&self.dir())),
-                ]
+                ];
+                if !folder {
+                    items.retain(|item| {
+                        !matches!(
+                            item.id.as_str(),
+                            "file-tab"
+                                | "file-window"
+                                | "file-explorer"
+                                | "pin"
+                                | "submenu:access-menu"
+                        )
+                    });
+                }
+                if self.bandizip.is_some() && !navigation::is_virtual(&self.dir()) {
+                    items.insert(
+                        items.len() - 1,
+                        MenuItem::new("submenu:bandizip-menu", "Bandizip"),
+                    );
+                }
+                items
             }
+            "bandizip-menu" => vec![
+                MenuItem::new(
+                    "bandizip:compress",
+                    rust_explorer::i18n::text("Bandizip 新建压缩包…"),
+                ),
+                MenuItem::new(
+                    "bandizip:extract",
+                    rust_explorer::i18n::text("Bandizip 解压到…"),
+                )
+                .enable(
+                    self.selected.len() == 1
+                        && self
+                            .selected
+                            .first()
+                            .and_then(|i| self.entries.get(*i))
+                            .is_some_and(|e| !e.directory),
+                ),
+            ],
             "access-menu" => {
                 let path = self
                     .selected
@@ -4649,7 +4686,19 @@ impl Explorer {
             .flex()
             .flex_col()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation());
+        let compact_actions = kind == "file-menu" && !navigation::is_shell_folder(&self.dir());
+        let action_ids = [
+            "file-cut",
+            "file-copy",
+            "file-rename",
+            "file-share",
+            "file-delete",
+        ];
         for (index, item) in self.menu_items(kind, cx).into_iter().enumerate() {
+            if compact_actions && action_ids.contains(&item.id.as_str()) {
+                continue;
+            }
+
             if item.id == "-" {
                 panel = panel.child(div().h(ui(1.)).flex_shrink_0().my_1().bg(rgb(t.border)));
                 offset += 9.;
@@ -4735,6 +4784,84 @@ impl Explorer {
                         }
                     })),
             )
+        }
+        if compact_actions {
+            let items = self.menu_items(kind, cx);
+            let mut actions = div().flex().h(ui(58.)).flex_shrink_0().gap_1();
+            for id in action_ids {
+                let label = match id {
+                    "file-cut" => "剪切",
+                    "file-copy" => "复制",
+                    "file-rename" => "重命名",
+                    "file-share" => "共享",
+                    _ => "删除",
+                };
+                let enabled = if id == "file-share" {
+                    self.selected.len() == 1 && !navigation::is_virtual(&self.dir())
+                } else {
+                    items
+                        .iter()
+                        .find(|item| item.id == id)
+                        .is_some_and(|item| item.enabled)
+                };
+                let button = div()
+                    .id(id)
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap_1()
+                    .rounded(ui(4.))
+                    .text_size(ui(11.))
+                    .text_color(rgb(if enabled { t.text } else { t.muted }))
+                    .when(enabled, |button| {
+                        button.active(move |style| {
+                            style.bg(rgb(if t.dark { 0x505050 } else { 0xdddddd }))
+                        })
+                    })
+                    .on_hover(cx.listener(move |v, hovered: &bool, _, cx| {
+                        if !*hovered && v.menu_action_hover != Some(id) {
+                            return;
+                        }
+                        let next = if *hovered && enabled { Some(id) } else { None };
+                        if v.menu_action_hover != next {
+                            v.menu_action_hover = next;
+                            cx.notify();
+                        }
+                    }))
+                    .child(visual::icon_at(
+                        menu_icon(id).unwrap_or("copy"),
+                        if enabled { t.text } else { t.muted },
+                        20.,
+                    ))
+                    .child(rust_explorer::i18n::text(label))
+                    .on_click(cx.listener(move |v, _, w, cx| {
+                        cx.stop_propagation();
+                        if enabled {
+                            v.menu_command(id, w, cx);
+                        }
+                    }));
+                let button = if enabled && self.menu_action_hover == Some(id) {
+                    button
+                        .with_animation(
+                            SharedString::from(format!("menu-action-fade-{id}")),
+                            Animation::new(Duration::from_millis(100)),
+                            move |button, delta| {
+                                let alpha = (delta * if t.dark { 24. } else { 16. }) as u32;
+                                button.bg(rgba(if t.dark { 0xffffff00 | alpha } else { alpha }))
+                            },
+                        )
+                        .into_any_element()
+                } else {
+                    button.into_any_element()
+                };
+                actions = actions.child(button);
+            }
+            panel = panel
+                .child(div().h(ui(1.)).flex_shrink_0().my_1().bg(rgb(t.border)))
+                .child(actions);
         }
         panel.into_any_element()
     }
@@ -4861,13 +4988,25 @@ impl Explorer {
         if kind == "crumb-children" {
             return self.render_crumb_children(position, window, cx);
         }
-        let width_logical = self.menu_width(&kind, window, cx);
+        let width_logical = self.menu_width(&kind, window, cx).max(
+            if kind == "file-menu" && !navigation::is_shell_folder(&self.dir()) {
+                320.
+            } else {
+                0.
+            },
+        );
         let width = width_logical * self.zoom;
+        let compact_actions = kind == "file-menu" && !navigation::is_shell_folder(&self.dir());
         let height = self
             .menu_items(&kind, cx)
             .iter()
             .map(|i| {
-                if i.id == "-" {
+                if compact_actions
+                    && ["file-cut", "file-copy", "file-rename", "file-delete"]
+                        .contains(&i.id.as_str())
+                {
+                    0.
+                } else if i.id == "-" {
                     9.
                 } else if kind.starts_with("filter-menu:") {
                     rust_explorer::layout_metrics::COMPACT_FILE_ROW
@@ -4877,7 +5016,7 @@ impl Explorer {
             })
             .sum::<f32>()
             * self.zoom
-            + 16. * self.zoom;
+            + (16. + if compact_actions { 67. } else { 0. }) * self.zoom;
         let max_x = f32::from(window.viewport_size().width) - width - 8.;
         let max_y = f32::from(window.viewport_size().height);
         let pointer_x = f32::from(position.x);
@@ -5029,6 +5168,22 @@ impl Explorer {
         cx.notify();
     }
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
+        self.menu_action_hover = None;
+        if let Some(action) = id.strip_prefix("bandizip:") {
+            self.popup = None;
+            self.submenu = None;
+            if let Some(executable) = &self.bandizip {
+                if let Err(error) = rust_explorer::external_tools::launch_bandizip(
+                    executable,
+                    &self.paths(),
+                    action == "extract",
+                ) {
+                    self.error = Some(error.to_string());
+                }
+            }
+            cx.notify();
+            return;
+        }
         if let Some(payload) = id.strip_prefix("shell-verb:") {
             match serde_json::from_str::<shell::Request>(payload) {
                 Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
