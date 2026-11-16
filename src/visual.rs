@@ -583,36 +583,74 @@ pub fn focus_outline(color: u32) -> AnyElement {
     .inset_0()
     .into_any_element()
 }
-pub fn film_strip() -> AnyElement {
-    canvas(
-        |_, _, _| (),
-        move |bounds, _, window, _| {
-            let width = f32::from(bounds.size.width);
-            let height = f32::from(bounds.size.height);
-            let rail = (width * 0.09).clamp(4., 9.);
-            for x in [0., width - rail] {
-                window.paint_quad(fill(
-                    Bounds::new(
-                        bounds.origin + point(px(x), px(0.)),
-                        size(px(rail), px(height)),
-                    ),
-                    rgb(0x252525),
-                ));
-                for y in (3..height.max(3.) as usize).step_by(8) {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            bounds.origin + point(px(x + 1.), px(y as f32)),
-                            size(px((rail - 2.).max(2.)), px(4.)),
-                        ),
-                        rgb(0x888888),
-                    ));
-                }
+/// Compose movie adornments inside the actual image bounds. The outer square
+/// remains only a layout slot; no rail or badge may float in its empty padding.
+pub fn video_picture(
+    path: &Path,
+    color: u32,
+    logical: f32,
+    thumbnail: Arc<Image>,
+    dimensions: (u32, u32),
+) -> AnyElement {
+    let scale = ICONS.with(|v| v.borrow().pixels as f32 / 16.);
+    let frame = rust_explorer::icon_layout::video_frame(logical, dimensions.0, dimensions.1, scale);
+    let mut picture = div()
+        .relative()
+        .w(ui(frame.width))
+        .h(ui(frame.height))
+        .flex_shrink_0()
+        .rounded(ui((frame.width * 0.02).min(3.)))
+        .overflow_hidden()
+        .bg(rgb(0x454545))
+        .child(
+            img(thumbnail)
+                .w(ui(frame.width))
+                .h(ui(frame.height))
+                .object_fit(ObjectFit::Contain),
+        );
+    if frame.rail > 0. {
+        for x in [0., frame.width - frame.rail] {
+            let mut rail = div()
+                .absolute()
+                .left(ui(x))
+                .top_0()
+                .w(ui(frame.rail))
+                .h(ui(frame.height))
+                .bg(rgb(0x454545));
+            let span = (frame.count.saturating_sub(1)) as f32 * frame.pitch + frame.hole;
+            for i in 0..frame.count {
+                rail = rail.child(
+                    div()
+                        .absolute()
+                        .left(ui((frame.rail - frame.hole) / 2.))
+                        .top(ui((frame.height - span) / 2. + i as f32 * frame.pitch))
+                        .size(ui(frame.hole))
+                        .rounded(ui(frame.hole * 0.22))
+                        .bg(rgb(0xfafafa)),
+                );
             }
-        },
-    )
-    .absolute()
-    .inset_0()
-    .into_any_element()
+            picture = picture.child(rail);
+        }
+    }
+    // Keep the type overlay proportional to a small provider image as well.
+    let badge = (logical * 0.16).clamp(12., 32.).min(frame.width * 0.25);
+    div()
+        .size(ui(logical))
+        .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .child(
+            picture.child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .bottom_0()
+                    .size(ui(badge))
+                    .child(associated_app_icon(path, color, badge)),
+            ),
+        )
+        .into_any_element()
 }
 pub fn file_icon_sized(path: &Path, directory: bool, color: u32, logical: f32) -> AnyElement {
     let (image, scale) = ICONS.with(|v| {

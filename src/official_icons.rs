@@ -1,6 +1,7 @@
 //! Microsoft Fluent UI System Icons, unmodified MIT-licensed upstream assets.
 pub fn bytes(name: &str) -> Option<&'static [u8]> {
     Some(match name {
+        "open-in-new" => include_bytes!("../resources/fluent-icons/open-in-new.svg"),
         "computer-outline" => include_bytes!("../resources/fluent-icons/computer-outline.svg"),
         "computer" => include_bytes!("../resources/fluent-icons/computer.svg"),
         "computer-colored" => include_bytes!("../resources/fluent-icons/computer-colored.svg"),

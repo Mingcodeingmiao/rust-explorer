@@ -37,6 +37,7 @@ pub mod shell_folder;
 pub mod system_icons;
 pub mod theme;
 pub mod thumbnails;
+pub mod updater;
 pub mod volume_label;
 pub mod volumes;
 pub mod window_frame;

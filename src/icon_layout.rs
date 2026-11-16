@@ -51,6 +51,45 @@ pub fn thumbnail_edge(logical: f32, width: u32, height: u32, scale: f32, folder:
     (width.max(height) as f32 / scale.max(0.5)).clamp(logical / 3., logical)
 }
 
+/// Frame bounds and perforations use the displayed image, never the square slot.
+#[derive(Debug, Clone, Copy)]
+pub struct VideoFrame {
+    pub width: f32,
+    pub height: f32,
+    pub rail: f32,
+    pub hole: f32,
+    pub pitch: f32,
+    pub count: usize,
+}
+
+pub fn video_frame(logical: f32, width: u32, height: u32, scale: f32) -> VideoFrame {
+    let edge = thumbnail_edge(logical, width, height, scale, false);
+    let long = width.max(height).max(1) as f32;
+    let (w, h) = if width > 0 && height > 0 {
+        (edge * width as f32 / long, edge * height as f32 / long)
+    } else {
+        (edge, edge)
+    };
+    // Explorer leaves portrait and square frames unadorned. Scale every part
+    // together so large and jumbo views do not become narrow pixel ladders.
+    let rail = if width > height { w * 0.105 } else { 0. };
+    let hole = rail * 0.60;
+    let pitch = (w * 0.11).max(1.);
+    let count = if rail > 0. {
+        (h / pitch).floor() as usize
+    } else {
+        0
+    };
+    VideoFrame {
+        width: w,
+        height: h,
+        rail,
+        hole,
+        pitch,
+        count,
+    }
+}
+
 /// Display edge for a Shell icon bitmap that may be smaller than its slot.
 ///
 /// A 32 px `.url` icon asked for the jumbo view used to be stretched to the whole
@@ -273,5 +312,35 @@ mod tests {
         alpha[3] = 80;
         alpha[20] = 210;
         assert_eq!(transparent_folder_border(4, 4, alpha.clone()), alpha);
+    }
+}
+
+#[cfg(test)]
+mod video_tests {
+    use super::*;
+    #[test]
+    fn film_frame_follows_picture_at_all_sizes_and_dpi() {
+        for slot in [40., 64., 102., 257.] {
+            for scale in [1., 1.25, 1.75, 2.] {
+                let frame = video_frame(slot, 256, 144, scale);
+                assert!(frame.width <= slot && frame.height < frame.width);
+                assert!((frame.width / frame.height - 16. / 9.).abs() < 0.001);
+                assert_eq!(frame.count, 5);
+                assert!(frame.hole < frame.rail);
+                assert!((frame.count - 1) as f32 * frame.pitch + frame.hole <= frame.height);
+            }
+        }
+    }
+    #[test]
+    fn portrait_square_and_missing_dimensions_have_no_sprockets() {
+        for (w, h) in [(180, 320), (240, 240), (0, 0)] {
+            let frame = video_frame(257., w, h, 1.75);
+            assert_eq!(frame.rail, 0.);
+            assert_eq!(frame.count, 0);
+            assert!(frame.width <= 257. && frame.height <= 257.);
+        }
+        let small = video_frame(257., 64, 36, 1.);
+        assert_eq!(small.width, 257. / 3.);
+        assert_eq!(small.count, 5);
     }
 }

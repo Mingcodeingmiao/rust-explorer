@@ -182,6 +182,7 @@ pub struct Settings {
     pub details_pane: bool,
     pub folders_first: bool,
     pub remember_views: bool,
+    pub check_updates: bool,
     pub columns: Vec<(String, f32)>,
     pub recycle_columns: Vec<(String, f32)>,
     pub search_columns: Vec<(String, f32)>,
@@ -232,6 +233,7 @@ impl Default for Settings {
             details_pane: false,
             folders_first: true,
             remember_views: true,
+            check_updates: true,
             search_columns: vec![
                 ("name".into(), 280.),
                 ("location".into(), 320.),
@@ -268,6 +270,14 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// UI preferences should not re-enumerate a potentially slow network folder.
+    pub fn listing_requires_reload(&self, previous: &Self) -> bool {
+        self.hidden != previous.hidden
+            || self.protected != previous.protected
+            || self.folders_first != previous.folders_first
+            || self.remember_views != previous.remember_views
+            || self.view != previous.view
+    }
     fn path() -> PathBuf {
         std::env::var_os("LOCALAPPDATA")
             .map(PathBuf::from)
@@ -543,6 +553,23 @@ mod volume_column_tests {
 #[cfg(test)]
 mod navigation_preferences_tests {
     use super::Settings;
+    #[test]
+    fn menu_and_update_preferences_do_not_reload_directory_contents() {
+        let original = Settings::default();
+        let mut changed = original.clone();
+        changed.full_system_menu = true;
+        changed.check_updates = false;
+        assert!(!changed.listing_requires_reload(&original));
+        let loaded: Settings =
+            serde_json::from_slice(&serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(loaded.full_system_menu);
+        assert!(!loaded.check_updates);
+        changed.hidden = !original.hidden;
+        assert!(changed.listing_requires_reload(&original));
+        changed.hidden = original.hidden;
+        changed.protected = !original.protected;
+        assert!(changed.listing_requires_reload(&original));
+    }
     #[test]
     fn old_settings_keep_compatible_tab_defaults() {
         let settings: Settings = serde_json::from_str("{}").unwrap();

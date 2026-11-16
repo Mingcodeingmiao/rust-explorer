@@ -419,7 +419,17 @@ fn icon_key(item: &IconRequest) -> String {
 /// Stable per-item key for a thumbnail.
 fn thumbnail_index_path(key: &crate::thumbnails::Key) -> Result<PathBuf> {
     // Include the cache schema/provider revision in a stable SHA-256 key.
-    let bytes = serde_json::to_vec(&(9u32, key))?;
+    // Retire icon-as-thumbnail results for videos without invalidating photos.
+    let video = key
+        .path
+        .extension()
+        .and_then(|v| v.to_str())
+        .is_some_and(|v| {
+            ["mp4", "m4v", "webm", "mov", "mkv", "avi", "wmv"]
+                .iter()
+                .any(|ext| v.eq_ignore_ascii_case(ext))
+        });
+    let bytes = serde_json::to_vec(&(if video { 10u32 } else { 9u32 }, key))?;
     Ok(crate::thumbnail_store::directory().join(format!("{}.json", sha256_hex(&bytes))))
 }
 
@@ -696,7 +706,14 @@ pub fn serve(json: &str) -> Result<()> {
                             ),
                         "文件不支持缩略图"
                     );
-                    crate::native_preview::file_thumbnail(&resolved.path, pixels)?
+                    if matches!(
+                        extension.as_str(),
+                        "mp4" | "m4v" | "webm" | "mov" | "mkv" | "avi" | "wmv"
+                    ) {
+                        crate::native_preview::video_thumbnail(&resolved.path, pixels)?
+                    } else {
+                        crate::native_preview::file_thumbnail(&resolved.path, pixels)?
+                    }
                 };
                 // No badge is painted into the bitmap: the view draws one link
                 // arrow per tile, so baking a second one here produced two arrows.

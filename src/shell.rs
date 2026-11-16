@@ -306,6 +306,7 @@ pub fn operation_label(request: &Request) -> String {
         }
         Request::InvokeVerb { verb, .. } if verb.eq_ignore_ascii_case("format") => "打开格式化窗口",
         Request::InvokeVerb { verb, .. } => return format!("系统命令：{verb}"),
+        Request::InvokeRegistered { menu_path, .. } => return menu_path.join(" > "),
         _ => "系统操作",
     };
     name.into()
@@ -473,6 +474,11 @@ pub enum Request {
     InvokeVerb {
         paths: Vec<PathBuf>,
         verb: String,
+    },
+    InvokeRegistered {
+        paths: Vec<PathBuf>,
+        folder: PathBuf,
+        menu_path: Vec<String>,
     },
     RenameComputer {
         dark: bool,
@@ -983,7 +989,14 @@ fn on_menu_sta<T: Send + 'static>(
 }
 
 fn execute_menu_on_sta(request: Request) -> Result<String> {
-    MENU_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    MENU_ACTIVE
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .map_err(|_| anyhow::anyhow!("A system menu is already open"))?;
     struct ClearMenuActive;
     impl Drop for ClearMenuActive {
         fn drop(&mut self) {
@@ -1261,12 +1274,41 @@ fn execute_one_shot(request: Request) -> Result<String> {
 mod protocol_tests {
     use super::*;
 
+    #[test]
+    fn selected_command_keeps_its_nested_registered_path() {
+        unsafe {
+            let root = Popup(CreatePopupMenu().unwrap());
+            let child = CreatePopupMenu().unwrap();
+            AppendMenuW(child, MF_STRING, 73, PCWSTR(wide("Compress...").as_ptr())).unwrap();
+            AppendMenuW(
+                root.0,
+                MF_POPUP,
+                child.0 as usize,
+                PCWSTR(wide("Extension").as_ptr()),
+            )
+            .unwrap();
+            assert_eq!(
+                selected_menu_path(root.0, 73, 0),
+                Some(vec!["Extension".into(), "Compress...".into()])
+            );
+            assert!(selected_menu_path(root.0, 74, 0).is_none());
+        }
+    }
+
     /// 回归测试：右键菜单必须留在应用进程内（见 `execute_controlled` 的警告）。
     ///
     /// 菜单一旦变成"一次性 helper + 可取消"请求，每次右键都要新起进程并冷加载
     /// Shell 扩展，实测 ≈250 ms 起、扩展多时接近 1 秒；进程内热路径是 40–80 ms。
     #[test]
     fn context_menus_keep_an_owner_and_stay_out_of_the_one_shot_helper() {
+        assert!(
+            !is_menu_request(&Request::InvokeRegistered {
+                paths: vec![],
+                folder: PathBuf::from("C:\\"),
+                menu_path: vec!["Example".into()],
+            }),
+            "selected commands must use the cancellable operation lifecycle"
+        );
         let path = PathBuf::from("C:\\Windows\\notepad.exe");
         let folder = PathBuf::from("C:\\Windows");
         let themed = Request::ThemedMenu {
@@ -1742,6 +1784,19 @@ pub fn dispatch(request: Request) -> Result<()> {
         }
         Request::AddNetworkLocation => add_network_location(),
         Request::InvokeVerb { paths, verb } => invoke_verb(&paths, &verb),
+        Request::InvokeRegistered {
+            paths,
+            folder,
+            menu_path,
+        } => {
+            anyhow::ensure!(!menu_path.is_empty(), "Missing registered menu command");
+            REGISTERED_SELECTION.with(|pending| *pending.borrow_mut() = Some(menu_path));
+            let result = context_menu_options(
+                &paths, &folder, 0, 0, None, false, false, false, None, false, None,
+            );
+            REGISTERED_SELECTION.with(|pending| pending.borrow_mut().take());
+            result.map(|_| ())
+        }
         Request::RenameComputer { dark, name } => namespace_rename::computer(dark, name),
         Request::ComputerName => {
             println!("computer-name:{}", namespace_rename::computer_name()?);
@@ -2281,7 +2336,10 @@ pub fn clear_clipboard() {
     }
 }
 
-thread_local! {static MENU:RefCell<Option<IContextMenu>>=const{RefCell::new(None)};}
+thread_local! {
+    static MENU:RefCell<Option<IContextMenu>>=const{RefCell::new(None)};
+    static REGISTERED_SELECTION: RefCell<Option<Vec<String>>> = const {RefCell::new(None)};
+}
 unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     // Trace every window message while a menu is up: a dismissal that is not our
     // own `EndMenu` shows as an activation/focus/capture change here.
@@ -2618,6 +2676,103 @@ fn selected_menu_label(popup: HMENU, command: u32, depth: u8) -> Option<String> 
         }
     }
     None
+}
+fn selected_menu_path(popup: HMENU, command: u32, depth: u8) -> Option<Vec<String>> {
+    if depth > 5 {
+        return None;
+    }
+    unsafe {
+        for index in 0..GetMenuItemCount(Some(popup)).clamp(0, 256) {
+            let mut text = [0u16; 1024];
+            let mut item = MENUITEMINFOW {
+                cbSize: size_of::<MENUITEMINFOW>() as u32,
+                fMask: MIIM_ID | MIIM_STRING | MIIM_SUBMENU,
+                dwTypeData: windows::core::PWSTR(text.as_mut_ptr()),
+                cch: text.len() as u32,
+                ..Default::default()
+            };
+            if GetMenuItemInfoW(popup, index as u32, true, &mut item).is_err() {
+                continue;
+            }
+            if item.wID == command {
+                return Some(vec![String::from_utf16_lossy(
+                    &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+                )]);
+            }
+            if !item.hSubMenu.is_invalid() {
+                if let Some(mut path) = selected_menu_path(item.hSubMenu, command, depth + 1) {
+                    path.insert(
+                        0,
+                        String::from_utf16_lossy(
+                            &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+                        ),
+                    );
+                    return Some(path);
+                }
+            }
+        }
+    }
+    None
+}
+unsafe fn registered_command_id(menu: &IContextMenu, popup: HMENU, path: &[String]) -> Result<u32> {
+    anyhow::ensure!(
+        !path.is_empty() && path.len() <= 6,
+        "Invalid menu command path"
+    );
+    let mut found = Vec::new();
+    for index in 0..unsafe { GetMenuItemCount(Some(popup)) }.clamp(0, 256) {
+        let mut text = [0u16; 1024];
+        let mut item = MENUITEMINFOW {
+            cbSize: size_of::<MENUITEMINFOW>() as u32,
+            fMask: MIIM_ID | MIIM_STRING | MIIM_SUBMENU | MIIM_STATE,
+            dwTypeData: windows::core::PWSTR(text.as_mut_ptr()),
+            cch: text.len() as u32,
+            ..Default::default()
+        };
+        unsafe { GetMenuItemInfoW(popup, index as u32, true, &mut item) }?;
+        let label = String::from_utf16_lossy(
+            &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+        );
+        if normalized_menu_title(&label) == normalized_menu_title(&path[0]) {
+            found.push((index, item));
+        }
+    }
+    anyhow::ensure!(
+        found.len() == 1,
+        "Registered menu changed or command is ambiguous; reopen the menu"
+    );
+    let (index, item) = found.pop().unwrap();
+    anyhow::ensure!(
+        !item.fState.contains(MFS_DISABLED),
+        "Registered menu command is disabled"
+    );
+    if path.len() == 1 {
+        anyhow::ensure!(
+            item.hSubMenu.is_invalid() && (1..=0x6fff).contains(&item.wID),
+            "Invalid registered menu command"
+        );
+        return Ok(item.wID);
+    }
+    anyhow::ensure!(!item.hSubMenu.is_invalid(), "Registered submenu is missing");
+    if let Ok(extension) = menu.cast::<IContextMenu3>() {
+        unsafe {
+            extension.HandleMenuMsg2(
+                WM_INITMENUPOPUP,
+                WPARAM(item.hSubMenu.0 as usize),
+                LPARAM(index as isize),
+                None,
+            )
+        }?;
+    } else if let Ok(extension) = menu.cast::<IContextMenu2>() {
+        unsafe {
+            extension.HandleMenuMsg(
+                WM_INITMENUPOPUP,
+                WPARAM(item.hSubMenu.0 as usize),
+                LPARAM(index as isize),
+            )
+        }?;
+    }
+    unsafe { registered_command_id(menu, item.hSubMenu, &path[1..]) }
 }
 /// Shell's background Sharing submenu expects Explorer's IShellView site.
 /// Keep the system's parent label, but give its context-appropriate commands application
@@ -3243,7 +3398,9 @@ fn context_menu_options(
                 crate::i18n::wide("添加网络位置(&L)…"),
             )?;
         }
-        if !wait_for_context_gesture(hwnd, x, y) {
+        if REGISTERED_SELECTION.with(|pending| pending.borrow().is_none())
+            && !wait_for_context_gesture(hwnd, x, y)
+        {
             return Ok(output);
         }
         let _ = ShowWindow(hwnd, SW_SHOW);
@@ -3273,15 +3430,20 @@ fn context_menu_options(
             native_menu::configure_theme(hwnd, dark);
         }
         let started = std::time::Instant::now();
-        let command = TrackPopupMenuEx(
-            popup.0,
-            (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-            x,
-            y,
-            hwnd,
-            None,
-        )
-        .0;
+        let requested = REGISTERED_SELECTION.with(|pending| pending.borrow().clone());
+        let command = if let Some(path) = requested {
+            registered_command_id(&menu, popup.0, &path)?
+        } else {
+            TrackPopupMenuEx(
+                popup.0,
+                (TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+                x,
+                y,
+                hwnd,
+                None,
+            )
+            .0 as u32
+        };
         menu_trace(format!(
             "host: menu returned command {command} after {} ms (GetLastError={:?})",
             started.elapsed().as_millis(),
@@ -3445,22 +3607,25 @@ fn context_menu_options(
                 emit!("command:file-{verb}");
                 return Ok(output);
             }
-            // Verbs that open a modal dialog of their own (format, print, share,
-            // burn) block the calling thread until the dialog closes. Delegate them
-            // to a detached helper so the application never waits for them.
+            // The menu itself stays in-process with its owner. Only the selected
+            // extension command crosses into the cancellable operation lifecycle:
+            // extensions may block in InvokeCommand or keep modal windows alive.
+            if app_owner.is_some() {
+                let menu_path = selected_menu_path(popup.0, command, 0)
+                    .context("Could not identify the selected registered command")?;
+                let request = Request::InvokeRegistered {
+                    paths: paths.to_vec(),
+                    folder: folder.to_path_buf(),
+                    menu_path,
+                };
+                emit!("command:shell-verb:{}", serde_json::to_string(&request)?);
+                return Ok(output);
+            }
             let mut info = CMINVOKECOMMANDINFOEX {
                 cbSize: size_of::<CMINVOKECOMMANDINFOEX>() as u32,
-                // `SEE_MASK_NOASYNC` forces the verb to finish before InvokeCommand
-                // returns. That is required in a short-lived helper, but in-process
-                // it blocks the menu task whenever the Shell shows a modal dialog
-                // (delete, paste, format, print, share, ...). Inside the application
-                // the Shell may run the verb asynchronously, so dialogs open on their
-                // own thread and the UI stays responsive.
-                fMask: if app_owner.is_some() {
-                    SEE_MASK_UNICODE
-                } else {
-                    SEE_MASK_UNICODE | SEE_MASK_NOASYNC
-                },
+                // Owner-backed UI menus returned above. This is an operation
+                // helper/legacy caller, which must keep COM alive until completion.
+                fMask: SEE_MASK_UNICODE | SEE_MASK_NOASYNC,
                 hwnd,
                 lpVerb: PCSTR((command as usize - 1) as *const u8),
                 lpVerbW: PCWSTR((command as usize - 1) as *const u16),
