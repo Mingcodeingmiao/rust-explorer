@@ -72,6 +72,9 @@ struct DragColumn {
     id: String,
 }
 struct NameTip {
+    suppressed: std::rc::Rc<std::cell::Cell<bool>>,
+    current_generation: std::rc::Rc<std::cell::Cell<u64>>,
+    generation: u64,
     hint: rust_explorer::file_hints::FileHint,
     visible: bool,
     theme: Theme,
@@ -79,7 +82,14 @@ struct NameTip {
     tip_scale: f32,
 }
 impl NameTip {
-    fn new(entry: Entry, theme: Theme, cx: &mut Context<Self>) -> Self {
+    fn new(
+        entry: Entry,
+        theme: Theme,
+        suppressed: std::rc::Rc<std::cell::Cell<bool>>,
+        current_generation: std::rc::Rc<std::cell::Cell<u64>>,
+        generation: u64,
+        cx: &mut Context<Self>,
+    ) -> Self {
         use rust_explorer::file_hints::{FileHint, FileHintRequest, HintLine};
         let mut lines = Vec::new();
         let mut push = |label: &str, value: String| {
@@ -122,12 +132,16 @@ impl NameTip {
             cx.background_executor()
                 .timer(Duration::from_millis(500))
                 .await;
-            if view
+            if !view
                 .update(cx, |tip, cx| {
+                    if tip.suppressed.get() || tip.current_generation.get() != tip.generation {
+                        return false;
+                    }
                     tip.visible = true;
                     cx.notify();
+                    true
                 })
-                .is_err()
+                .is_ok_and(|visible| visible)
             {
                 return;
             }
@@ -145,6 +159,9 @@ impl NameTip {
         })
         .detach();
         Self {
+            suppressed,
+            current_generation,
+            generation,
             hint,
             visible: false,
             theme,
@@ -168,7 +185,11 @@ impl Render for NameTip {
         // GPUI pixels are logical: the native card needs the monitor DPI as well as
         // the user's zoom, otherwise it renders at 100% size on a scaled display.
         let scale = (f32::from(window.rem_size()) / 16.) * window.scale_factor();
-        if shell::menu_active() || !window.is_window_active() {
+        if self.suppressed.get()
+            || self.current_generation.get() != self.generation
+            || shell::menu_active()
+            || !window.is_window_active()
+        {
             // The card belongs to this window: a native menu, deactivation or another
             // application taking the foreground must hide it rather than leave it on
             // screen.
@@ -499,7 +520,8 @@ fn menu_icon(id: &str) -> Option<&'static str> {
         match id {
             "new-folder" => "folder",
             "new-shortcut" => "shortcut",
-            "zip" => "zip",
+            "zip" | "archive-tar" | "archive-7z" | "submenu:compress-menu" => "zip",
+            "file-tab" | "file-window" => "open-in-new",
             "file-cut" => "cut",
             "file-copy" => "copy",
             "file-paste" => "paste",
@@ -508,7 +530,7 @@ fn menu_icon(id: &str) -> Option<&'static str> {
             "file-share" => "share",
             "submenu:view-menu" => "view",
             "submenu:sort-menu" => "sort",
-            "pin" | "nav-pin" | "nav-unpin" => "pin",
+            "pin" | "pin-start" | "nav-pin" | "nav-unpin" => "pin",
             "copy-path" | "nav-copy-path" => "copy-path",
             "select-all" => "select-all",
             "select-none" => "select-none",
@@ -525,6 +547,85 @@ fn menu_icon(id: &str) -> Option<&'static str> {
 }
 
 impl Explorer {
+    pub(super) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+        if self.update_task.is_some() {
+            return;
+        }
+        self.update_status = rust_explorer::i18n::text("正在检查更新…").into();
+        let control = rust_explorer::updater::Control::default();
+        self.update_control = Some(control.clone());
+        self.update_downloading = false;
+        self.update_progress = None;
+        let (send, receive) = std::sync::mpsc::channel();
+        self.update_task = Some(receive);
+        let worker = std::thread::Builder::new()
+            .name("release-check".into())
+            .spawn(move || {
+                let result =
+                    std::panic::catch_unwind(|| rust_explorer::updater::check_with(&control))
+                        .map_err(|_| {
+                            rust_explorer::i18n::text("更新任务已结束，请重试").to_string()
+                        })
+                        .and_then(|result| {
+                            result
+                                .map(UpdateResult::Checked)
+                                .map_err(|error| rust_explorer::updater::error_message(&error))
+                        });
+                let _ = send.send(result);
+            });
+        if worker.is_err() {
+            self.cancel_update(cx);
+            self.update_status = rust_explorer::i18n::text("更新任务已结束，请重试").into();
+        }
+        cx.notify();
+    }
+
+    fn download_update(&mut self, cx: &mut Context<Self>) {
+        if self.update_task.is_some() {
+            return;
+        }
+        let Some(update) = self.update_available.clone() else {
+            return;
+        };
+        self.update_status = rust_explorer::i18n::text("正在下载更新…").into();
+        let control = rust_explorer::updater::Control::default();
+        self.update_control = Some(control.clone());
+        self.update_downloading = true;
+        self.update_progress = None;
+        let (send, receive) = std::sync::mpsc::channel();
+        self.update_task = Some(receive);
+        let worker = std::thread::Builder::new()
+            .name("release-download".into())
+            .spawn(move || {
+                let result = std::panic::catch_unwind(|| {
+                    rust_explorer::updater::download_with(&update, &control)
+                })
+                .map_err(|_| rust_explorer::i18n::text("更新任务已结束，请重试").to_string())
+                .and_then(|result| {
+                    result
+                        .map(UpdateResult::Downloaded)
+                        .map_err(|error| rust_explorer::updater::error_message(&error))
+                });
+                let _ = send.send(result);
+            });
+        if worker.is_err() {
+            self.cancel_update(cx);
+            self.update_status = rust_explorer::i18n::text("更新任务已结束，请重试").into();
+        }
+        cx.notify();
+    }
+
+    fn cancel_update(&mut self, cx: &mut Context<Self>) {
+        if let Some(control) = self.update_control.take() {
+            control.cancel();
+        }
+        // Detach the old receiver: a late result must not overwrite a newer check.
+        self.update_task = None;
+        self.update_downloading = false;
+        self.update_progress = None;
+        self.update_status = rust_explorer::i18n::text("已取消更新操作").into();
+        cx.notify();
+    }
     fn change_quick_access(&mut self, paths: Vec<PathBuf>, pinned: bool, cx: &mut Context<Self>) {
         if paths.is_empty() || self.busy {
             return;
@@ -3337,10 +3438,25 @@ impl Explorer {
                 v.selected.contains(&index),
             )
         };
+        let tip_suppressed = self.tooltip_suppressed.clone();
+        let tip_generation = self.tooltip_generation.clone();
+        let generation = self.generation;
         let mut row = div()
             .id(("file", index))
             .when(!dragging_files, |d| {
-                d.tooltip(move |_, cx| cx.new(|cx| NameTip::new(hint_entry.clone(), t, cx)).into())
+                d.tooltip(move |_, cx| {
+                    cx.new(|cx| {
+                        NameTip::new(
+                            hint_entry.clone(),
+                            t,
+                            tip_suppressed.clone(),
+                            tip_generation.clone(),
+                            generation,
+                            cx,
+                        )
+                    })
+                    .into()
+                })
             })
             .w(ui(item_width))
             .min_w_0()
@@ -3594,11 +3710,16 @@ impl Explorer {
                 .and_then(|key| self.thumbnails.presentation(key))
                 .unwrap_or_default();
             let has_thumbnail = thumbnail.is_some();
-            let picture = div()
-                .relative()
-                .size(ui(self.view.icon_size()))
-                .flex_shrink_0()
-                .child(visual::thumbnail_or_icon(
+            let image = if let Some(image) = thumbnail.clone().filter(|_| presentation.video) {
+                visual::video_picture(
+                    &entry.path,
+                    t.text,
+                    self.view.icon_size(),
+                    image,
+                    (presentation.width, presentation.height),
+                )
+            } else {
+                visual::thumbnail_or_icon(
                     &entry.path,
                     entry.directory,
                     t.muted,
@@ -3608,17 +3729,13 @@ impl Explorer {
                     entry.directory || presentation.directory,
                     &self.thumbnail_images,
                     cx,
-                ))
-                .when(has_thumbnail && presentation.video, |d| {
-                    d.child(visual::film_strip()).child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .bottom_0()
-                            .size(ui(20.))
-                            .child(visual::associated_app_icon(&entry.path, t.text, 20.)),
-                    )
-                })
+                )
+            };
+            let picture = div()
+                .relative()
+                .size(ui(self.view.icon_size()))
+                .flex_shrink_0()
+                .child(image)
                 .when(
                     rust_explorer::layout_metrics::needs_link_badge(
                         entry.link,
@@ -4014,6 +4131,7 @@ struct MenuItem {
     label: String,
     checked: bool,
     enabled: bool,
+    shortcut: Option<&'static str>,
 }
 impl MenuItem {
     fn new(id: impl Into<String>, label: impl Into<String>) -> Self {
@@ -4022,10 +4140,15 @@ impl MenuItem {
             label: label.into(),
             checked: false,
             enabled: true,
+            shortcut: None,
         }
     }
     fn check(mut self, value: bool) -> Self {
         self.checked = value;
+        self
+    }
+    fn shortcut(mut self, value: &'static str) -> Self {
+        self.shortcut = Some(value);
         self
     }
     fn enable(mut self, value: bool) -> Self {
@@ -4191,9 +4314,17 @@ impl Explorer {
                     ),
                     MenuItem::new("file-delete", rust_explorer::i18n::text("删除"))
                         .enable(!navigation::is_app_virtual(&self.dir())),
-                    MenuItem::new("copy-path", rust_explorer::i18n::text("复制路径")),
                     MenuItem::new("pin", rust_explorer::i18n::text("固定到快速访问"))
                         .enable(folder && !navigation::is_virtual(&self.dir())),
+                    MenuItem::new("pin-start", rust_explorer::i18n::text("固定到“开始”"))
+                        .enable(folder && !navigation::is_virtual(&self.dir())),
+                    MenuItem::new(
+                        "submenu:compress-menu",
+                        rust_explorer::i18n::text("压缩到…"),
+                    )
+                    .enable(!navigation::is_virtual(&self.dir())),
+                    MenuItem::new("copy-path", rust_explorer::i18n::text("复制文件地址"))
+                        .shortcut("Ctrl+Shift+C"),
                     MenuItem::new(
                         "submenu:access-menu",
                         rust_explorer::i18n::text("授予访问权限                 ›"),
@@ -4213,12 +4344,18 @@ impl Explorer {
                                 | "file-window"
                                 | "file-explorer"
                                 | "pin"
+                                | "pin-start"
                                 | "submenu:access-menu"
                         )
                     });
                 }
                 items
             }
+            "compress-menu" => vec![
+                MenuItem::new("zip", rust_explorer::i18n::text("ZIP 文件")),
+                MenuItem::new("archive-7z", rust_explorer::i18n::text("7z 文件")),
+                MenuItem::new("archive-tar", rust_explorer::i18n::text("TAR 文件")),
+            ],
             "access-menu" => {
                 let path = self
                     .selected
@@ -4616,6 +4753,10 @@ impl Explorer {
                     0.
                 } else {
                     measure(item.label.trim_end_matches('›').trim())
+                        + item
+                            .shortcut
+                            .map(|shortcut| measure(shortcut) + 20.)
+                            .unwrap_or(0.)
                 }
             })
             .fold(0.0_f32, f32::max);
@@ -4715,7 +4856,21 @@ impl Explorer {
                             .text_color(rgb(t.accent))
                             .when(item.checked, |d| d.child(visual::icon("check", t.accent))),
                     )
-                    .when_some(icon, |d, icon| d.child(visual::icon(icon, t.text)))
+                    .when_some(icon, |d, icon| {
+                        if icon == "pin" {
+                            // Menu pins use the official outline SVG; the sidebar
+                            // keeps its system resource and independent icon size.
+                            d.child(
+                                svg()
+                                    .path("fluent/pin.svg")
+                                    .size(ui(16.))
+                                    .flex_shrink_0()
+                                    .text_color(rgb(t.accent)),
+                            )
+                        } else {
+                            d.child(visual::icon_sized(icon, t.text, 16.))
+                        }
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -4727,6 +4882,15 @@ impl Explorer {
                     )
                     .when(id.starts_with("submenu:"), |d| {
                         d.child(visual::icon("chevron-right", t.muted))
+                    })
+                    .when_some(item.shortcut, |d, shortcut| {
+                        d.child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(ui(12.))
+                                .text_color(rgb(t.muted))
+                                .child(shortcut),
+                        )
                     })
                     .on_mouse_move(cx.listener(move |v, _, _, cx| {
                         if level <= 1 {
@@ -5147,7 +5311,10 @@ impl Explorer {
         self.menu_action_hover = None;
         if let Some(payload) = id.strip_prefix("shell-verb:") {
             match serde_json::from_str::<shell::Request>(payload) {
-                Ok(request @ shell::Request::InvokeVerb { .. }) => self.run_shell(request, cx),
+                Ok(
+                    request @ (shell::Request::InvokeVerb { .. }
+                    | shell::Request::InvokeRegistered { .. }),
+                ) => self.run_shell(request, cx),
                 _ => self.error = Some(rust_explorer::i18n::text("无效的系统菜单操作").into()),
             }
             cx.notify();
@@ -5566,7 +5733,19 @@ impl Explorer {
             }
             "nav-system-menu" => {
                 if let Some(path) = self.context_target.clone() {
-                    if !navigation::is_virtual(&path) {
+                    if volumes::is_computer(&path) {
+                        let (x, y) = shell::cursor();
+                        self.run_shell(
+                            shell::Request::ComputerMenu {
+                                x,
+                                y,
+                                dark: self.theme.dark,
+                                expanded: self.tree_is_open(&path),
+                                owner: shell::active_window_owner(),
+                            },
+                            cx,
+                        );
+                    } else if !navigation::is_virtual(&path) {
                         let (x, y) = shell::cursor();
                         let quick_access_pinned = self
                             .system_quick_access
@@ -5721,6 +5900,18 @@ impl Explorer {
             "pin" => {
                 self.change_quick_access(self.paths(), true, cx);
             }
+            "pin-start" => {
+                let paths = self.paths();
+                if paths.len() == 1 {
+                    self.run_shell(
+                        shell::Request::InvokeVerb {
+                            paths,
+                            verb: "pintostartscreen".into(),
+                        },
+                        cx,
+                    );
+                }
+            }
             "options" => {
                 self.options = Some(self.settings.clone());
                 self.options_page = 0;
@@ -5738,42 +5929,67 @@ impl Explorer {
                 let _ = open_explorer(Some(tab), cx);
             }
             "detach-tab" => self.detach_tab(self.tabs[self.active].id, cx),
-            "zip" => self.compress_selection(cx),
+            "zip" => self.compress_selection("zip", cx),
+            "archive-7z" => self.compress_selection("7z", cx),
+            "archive-tar" => self.compress_selection("tar", cx),
             _ => {}
         }
         self.invalidate_list();
         self.save_settings(cx);
         cx.notify();
     }
-    fn compress_selection(&mut self, cx: &mut Context<Self>) {
+    fn compress_selection(&mut self, extension: &'static str, cx: &mut Context<Self>) {
         let paths = self.paths();
         if paths.is_empty() || self.busy {
             return;
         }
         let folder = self.dir();
+        let single_directory = self.selected.len() == 1
+            && self
+                .selected
+                .first()
+                .and_then(|i| self.entries.get(*i))
+                .is_some_and(|entry| entry.directory);
         self.busy = true;
-        self.status = rust_explorer::i18n::text("正在压缩 ZIP…").into();
+        self.status = rust_explorer::i18n::text("正在压缩…").into();
         let task = cx.background_executor().spawn(async move {
             (move || -> anyhow::Result<PathBuf> {
                 let stem = if paths.len() == 1 {
-                    paths[0]
-                        .file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
+                    (if single_directory {
+                        paths[0].file_name()
+                    } else {
+                        paths[0].file_stem()
+                    })
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
                 } else {
                     rust_explorer::i18n::text("存档").into()
                 };
-                let archive = (0..10000)
-                    .map(|i| {
-                        folder.join(if i == 0 {
-                            format!("{stem}.zip")
-                        } else {
-                            format!("{stem} ({i}).zip")
-                        })
-                    })
-                    .find(|p| !p.exists())
-                    .ok_or_else(|| anyhow::anyhow!("无法生成存档名称"))?;
+                // Reserve the output atomically so two windows cannot overwrite
+                // each other's archive after both observed a free name.
+                let mut archive = None;
+                for i in 0..10000 {
+                    let path = folder.join(if i == 0 {
+                        format!("{stem}.{extension}")
+                    } else {
+                        format!("{stem} ({i}).{extension}")
+                    });
+                    match std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&path)
+                    {
+                        Ok(file) => {
+                            drop(file);
+                            archive = Some(path);
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                let archive = archive.ok_or_else(|| anyhow::anyhow!("无法生成存档名称"))?;
                 let system = std::env::var_os("WINDIR")
                     .map(PathBuf::from)
                     .unwrap_or_else(|| PathBuf::from("C:\\Windows"));
@@ -5785,8 +6001,15 @@ impl Explorer {
                     }
                 }
                 use std::os::windows::process::CommandExt;
-                let output = cmd.creation_flags(0x08000000).output()?;
+                let output = match cmd.creation_flags(0x08000000).output() {
+                    Ok(output) => output,
+                    Err(error) => {
+                        let _ = std::fs::remove_file(&archive);
+                        return Err(error.into());
+                    }
+                };
                 if !output.status.success() {
+                    let _ = std::fs::remove_file(&archive);
                     anyhow::bail!("压缩失败：{}", String::from_utf8_lossy(&output.stderr));
                 }
                 Ok(archive)
@@ -5818,18 +6041,38 @@ impl Explorer {
                 cx.global_mut::<SavedFolderViews>().0.clear();
             }
             let remember_changed = settings.remember_views != self.settings.remember_views;
+            let reload_listing = reset || settings.listing_requires_reload(&self.settings);
+            let warm_menu = settings.full_system_menu && !self.settings.full_system_menu;
+            let preview_changed = settings.preview != self.settings.preview;
+            let tree_changed = settings.hidden != self.settings.hidden
+                || settings.protected != self.settings.protected
+                || settings.show_all_folders != self.settings.show_all_folders;
             self.settings = settings;
+            if warm_menu {
+                shell::prewarm_in_process_menu();
+            }
             rust_explorer::i18n::set_language(&self.settings.language);
             self.language_menu_open = false;
             self.theme = Theme::preference(&self.settings.theme);
-            self.tree_children.clear();
+            if tree_changed {
+                self.tree_children.clear();
+            }
             self.hidden = self.settings.hidden;
             self.preview_open = self.settings.preview;
             if (reset || remember_changed) && self.tabs[self.active].query.trim().is_empty() {
                 self.apply_listing_defaults(&self.dir(), cx);
             }
             self.save_settings(cx);
-            self.reload(cx);
+            if reload_listing {
+                self.reload(cx);
+            } else {
+                self.rebuild_rows();
+                self.prefetch_entry_icons();
+                self.sync_thumbnails();
+                if preview_changed {
+                    self.load_preview(cx);
+                }
+            }
             if close {
                 self.options = None;
             }
@@ -6044,6 +6287,108 @@ impl Explorer {
                 "当前软件版本：{}",
                 env!("CARGO_PKG_VERSION")
             )));
+            let checking = self.update_task.is_some();
+            let mut updates = div()
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .child(
+                    button(
+                        "automatic-updates",
+                        rust_explorer::i18n::text("自动检查更新"),
+                        t,
+                    )
+                    .when(settings.check_updates, |b| b.bg(rgb(t.selection)))
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        if let Some(settings) = &mut v.options {
+                            settings.check_updates = !settings.check_updates;
+                        }
+                        cx.notify();
+                    })),
+                )
+                .child(
+                    button("check-updates", rust_explorer::i18n::text("检查更新"), t)
+                        .when(checking, |b| b.opacity(0.5))
+                        .on_click(cx.listener(|v, _, _, cx| v.check_for_updates(cx))),
+                );
+            // Keep Cancel in the same position when a request completes, so a
+            // late click cannot accidentally activate a newly shifted button.
+            updates = updates.child(
+                button("cancel-update", rust_explorer::i18n::text("取消"), t)
+                    .when(!checking, |b| b.opacity(0.4))
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        if v.update_task.is_some() {
+                            v.cancel_update(cx);
+                        }
+                    })),
+            );
+            updates = updates.child(
+                button(
+                    "update-release-page",
+                    rust_explorer::i18n::text("发行页面"),
+                    t,
+                )
+                .on_click(cx.listener(|_, _, _, cx| {
+                    cx.open_url("https://github.com/Mingcodeingmiao/rust-explorer/releases/latest")
+                })),
+            );
+            if self.update_available.is_some() && self.update_file.is_none() {
+                updates = updates.child(
+                    button("download-update", rust_explorer::i18n::text("下载更新"), t)
+                        .when(checking, |b| b.opacity(0.5))
+                        .on_click(cx.listener(|v, _, _, cx| v.download_update(cx))),
+                );
+            }
+            if self.update_file.is_some() {
+                updates = updates.child(
+                    button(
+                        "open-update-download",
+                        rust_explorer::i18n::text("打开下载目录"),
+                        t,
+                    )
+                    .on_click(cx.listener(move |v, _, _, cx| {
+                        if let Some(path) = &v.update_file {
+                            let target = path.parent().unwrap_or(path).to_path_buf();
+                            v.run_shell(shell::Request::Open { path: target }, cx);
+                        }
+                    })),
+                );
+            }
+            body = body.child(updates);
+            if !self.update_status.is_empty() {
+                body = body.child(div().w_full().min_w_0().child(self.update_status.clone()));
+            }
+            if self.update_downloading {
+                if let Some((received, total)) = self.update_progress {
+                    let label = if let Some(total) = total {
+                        format!(
+                            "{} / {}  ({}%)",
+                            fs::size_label(received),
+                            fs::size_label(total),
+                            received
+                                .saturating_mul(100)
+                                .checked_div(total)
+                                .unwrap_or(0)
+                                .min(100)
+                        )
+                    } else {
+                        fs::size_label(received)
+                    };
+                    body = body.child(div().child(label));
+                }
+            }
+            if let Some(time) = &self.update_checked_at {
+                body = body.child(div().text_color(rgb(t.muted)).child(format!(
+                    "{}: {time}",
+                    rust_explorer::i18n::text("上次成功检查")
+                )));
+            }
+            body = body.child(div().w_full().min_w_0().text_color(rgb(t.muted)).child(
+                rust_explorer::i18n::text("自动检查仅检查版本；下载后请手动解压更新"),
+            ));
+            if let Some(update) = &self.update_available {
+                body = body.child(div().child(format!("v{}", update.version)));
+            }
         }
         if self.options_page == 0 {
             let mut startup = div()

@@ -2,6 +2,7 @@
   "commit": "a347af95478f989038cccbf085978865264c048a",
   "repository": "https://github.com/microsoft/fluentui-system-icons",
   "assets": {
+    "open-in-new": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/a347af95478f989038cccbf085978865264c048a/assets/Open/SVG/ic_fluent_open_20_regular.svg",
     "computer-outline": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/a347af95478f989038cccbf085978865264c048a/assets/Desktop/SVG/ic_fluent_desktop_20_regular.svg",
     "computer": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/a347af95478f989038cccbf085978865264c048a/assets/Desktop/SVG/ic_fluent_desktop_20_regular.svg",
     "computer-colored": "https://raw.githubusercontent.com/microsoft/fluentui-system-icons/a347af95478f989038cccbf085978865264c048a/assets/Desktop/SVG/ic_fluent_desktop_20_regular.svg",

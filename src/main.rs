@@ -9,6 +9,10 @@ fn main() {
         let _ = std::thread::spawn(rust_explorer::native_assets::cleanup_legacy_disk_cache);
     }
     let result = match args.get(1).map(String::as_str) {
+        Some("--check-updates") => rust_explorer::updater::check().and_then(|update| {
+            println!("{}", serde_json::to_string_pretty(&update)?);
+            Ok(())
+        }),
         Some("--open-folder") => args
             .get(2)
             .context("缺少文件夹路径")

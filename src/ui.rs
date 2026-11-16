@@ -47,6 +47,7 @@ actions!(
         Search,
         Open,
         Copy,
+        CopyPath,
         Cut,
         Paste,
         Undo,
@@ -234,7 +235,23 @@ struct CrumbRow {
     glyph: Option<&'static str>,
 }
 
+enum UpdateResult {
+    Checked(Option<rust_explorer::updater::Available>),
+    Downloaded(PathBuf),
+}
+static AUTO_UPDATE_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
+
 struct Explorer {
+    tooltip_suppressed: std::rc::Rc<std::cell::Cell<bool>>,
+    tooltip_generation: std::rc::Rc<std::cell::Cell<u64>>,
+    update_task: Option<mpsc::Receiver<Result<UpdateResult, String>>>,
+    update_control: Option<rust_explorer::updater::Control>,
+    update_downloading: bool,
+    update_progress: Option<(u64, Option<u64>)>,
+    update_checked_at: Option<String>,
+    update_available: Option<rust_explorer::updater::Available>,
+    update_file: Option<PathBuf>,
+    update_status: String,
     marquee: Option<Marquee>,
     settings: Settings,
     options: Option<Settings>,
@@ -432,6 +449,9 @@ struct Explorer {
 }
 impl Drop for Explorer {
     fn drop(&mut self) {
+        if let Some(control) = &self.update_control {
+            control.cancel();
+        }
         self.usage_cancel.store(true, Ordering::Relaxed);
         self.cancel.store(true, Ordering::Relaxed);
         self.preview_cancel.store(true, Ordering::Relaxed);
@@ -897,7 +917,17 @@ impl Explorer {
             "new window initial={:?} remember={} -> view={:?}",
             initial, settings.remember_views, view
         ));
-        let this = Self {
+        let mut this = Self {
+            tooltip_suppressed: std::rc::Rc::new(std::cell::Cell::new(false)),
+            tooltip_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
+            update_task: None,
+            update_control: None,
+            update_downloading: false,
+            update_progress: None,
+            update_checked_at: None,
+            update_available: None,
+            update_file: None,
+            update_status: String::new(),
             marquee: None,
             view,
             options: None,
@@ -1091,6 +1121,9 @@ impl Explorer {
             let _ = weak.update(cx, |_, cx| cx.notify());
         });
         window.focus(&this.focus);
+        if this.settings.check_updates && !AUTO_UPDATE_CHECK_STARTED.swap(true, Ordering::Relaxed) {
+            this.check_for_updates(cx);
+        }
         let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
             loop {
@@ -1099,6 +1132,60 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
+                        if this.update_downloading {
+                            let progress = this
+                                .update_control
+                                .as_ref()
+                                .map(|control| control.progress());
+                            if progress != this.update_progress {
+                                this.update_progress = progress;
+                                cx.notify();
+                            }
+                        }
+                        let update_result =
+                            this.update_task
+                                .as_ref()
+                                .and_then(|task| match task.try_recv() {
+                                    Ok(result) => Some(result),
+                                    Err(mpsc::TryRecvError::Empty) => None,
+                                    Err(mpsc::TryRecvError::Disconnected) => Some(Err(
+                                        rust_explorer::i18n::text("更新任务已结束，请重试").into(),
+                                    )),
+                                });
+                        if let Some(result) = update_result {
+                            this.update_task = None;
+                            this.update_control = None;
+                            this.update_downloading = false;
+                            this.update_progress = None;
+                            match result {
+                                Ok(UpdateResult::Checked(available)) => {
+                                    this.update_checked_at = Some(
+                                        chrono::Local::now()
+                                            .format("%Y-%m-%d %H:%M:%S")
+                                            .to_string(),
+                                    );
+                                    this.update_status = if available.is_some() {
+                                        rust_explorer::i18n::text("发现新版本").into()
+                                    } else {
+                                        rust_explorer::i18n::text("当前已是最新版本").into()
+                                    };
+                                    if this.update_available.as_ref().map(|u| &u.filename)
+                                        != available.as_ref().map(|u| &u.filename)
+                                    {
+                                        this.update_file = None;
+                                    }
+                                    this.update_available = available;
+                                }
+                                Ok(UpdateResult::Downloaded(path)) => {
+                                    this.update_file = Some(path);
+                                    this.update_status =
+                                        rust_explorer::i18n::text("下载完成，SHA-256 校验通过")
+                                            .into();
+                                }
+                                Err(error) => this.update_status = error,
+                            }
+                            cx.notify();
+                        }
                         let finished = this
                             .native_drop
                             .as_ref()
@@ -1212,6 +1299,13 @@ impl Explorer {
                         if this.watch_pending
                             && this.dialog.is_none()
                             && this.options.is_none()
+                            // A directory notification must not dismiss a menu,
+                            // reset a rename editor or replace rows during a drag.
+                            && this.popup.is_none()
+                            && this.inline_rename.is_none()
+                            && this.file_drag.is_none()
+                            && this.right_file_drag.is_none()
+                            && this.marquee.is_none()
                             && !this.loading
                             && !this.busy
                             && this.tabs[this.active].query.is_empty()
@@ -1521,6 +1615,7 @@ impl Explorer {
         }
     }
     fn reload(&mut self, cx: &mut Context<Self>) {
+        rust_explorer::file_tip::hide_current();
         let tab_id = self.tabs[self.active].id;
         let options = (
             self.hidden,
@@ -1581,6 +1676,7 @@ impl Explorer {
         let cancel = self.cancel.clone();
         let reveal = self.external_reveal.clone();
         self.generation += 1;
+        self.tooltip_generation.set(self.generation);
         let generation = self.generation;
         let path = self.dir();
         if !navigation::is_shell_folder(&path) {
@@ -2360,6 +2456,7 @@ impl Explorer {
                 | shell::Request::SharingAccess { .. }
                 | shell::Request::AdvancedShare { .. }
                 | shell::Request::InvokeVerb { .. }
+                | shell::Request::InvokeRegistered { .. }
         );
         // File operations run in their own killable helper and may overlap; the
         // exclusive `busy` flag is for menus, dialogs and other interactive work.
@@ -2702,7 +2799,7 @@ impl Explorer {
     }
     fn menu(&mut self, cx: &mut Context<Self>) {
         self.menu_action_hover = None;
-        if self.busy {
+        if self.system_menu_active || shell::menu_active() {
             return;
         }
         self.context_origin = RenameSite::List;
@@ -2734,20 +2831,10 @@ impl Explorer {
             cx.notify();
             return;
         }
-        if self
-            .paths()
-            .iter()
-            .any(|path| volume_label::is_drive_root(path))
-        {
-            self.system_menu(cx);
-            return;
-        }
-        // Let the Shell query registered handlers for this exact selection.
-        // Do not substitute a hand-maintained list of third-party applications.
-        if !navigation::is_virtual(&self.dir())
-            || (self.settings.full_system_menu
-                && !(navigation::is_virtual(&self.dir()) && self.selected.is_empty()))
-        {
+        // Respect the user's choice in ordinary folders as well as This PC.
+        // The app menu keeps an explicit full-Shell-menu entry; when requested,
+        // that path still queries registered extensions without vendor adapters.
+        if self.settings.full_system_menu {
             self.system_menu(cx);
             return;
         }
@@ -4170,6 +4257,9 @@ fn operation_details(request: &shell::Request) -> String {
         shell::Request::PropertiesMany { paths } | shell::Request::Share { paths } => {
             summary(paths)
         }
+        shell::Request::InvokeRegistered {
+            paths, menu_path, ..
+        } => format!("{} | {}", menu_path.join(" > "), summary(paths)),
         shell::Request::InvokeVerb { paths, verb } => {
             format!("{verb} · {}", summary(paths))
         }
@@ -4196,6 +4286,13 @@ fn operation_details(request: &shell::Request) -> String {
 
 impl Render for Explorer {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.tooltip_suppressed.set(
+            self.popup.is_some()
+                || self.options.is_some()
+                || self.dialog.is_some()
+                || self.file_drag.is_some()
+                || self.system_menu_active,
+        );
         self.install_native_drop(window);
         self.file_drop_bounds.borrow_mut().clear();
         window.set_rem_size(px(16. * self.zoom));
@@ -4599,6 +4696,16 @@ impl Render for Explorer {
             .on_action(cx.listener(|v, _: &Copy, _, cx| {
                 if v.options.is_none() && (v.dialog.is_none() || v.inline_rename.is_some()) {
                     v.copy(false, cx);
+                }
+            }))
+            .on_action(cx.listener(|v, _: &CopyPath, w, cx| {
+                if v.options.is_none()
+                    && v.dialog.is_none()
+                    && !v.editing_address
+                    && v.focus.is_focused(w)
+                    && !v.selected.is_empty()
+                {
+                    v.menu_command("copy-path", w, cx);
                 }
             }))
             .on_action(cx.listener(|v, _: &Cut, _, cx| {
@@ -5571,14 +5678,18 @@ impl Render for Explorer {
                     .min_h_0()
                     .flex()
                     .flex_col()
-                    .on_mouse_down(
+                    .on_mouse_up(
                         MouseButton::Right,
-                        cx.listener(|v, e: &MouseDownEvent, w, cx| {
+                        cx.listener(|v, e: &MouseUpEvent, w, cx| {
                             cx.stop_propagation();
                             v.selected.clear();
                             v.clear_preview();
                             w.focus(&v.focus);
-                            v.menu(cx);
+                            if e.modifiers.shift {
+                                v.system_menu(cx);
+                            } else {
+                                v.menu(cx);
+                            }
                             if let Some((_, p)) = &mut v.popup {
                                 *p = e.position;
                             }
@@ -6322,10 +6433,11 @@ impl Render for Explorer {
 
 pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
     rust_explorer::fluent_icons::initialize();
-    // Menus are built in-process, so the first right-click pays the cold load of
-    // every registered Shell extension. Warm that path in the background while the
-    // window is still opening instead of on the first click.
-    rust_explorer::shell::prewarm_in_process_menu();
+    // App-menu users should not pay for loading third-party Shell extensions at
+    // startup. Explicit full menus retain the same owner-backed STA path.
+    if Settings::load().full_system_menu {
+        rust_explorer::shell::prewarm_in_process_menu();
+    }
     Application::new()
         .with_assets(rust_explorer::fluent_icons::Assets)
         .run(move |cx: &mut App| {
@@ -6347,6 +6459,7 @@ pub fn run(launch: Option<rust_explorer::launch_request::LaunchRequest>) {
                 KeyBinding::new("shift-enter", Open, Some("Explorer")),
                 KeyBinding::new("ctrl-shift-enter", Open, Some("Explorer")),
                 KeyBinding::new("ctrl-c", Copy, Some("Explorer")),
+                KeyBinding::new("ctrl-shift-c", CopyPath, Some("Explorer")),
                 KeyBinding::new("ctrl-x", Cut, Some("Explorer")),
                 KeyBinding::new("ctrl-v", Paste, Some("Explorer")),
                 KeyBinding::new("ctrl-z", Undo, Some("Explorer")),

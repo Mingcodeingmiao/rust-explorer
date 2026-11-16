@@ -120,7 +120,7 @@ fn pixel_len(width: u32, height: u32) -> Result<usize> {
 /// Uses Explorer's thumbnail cache first, then the registered thumbnail provider.
 /// A missing/unsupported codec returns an error and should hide video preview.
 pub fn video_thumbnail(path: &Path, size: u32) -> Result<Bitmap> {
-    file_thumbnail(path, size)
+    shell_thumbnail(path, size, false, false)
 }
 
 /// Resolve a shortcut without launching it, searching for missing targets or
@@ -250,22 +250,22 @@ mod shortcut_tests {
 
 /// Genuine Explorer thumbnail for photos, videos or other registered providers.
 pub fn file_thumbnail(path: &Path, size: u32) -> Result<Bitmap> {
-    shell_thumbnail(path, size, false)
+    shell_thumbnail(path, size, false, true)
 }
 
 /// Folder compositions need the alpha that an ordinary opaque video frame does not.
 pub fn folder_thumbnail(path: &Path, size: u32) -> Result<Bitmap> {
-    shell_thumbnail(path, size, true)
+    shell_thumbnail(path, size, true, true)
 }
 
-fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Result<Bitmap> {
+fn shell_thumbnail(path: &Path, size: u32, folder_alpha: bool, allow_icon: bool) -> Result<Bitmap> {
     let _com = Com::new()?;
     use std::os::windows::ffi::OsStrExt;
     let path: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
     let factory: IShellItemImageFactory =
         unsafe { SHCreateItemFromParsingName(PCWSTR(path.as_ptr()), None) }
             .context("创建 Windows 缩略图提供程序")?;
-    factory_bitmap(&factory, size, folder_alpha)
+    factory_bitmap(&factory, size, folder_alpha, allow_icon)
 }
 
 /// Thumbnail for a Shell namespace item that has no filesystem path (portable
@@ -276,13 +276,14 @@ pub fn shell_item_thumbnail(path: &Path, size: u32, folder_alpha: bool) -> Resul
     use windows::core::Interface;
     let item = crate::shell_folder::item(path)?;
     let factory: IShellItemImageFactory = item.cast().context("此位置不提供 Windows 缩略图")?;
-    factory_bitmap(&factory, size, folder_alpha)
+    factory_bitmap(&factory, size, folder_alpha, true)
 }
 
 fn factory_bitmap(
     factory: &IShellItemImageFactory,
     size: u32,
     folder_alpha: bool,
+    allow_icon: bool,
 ) -> Result<Bitmap> {
     let extent = size.clamp(32, 2048) as i32;
     let bounds = SIZE {
@@ -306,6 +307,7 @@ fn factory_bitmap(
             .or_else(|_| factory.GetImage(bounds, flags))
     } {
         Ok(bitmap) => bitmap_pixels(OwnedBitmap(bitmap).0, folder_alpha),
+        Err(error) if !allow_icon => Err(error).context("系统未提供视频缩略图"),
         Err(_) => {
             let icon = unsafe {
                 factory.GetImage(

@@ -122,14 +122,17 @@ impl Explorer {
         position: Point<Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if self.busy {
+        if self.system_menu_active || shell::menu_active() {
             return;
         }
+        rust_explorer::file_tip::hide_current();
+        self.menu_action_hover = None;
         self.context_origin = RenameSite::Tree;
         self.context_target = Some(path.clone());
         self.popup = None;
         self.submenu = None;
-        if volumes::is_computer(&path) {
+        self.nested_submenu = None;
+        if self.settings.full_system_menu && volumes::is_computer(&path) {
             let (x, y) = shell::cursor();
             self.run_shell(
                 shell::Request::ComputerMenu {
@@ -141,8 +144,7 @@ impl Explorer {
                 },
                 cx,
             );
-        } else if (self.settings.full_system_menu
-            || rust_explorer::volume_label::is_drive_root(&path))
+        } else if self.settings.full_system_menu
             && !special(&path)
             && !path.to_string_lossy().starts_with("shell:")
         {
@@ -657,7 +659,7 @@ impl Explorer {
         self.status = rust_explorer::trf!("{} 个项目", self.entries.len());
         self.rebuild_rows();
     }
-    fn tree_is_open(&self, path: &std::path::Path) -> bool {
+    pub(super) fn tree_is_open(&self, path: &std::path::Path) -> bool {
         if volumes::is_computer(path) {
             self.computer_open
         } else if path == std::path::Path::new("::QuickAccess") {
@@ -1222,9 +1224,9 @@ impl Explorer {
                                             }
                                         }),
                                     )
-                                    .on_mouse_down(
+                                    .on_mouse_up(
                                         MouseButton::Right,
-                                        cx.listener(move |v, e: &MouseDownEvent, window, cx| {
+                                        cx.listener(move |v, e: &MouseUpEvent, window, cx| {
                                             cx.stop_propagation();
                                             v.nav_keyboard_index = index;
                                             v.keyboard_focus_region = 3;
