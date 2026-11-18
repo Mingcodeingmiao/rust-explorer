@@ -530,7 +530,7 @@ fn menu_icon(id: &str) -> Option<&'static str> {
             "file-share" => "share",
             "submenu:view-menu" => "view",
             "submenu:sort-menu" => "sort",
-            "pin" | "pin-start" | "nav-pin" | "nav-unpin" => "pin",
+            "pin" | "nav-pin" | "nav-unpin" => "pin",
             "copy-path" | "nav-copy-path" => "copy-path",
             "select-all" => "select-all",
             "select-none" => "select-none",
@@ -1154,21 +1154,30 @@ impl Explorer {
         let scroll = self.content_scroll.clone();
         let registration =
             rust_explorer::native_drag::DropTarget::register(owner, current, move |x, y| {
-                let current = fallback.try_borrow().ok()?.clone();
-                let position = point(px(x), px(y));
-                let regions = bounds.try_borrow().ok()?;
-                if let Some((path, _, directory)) = regions
-                    .iter()
-                    .rev()
-                    .find(|(_, area, _)| area.contains(&position))
-                {
-                    return (*directory && !navigation::is_app_virtual(path)).then(|| path.clone());
-                }
-                scroll
-                    .bounds()
-                    .contains(&position)
-                    .then_some(current)
-                    .flatten()
+                let target = (|| {
+                    let current = fallback.try_borrow().ok().and_then(|value| value.clone());
+                    let position = point(px(x), px(y));
+                    let regions = bounds.try_borrow().ok()?;
+                    if let Some((path, _, directory)) = regions
+                        .iter()
+                        .rev()
+                        .find(|(_, area, _)| area.contains(&position))
+                    {
+                        if *directory && !navigation::is_app_virtual(path) {
+                            return Some(path.clone());
+                        }
+                        // A file row is not a folder target, but dropping on it
+                        // still means "into the current folder"; fall through to
+                        // the view background instead of rejecting the drag.
+                    }
+                    scroll
+                        .bounds()
+                        .contains(&position)
+                        .then_some(current)
+                        .flatten()
+                })();
+                rust_explorer::native_drag::set_feedback(owner, x, y, target.clone());
+                target
             })
             .map_err(|error| format!("{error:#}"));
         if let Err(error) = &registration {
@@ -1183,6 +1192,8 @@ impl Explorer {
         cx: &mut Context<Self>,
     ) {
         rust_explorer::native_drag::trace("requested");
+        // The hover card must not cover the operation label while dragging.
+        rust_explorer::file_tip::hide_current();
         // Defer until GPUI has installed its local payload, then hand ownership
         // of mouse capture to OLE. The posted native message runs after this
         // callback returns; its nested message pump holds no App/Entity borrow.
@@ -1195,6 +1206,7 @@ impl Explorer {
             if view.busy {
                 return;
             }
+            view.native_file_drag = Some(paths.clone());
             unsafe {
                 let _ = windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture();
             }
@@ -1206,7 +1218,10 @@ impl Explorer {
                 .and_then(|target| target.start(&paths));
             match result {
                 Ok(()) => {}
-                Err(error) => view.status = format!("{error:#}"),
+                Err(error) => {
+                    view.native_file_drag = None;
+                    view.status = format!("{error:#}");
+                }
             }
             cx.notify();
         });
@@ -1220,6 +1235,11 @@ impl Explorer {
     ) {
         let mode =
             rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+        if rust_explorer::file_drag::same_location(&paths, &destination) {
+            self.status = rust_explorer::i18n::text("源和目标相同，已忽略").into();
+            cx.notify();
+            return;
+        }
         if !rust_explorer::file_drag::allows(&paths, &destination, mode)
             || navigation::is_app_virtual(&destination)
             || self.busy
@@ -1254,7 +1274,21 @@ impl Explorer {
             _ => return,
         };
         if drop.paths.is_empty()
-            || !rust_explorer::file_drag::allows(&drop.paths, &drop.destination, mode)
+            || rust_explorer::file_drag::same_location(&drop.paths, &drop.destination)
+        {
+            if !drop.paths.is_empty() {
+                rust_explorer::native_drag::trace("native drop ignored: source equals destination");
+                let message = rust_explorer::i18n::text("源和目标相同，已忽略").to_string();
+                self.status = message.clone();
+                // A native drop is followed by a completion refresh; keep the
+                // explanation visible in the error banner instead of letting
+                // the refresh overwrite the status line.
+                self.error = Some(message.into());
+                cx.notify();
+            }
+            return;
+        }
+        if !rust_explorer::file_drag::allows(&drop.paths, &drop.destination, mode)
             || navigation::is_app_virtual(&drop.destination)
             || self.busy
             || self.options.is_some()
@@ -1281,6 +1315,14 @@ impl Explorer {
         mode: shell::TransferMode,
         cx: &mut Context<Self>,
     ) {
+        if rust_explorer::file_drag::same_location(&paths, &destination) {
+            self.popup = None;
+            self.submenu = None;
+            self.nested_submenu = None;
+            self.status = rust_explorer::i18n::text("源和目标相同，已忽略").into();
+            cx.notify();
+            return;
+        }
         if !rust_explorer::file_drag::allows(&paths, &destination, mode)
             || navigation::is_app_virtual(&destination)
             || self.busy
@@ -1343,6 +1385,7 @@ impl Explorer {
                 .collect()
         };
         self.file_drag = Some(FileDragState {
+            count: paths.len(),
             paths,
             previews,
             position,
@@ -1351,9 +1394,20 @@ impl Explorer {
         });
         cx.notify();
     }
+    pub(super) fn drop_target_path(&self, window: &Window) -> Option<PathBuf> {
+        let hwnd = native_hwnd(window);
+        self.file_drag
+            .as_ref()
+            .and_then(|drag| drag.target.clone())
+            .or_else(|| {
+                rust_explorer::native_drag::feedback()
+                    .filter(|feedback| Some(feedback.window) == hwnd)
+                    .and_then(|feedback| feedback.target)
+            })
+    }
     pub(super) fn file_drag_label(&self, drag: &FileDragState) -> String {
         let Some(target) = &drag.target else {
-            return rust_explorer::trf!("{} 个项目 · 不能放置到此处", drag.paths.len());
+            return rust_explorer::trf!("{} 个项目 · 不能放置到此处", drag.count);
         };
         let operation =
             match rust_explorer::file_drag::feedback_mode(&drag.paths, target, drag.mode) {
@@ -1364,7 +1418,7 @@ impl Explorer {
             };
         rust_explorer::trf!(
             "{} 个项目 · {operation} {}",
-            drag.paths.len(),
+            drag.count,
             target
                 .file_name()
                 .unwrap_or(target.as_os_str())
@@ -1471,7 +1525,7 @@ impl Explorer {
             .flex()
             .flex_col()
             .gap(ui(4.))
-            .child(stack)
+            .when(!drag.paths.is_empty(), move |d| d.child(stack))
             .child(
                 div()
                     .flex()
@@ -2008,7 +2062,14 @@ impl Explorer {
         self.filter_types = types.into_iter().map(str::to_owned).collect();
         self.group_members = groups.iter().cloned().collect();
         if !self.group.is_empty() {
-            groups.sort_by(|a, b| fs::natural_cmp(&a.0, &b.0));
+            groups.sort_by(|a, b| {
+                let order = fs::natural_cmp(&a.0, &b.0);
+                if self.group_descending {
+                    order.reverse()
+                } else {
+                    order
+                }
+            });
         }
         if self.view == ViewMode::List {
             let count = (self.layout_height / if self.settings.compact { 26. } else { 34. })
@@ -3247,9 +3308,20 @@ impl Explorer {
         };
         let drag_source = cx.entity().downgrade();
         let self_selected = self.selected.contains(&index);
-        let dragging_files = self.file_drag.is_some();
-        let drop_target =
-            self.file_drag.as_ref().and_then(|d| d.target.as_ref()) == Some(&entry.path);
+        // Native (left-button) and external drags never populate `file_drag`;
+        // their live target comes from the Shell drop-target feedback. Include
+        // both so the hovered folder is highlighted exactly like a right drag.
+        let native_feedback = rust_explorer::native_drag::feedback()
+            .filter(|feedback| Some(feedback.window) == native_hwnd(window));
+        let dragging_files = self.file_drag.is_some()
+            || self.native_file_drag.is_some()
+            || native_feedback.is_some();
+        let drop_target = self.file_drag.as_ref().and_then(|d| d.target.as_ref())
+            == Some(&entry.path)
+            || native_feedback
+                .as_ref()
+                .and_then(|feedback| feedback.target.as_deref())
+                == Some(entry.path.as_path());
         let drop_bounds = self.file_drop_bounds.clone();
         let drop_path = entry.path.clone();
         let drop_directory = entry.directory;
@@ -4316,8 +4388,6 @@ impl Explorer {
                         .enable(!navigation::is_app_virtual(&self.dir())),
                     MenuItem::new("pin", rust_explorer::i18n::text("固定到快速访问"))
                         .enable(folder && !navigation::is_virtual(&self.dir())),
-                    MenuItem::new("pin-start", rust_explorer::i18n::text("固定到“开始”"))
-                        .enable(folder && !navigation::is_virtual(&self.dir())),
                     MenuItem::new(
                         "submenu:compress-menu",
                         rust_explorer::i18n::text("压缩到…"),
@@ -4344,7 +4414,6 @@ impl Explorer {
                                 | "file-window"
                                 | "file-explorer"
                                 | "pin"
-                                | "pin-start"
                                 | "submenu:access-menu"
                         )
                     });
@@ -4565,19 +4634,33 @@ impl Explorer {
                     rust_explorer::i18n::text("分组依据                     ›"),
                 ),
             ],
-            "group" => [
-                ("", rust_explorer::i18n::text("（无）")),
-                ("name", rust_explorer::i18n::text("名称")),
-                ("modified", rust_explorer::i18n::text("修改日期")),
-                ("kind", rust_explorer::i18n::text("类型")),
-                ("size", rust_explorer::i18n::text("大小")),
-                ("created", rust_explorer::i18n::text("创建日期")),
-            ]
-            .iter()
-            .map(|(id, label)| {
-                MenuItem::new(format!("group:{id}"), *label).check(self.group == *id)
-            })
-            .collect(),
+            "group" => {
+                let mut items: Vec<MenuItem> = [
+                    ("", rust_explorer::i18n::text("（无）")),
+                    ("name", rust_explorer::i18n::text("名称")),
+                    ("modified", rust_explorer::i18n::text("修改日期")),
+                    ("kind", rust_explorer::i18n::text("类型")),
+                    ("size", rust_explorer::i18n::text("大小")),
+                    ("created", rust_explorer::i18n::text("创建日期")),
+                ]
+                .iter()
+                .map(|(id, label)| {
+                    MenuItem::new(format!("group:{id}"), *label).check(self.group == *id)
+                })
+                .collect();
+                items.push(MenuItem::separator());
+                items.push(
+                    MenuItem::new("group-ascending", rust_explorer::i18n::text("递增"))
+                        .check(!self.group_descending)
+                        .enable(!self.group.is_empty()),
+                );
+                items.push(
+                    MenuItem::new("group-descending", rust_explorer::i18n::text("递减"))
+                        .check(self.group_descending)
+                        .enable(!self.group.is_empty()),
+                );
+                items
+            }
             "columns" => if rust_explorer::shell_folder::is_recycle_bin_path(&self.dir()) {
                 vec!["name", "original", "deleted", "size", "kind", "modified"]
             } else {
@@ -5510,6 +5593,16 @@ impl Explorer {
             cx.notify();
             return;
         }
+        if id == "group-ascending" || id == "group-descending" {
+            let descending = id == "group-descending";
+            self.group_descending = descending;
+            if self.remember_folder_view(cx, |prefs| prefs.group_descending = descending) {
+                self.save_settings(cx);
+            }
+            self.rebuild_rows();
+            cx.notify();
+            return;
+        }
         if let Some(id) = id.strip_prefix("group:") {
             self.group = id.into();
             if self.remember_folder_view(cx, |prefs| prefs.group = Some(id.into())) {
@@ -5686,7 +5779,13 @@ impl Explorer {
             }
             "nav-pin" => {
                 if let Some(path) = self.context_target.clone() {
-                    self.change_quick_access(vec![path], true, cx);
+                    // This PC/Network/Libraries are namespace roots, not folders.
+                    // Pinning one only creates a Quick Access entry that cannot
+                    // be opened, so refuse it at the command layer as well as in
+                    // the menus.
+                    if !navigation::is_virtual(&path) {
+                        self.change_quick_access(vec![path], true, cx);
+                    }
                 }
             }
             "nav-tab" => {
@@ -5775,6 +5874,7 @@ impl Explorer {
                                 .into(),
                                 descending: self.descending,
                                 group: self.group.clone(),
+                                group_descending: self.group_descending,
                                 undo: !self.undo_stack.is_empty(),
                                 redo: !self.redo_stack.is_empty(),
                                 can_paste: false,
@@ -5899,18 +5999,6 @@ impl Explorer {
             }
             "pin" => {
                 self.change_quick_access(self.paths(), true, cx);
-            }
-            "pin-start" => {
-                let paths = self.paths();
-                if paths.len() == 1 {
-                    self.run_shell(
-                        shell::Request::InvokeVerb {
-                            paths,
-                            verb: "pintostartscreen".into(),
-                        },
-                        cx,
-                    );
-                }
             }
             "options" => {
                 self.options = Some(self.settings.clone());

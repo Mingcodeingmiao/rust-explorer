@@ -137,6 +137,9 @@ struct DragFiles {
 struct FileDragState {
     paths: Vec<PathBuf>,
     previews: Vec<Entry>,
+    /// Number of dragged items. A target window that is not the source has no
+    /// paths/previews but can still render "N 个项目".
+    count: usize,
     position: Point<Pixels>,
     target: Option<PathBuf>,
     mode: shell::TransferMode,
@@ -310,6 +313,7 @@ struct Explorer {
     crumb_scroll: ScrollHandle,
     view: ViewMode,
     group: String,
+    group_descending: bool,
     filters: rust_explorer::file_filter::Filters,
     filter_types: Vec<String>,
     filter_folder: PathBuf,
@@ -388,6 +392,10 @@ struct Explorer {
     /// Scroll row to restore when nothing was selected in the target folder.
     pending_scroll_row: Option<f32>,
     file_drag: Option<FileDragState>,
+    /// Paths owned by the left-button OLE drag. Windows runs that drag in its
+    /// own modal loop, so GPUI receives no DragFiles move events; this keeps the
+    /// operation label alive while the pointer is over a folder.
+    native_file_drag: Option<Vec<PathBuf>>,
     right_file_drag: Option<RightFileDrag>,
     pending_right_drop: Option<(Vec<PathBuf>, PathBuf)>,
     file_drop_bounds: std::rc::Rc<std::cell::RefCell<Vec<(PathBuf, Bounds<Pixels>, bool)>>>,
@@ -467,6 +475,7 @@ struct ListingPresentation {
     sort: Sort,
     descending: bool,
     group: String,
+    group_descending: bool,
 }
 impl ListingPresentation {
     fn resolve(settings: &Settings, path: &std::path::Path, cx: &App) -> Self {
@@ -505,11 +514,14 @@ impl ListingPresentation {
                     String::new()
                 }
             });
+        let group_descending =
+            !group.is_empty() && saved.is_some_and(|prefs| prefs.group_descending);
         Self {
             view,
             sort,
             descending,
             group,
+            group_descending,
         }
     }
 }
@@ -912,6 +924,7 @@ impl Explorer {
             sort,
             descending,
             group,
+            group_descending,
         } = ListingPresentation::resolve(&settings, &initial, cx);
         view_trace(format!(
             "new window initial={:?} remember={} -> view={:?}",
@@ -980,6 +993,7 @@ impl Explorer {
             group_members: Default::default(),
             collapsed_groups: Default::default(),
             group,
+            group_descending,
             usage: HashMap::new(),
             usage_cancel: Arc::new(AtomicBool::new(false)),
             usage_rx,
@@ -1061,6 +1075,7 @@ impl Explorer {
             pending_restore: None,
             pending_scroll_row: None,
             file_drag: None,
+            native_file_drag: None,
             right_file_drag: None,
             pending_right_drop: None,
             file_drop_bounds: Default::default(),
@@ -1207,6 +1222,8 @@ impl Explorer {
                             .and_then(|target| target.as_ref().ok())
                             .is_some_and(|target| target.take_completed())
                         {
+                            this.native_file_drag = None;
+                            this.file_drag = None;
                             this.reload(cx);
                         }
                         let dropped = this
@@ -1436,6 +1453,7 @@ impl Explorer {
         // folder that happens to use the same grouping and group names.
         self.collapsed_groups.clear();
         self.group = listing.group;
+        self.group_descending = listing.group_descending;
         view_trace(format!(
             "listing defaults for {:?} -> view={:?} group={:?}",
             path, self.view, self.group
@@ -2878,22 +2896,15 @@ impl Explorer {
             cx.notify();
             return;
         }
-        if volumes::is_computer(&self.dir()) && self.selected.is_empty() {
-            let (x, y) = shell::cursor();
-            self.context_target = Some(volumes::computer());
-            self.run_shell(
-                shell::Request::ComputerMenu {
-                    x,
-                    y,
-                    dark: self.theme.dark,
-                    expanded: self.computer_open,
-                    owner: shell::active_window_owner(),
-                },
-                cx,
-            );
-            return;
-        }
-        if navigation::is_app_virtual(&self.dir()) && self.selected.is_empty() {
+        // The This PC *page* background is a Shell folder view: reuse the
+        // folder background menu (View/Sort/Group/Refresh/Paste/Add network
+        // location/Properties) instead of the This PC item menu, which is
+        // reserved for the left-tree node.
+        let this_pc_background = volumes::is_computer(&self.dir()) && self.selected.is_empty();
+        if navigation::is_app_virtual(&self.dir())
+            && !this_pc_background
+            && self.selected.is_empty()
+        {
             self.popup = Some((
                 if self.dir() == PathBuf::from("::QuickAccess") {
                     "quick-background-menu"
@@ -2919,7 +2930,11 @@ impl Explorer {
         self.run_shell(
             shell::Request::ThemedMenu {
                 paths,
-                folder: self.dir(),
+                folder: if this_pc_background {
+                    PathBuf::from("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}")
+                } else {
+                    self.dir()
+                },
                 x,
                 y,
                 dark: self.theme.dark,
@@ -2940,6 +2955,7 @@ impl Explorer {
                 .into(),
                 descending: self.descending,
                 group: self.group.clone(),
+                group_descending: self.group_descending,
                 undo: !self.undo_stack.is_empty(),
                 redo: !self.redo_stack.is_empty(),
                 can_paste: self.can_paste(),
@@ -4291,6 +4307,8 @@ impl Render for Explorer {
                 || self.options.is_some()
                 || self.dialog.is_some()
                 || self.file_drag.is_some()
+                || self.native_file_drag.is_some()
+                || rust_explorer::native_drag::feedback().is_some()
                 || self.system_menu_active,
         );
         self.install_native_drop(window);
@@ -4839,6 +4857,7 @@ impl Render for Explorer {
                     return;
                 }
                 v.file_drag = None;
+                v.native_file_drag = None;
                 v.right_file_drag = None;
                 v.pending_right_drop = None;
                 v.pending_selection_click = None;
@@ -4865,6 +4884,7 @@ impl Render for Explorer {
             .capture_any_mouse_down(cx.listener(|v, e: &MouseDownEvent, _, _| {
                 v.marquee = None;
                 v.pending_selection_click = None;
+                v.native_file_drag = None;
                 v.right_file_drag = None;
                 v.file_drag = None;
                 if e.button == MouseButton::Left {
@@ -4998,6 +5018,8 @@ impl Render for Explorer {
             })
             .capture_any_mouse_up(cx.listener(|v, e: &MouseUpEvent, w, cx| {
                 if e.button == MouseButton::Left {
+                    v.native_file_drag = None;
+                    v.file_drag = None;
                     if let Some(drag) = v.marquee.take() {
                         if drag.active {
                             v.focus_item = v
@@ -6423,7 +6445,62 @@ impl Render for Explorer {
             root = root.child(self.render_options(cx));
         }
 
-        if let Some(drag) = &self.file_drag {
+        // A left-button drag runs inside OLE's modal loop, so its target
+        // callback (not GPUI mouse moves) supplies the operation label state.
+        // Feedback is window-scoped: two application windows share this thread.
+        let hwnd = native_hwnd(window);
+        let feedback =
+            rust_explorer::native_drag::feedback().filter(|feedback| Some(feedback.window) == hwnd);
+        let native_drag = feedback.and_then(|feedback| {
+            let modifiers = window.modifiers();
+            let modifier_mode =
+                rust_explorer::file_drag::mode(modifiers.control, modifiers.shift, modifiers.alt);
+            let mode = match feedback.effect & 0x7 {
+                1 => shell::TransferMode::Copy,
+                2 => shell::TransferMode::Move,
+                4 => shell::TransferMode::Link,
+                _ => modifier_mode,
+            };
+            let position = point(px(feedback.position.0), px(feedback.position.1));
+            if let Some(paths) = self.native_file_drag.as_ref() {
+                let target = feedback
+                    .target
+                    .filter(|target| rust_explorer::file_drag::allows(paths, target, mode));
+                let previews = paths
+                    .iter()
+                    .take(3)
+                    .filter_map(|path| {
+                        self.entries
+                            .iter()
+                            .find(|entry| &entry.path == path)
+                            .cloned()
+                    })
+                    .collect();
+                Some(FileDragState {
+                    paths: paths.clone(),
+                    previews,
+                    count: paths.len(),
+                    position,
+                    target,
+                    mode,
+                })
+            } else if feedback.count > 0 {
+                // This window is the drop target, not the drag source (or the
+                // source is another application/process). Render the same
+                // operation label without a local preview stack.
+                Some(FileDragState {
+                    paths: Vec::new(),
+                    previews: Vec::new(),
+                    count: feedback.count as usize,
+                    position,
+                    target: feedback.target,
+                    mode,
+                })
+            } else {
+                None
+            }
+        });
+        if let Some(drag) = native_drag.as_ref().or(self.file_drag.as_ref()) {
             root = root.child(self.render_file_drag(drag, window, cx));
         }
 

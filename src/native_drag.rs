@@ -33,6 +33,57 @@ pub fn trace(message: &str) {
     }
 }
 
+/// Latest position/target observed by the OLE drop target. OLE owns the mouse
+/// during a left-button drag, so GPUI receives no reliable mouse-move stream;
+/// the target callback updates this state and the renderer paints the same
+/// operation label the right-drag path uses.
+#[derive(Clone, Debug, Default)]
+pub struct DragFeedback {
+    /// HWND of the window whose drop target produced this feedback. Two
+    /// application windows share the UI thread, so the consumer must ignore
+    /// feedback that belongs to another window.
+    pub window: isize,
+    pub position: (f32, f32),
+    pub target: Option<PathBuf>,
+    /// Number of dragged items, read from CF_HDROP by the target. It lets a
+    /// window that is not the drag source render the same operation label.
+    pub count: u32,
+    /// Current OLE drop effect (COPY=1, MOVE=2, LINK=4).
+    pub effect: u32,
+}
+thread_local! {
+    static FEEDBACK: RefCell<Option<DragFeedback>> = const { RefCell::new(None) };
+    static COUNT: Cell<u32> = const { Cell::new(0) };
+    static EFFECT: Cell<u32> = const { Cell::new(0) };
+}
+pub fn set_drag_count(count: u32) {
+    COUNT.with(|slot| slot.set(count));
+}
+pub fn set_drag_effect(effect: u32) {
+    EFFECT.with(|slot| slot.set(effect));
+}
+pub fn set_feedback(window: isize, x: f32, y: f32, target: Option<PathBuf>) {
+    let count = COUNT.with(Cell::get);
+    let effect = EFFECT.with(Cell::get);
+    FEEDBACK.with(|slot| {
+        *slot.borrow_mut() = Some(DragFeedback {
+            window,
+            position: (x, y),
+            target,
+            count,
+            effect,
+        });
+    });
+}
+pub fn feedback() -> Option<DragFeedback> {
+    FEEDBACK.with(|slot| slot.borrow().clone())
+}
+pub fn clear_feedback() {
+    FEEDBACK.with(|slot| *slot.borrow_mut() = None);
+    COUNT.with(|slot| slot.set(0));
+    EFFECT.with(|slot| slot.set(0));
+}
+
 /// One completed native drop. The transfer itself runs in the cancellable
 /// helper, never on the UI thread that is still inside OLE's Drop callback.
 pub struct DropRequest {
@@ -103,14 +154,30 @@ extern "C" fn callback(
     context: *mut c_void,
 ) -> i32 {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if kind == 6 {
+            set_drag_count(x.max(0.0) as u32);
+            return 1;
+        }
+        if kind == 7 {
+            set_drag_effect(x.max(0.0) as u32);
+            return 1;
+        }
         if kind == 2 {
+            clear_feedback();
             unsafe {
                 drop(Box::from_raw(context as *mut Context));
             }
             return 1;
         }
+        if kind == 5 {
+            // Pointer left every registered drop region: no next DragOver will
+            // arrive to clear the operation label.
+            clear_feedback();
+            return 1;
+        }
         let context = unsafe { &*(context as *const Context) };
         if kind == 3 || kind == 4 {
+            clear_feedback();
             let result = if kind == 3 {
                 Ok(x as u32)
             } else {
@@ -122,6 +189,7 @@ extern "C" fn callback(
             return 1;
         }
         if kind == 1 {
+            clear_feedback();
             context.completed.set(true);
             return 1;
         }
@@ -263,5 +331,26 @@ mod tests {
         assert_eq!(request.destination, PathBuf::from("R:\\"));
         assert_eq!(request.effect, 1);
         unsafe { drop(Box::from_raw(context)) };
+    }
+
+    #[test]
+    fn drag_feedback_round_trips_and_clears() {
+        clear_feedback();
+        assert!(feedback().is_none());
+        set_drag_count(3);
+        set_drag_effect(2);
+        set_feedback(42, 12.5, 34.5, Some(PathBuf::from(r"C:\target")));
+        let value = feedback().expect("feedback");
+        assert_eq!(value.window, 42);
+        assert_eq!(value.position, (12.5, 34.5));
+        assert_eq!(value.target, Some(PathBuf::from(r"C:\target")));
+        assert_eq!(value.count, 3);
+        assert_eq!(value.effect, 2);
+        set_feedback(7, 1.0, 2.0, None);
+        let value = feedback().expect("feedback");
+        assert_eq!(value.window, 7);
+        assert_eq!(value.target, None);
+        clear_feedback();
+        assert!(feedback().is_none());
     }
 }

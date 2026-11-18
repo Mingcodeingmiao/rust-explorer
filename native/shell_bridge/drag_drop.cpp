@@ -72,12 +72,6 @@ static std::wstring normalized_path(std::wstring path) {
     while (path.size() > 3 && path.back() == L'\\') path.pop_back();
     return path;
 }
-static std::wstring parent_path(const std::wstring& path) {
-    const auto slash = path.find_last_of(L'\\');
-    if (slash == std::wstring::npos) return {};
-    if (slash == 2 && path[1] == L':') return path.substr(0, 3);
-    return path.substr(0, slash);
-}
 static bool is_within(const std::wstring& child, const std::wstring& parent) {
     return child == parent ||
            (child.size() > parent.size() &&
@@ -87,9 +81,25 @@ static bool is_within(const std::wstring& child, const std::wstring& parent) {
 static bool same_volume(const std::wstring& source, const std::wstring& destination) {
     wchar_t source_root[32768]{};
     wchar_t destination_root[32768]{};
-    return GetVolumePathNameW(source.c_str(), source_root, 32768) &&
-           GetVolumePathNameW(destination.c_str(), destination_root, 32768) &&
-           _wcsicmp(source_root, destination_root) == 0;
+    if (GetVolumePathNameW(source.c_str(), source_root, 32768) &&
+        GetVolumePathNameW(destination.c_str(), destination_root, 32768)) {
+        return _wcsicmp(source_root, destination_root) == 0;
+    }
+    // Some RAM-disk drivers do not answer GetVolumePathNameW. Both paths still
+    // carry their drive roots, which is enough to keep the default drag effect
+    // (move on the same device) consistent with the application label.
+    auto drive_root = [](const std::wstring& path) -> std::wstring {
+        if (path.size() >= 2 && path[1] == L':' && iswalpha(path[0])) {
+            std::wstring root = path.substr(0, 2);
+            root.push_back(L'\\');
+            return root;
+        }
+        return {};
+    };
+    const auto source_drive = drive_root(source);
+    const auto destination_drive = drive_root(destination);
+    return !source_drive.empty() &&
+           _wcsicmp(source_drive.c_str(), destination_drive.c_str()) == 0;
 }
 static bool read_hdrop_paths(IDataObject* data, std::vector<std::wstring>& paths) {
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
@@ -127,18 +137,23 @@ static DWORD drop_effect(DWORD keys, const std::vector<std::wstring>& paths,
 }
 static bool allows_drop(const std::vector<std::wstring>& paths,
                         const std::wstring& destination, DWORD effect) {
+    (void)effect;
     const auto target = normalized_path(destination);
     if (target.empty()) return false;
     for (const auto& path : paths) {
         const auto source = normalized_path(path);
         if (source.empty() || is_within(target, source)) return false;
-        if (effect == DROPEFFECT_MOVE && parent_path(source) == target) return false;
+        // Same-folder drops are accepted and ignored with a prompt by the UI;
+        // rejecting them here would make the prompt unreachable.
     }
     return true;
 }
 static constexpr UINT START_FILE_DRAG = WM_APP + 0x637;
 static constexpr UINT_PTR DRAG_SUBCLASS = 0x52454444;
 static constexpr UINT_PTR DRAG_REPAINT_TIMER = 0x52445254;
+// gpui 0.2.2 (pinned) forces an element-tree render for this window message;
+// InvalidateRect alone only repaints the cached frame.
+static constexpr UINT GPUI_FORCE_UPDATE_WINDOW = WM_USER + 5;
 extern "C" HRESULT re_drag_files(HWND, const wchar_t* const*, unsigned, DWORD*) noexcept;
 
 // Finish reliably even if the cursor crosses into another application's window.
@@ -178,6 +193,23 @@ class FileDropTarget final : public IDropTarget {
     std::wstring path_;
     std::vector<std::wstring> pending_;
     bool source_active_ = false;
+    // Our own left drag already paints its GPUI preview/label. Suppress the
+    // Shell's drag image for that source so only one icon is visible; external
+    // drags keep the standard Shell drag image.
+    bool own_source_ = false;
+    ULONGLONG last_force_ = 0;
+    unsigned dragged_count_ = 0;
+
+    // GPUI only re-runs its element tree when it receives this message. Our own
+    // drag has a 30 ms timer; external drags have none, so throttle here to let
+    // the hovered folder highlight track the external pointer.
+    void request_ui_frame() {
+        const auto now = GetTickCount64();
+        if (now - last_force_ < 30) return;
+        last_force_ = now;
+        InvalidateRect(owner_, nullptr, FALSE);
+        PostMessageW(owner_, GPUI_FORCE_UPDATE_WINDOW, 0, 0);
+    }
 
     void leave() {
         if (target_) { target_->DragLeave(); target_->Release(); target_ = nullptr; }
@@ -269,21 +301,37 @@ public:
         reset();
         if (!data || !effect) return E_POINTER;
         data_ = data; data_->AddRef();
+        own_source_ = is_deferred_source(data);
+        std::vector<std::wstring> drag_paths;
+        dragged_count_ = read_hdrop_paths(data, drag_paths)
+            ? static_cast<unsigned>(drag_paths.size())
+            : 0;
+        // The UI needs the item count for the operation label even when this is
+        // a different window/process than the drag source.
+        resolve_(6, static_cast<float>(dragged_count_), 0, nullptr, 0, context_);
         const auto hr = locate(keys, point, effect);
         POINT p{point.x, point.y};
-        if (helper_) helper_->DragEnter(owner_, data, &p, *effect);
+        if (helper_ && !own_source_) helper_->DragEnter(owner_, data, &p, *effect);
+        resolve_(7, static_cast<float>(*effect), 0, nullptr, 0, context_);
+        request_ui_frame();
         return hr;
     }
     HRESULT STDMETHODCALLTYPE DragOver(DWORD keys, POINTL point, DWORD* effect) override {
         if (!effect) return E_POINTER;
         const auto hr = locate(keys, point, effect);
         POINT p{point.x, point.y};
-        if (helper_) helper_->DragOver(&p, *effect);
+        if (helper_ && !own_source_) helper_->DragOver(&p, *effect);
+        resolve_(7, static_cast<float>(*effect), 0, nullptr, 0, context_);
+        request_ui_frame();
         return hr;
     }
     HRESULT STDMETHODCALLTYPE DragLeave() override {
-        if (helper_) helper_->DragLeave();
+        // Let the UI clear its operation label; no DragOver follows this call.
+        resolve_(5, 0, 0, nullptr, 0, context_);
+        if (helper_ && !own_source_) helper_->DragLeave();
+        own_source_ = false;
         reset();
+        request_ui_frame();
         return S_OK;
     }
     HRESULT STDMETHODCALLTYPE Drop(IDataObject* data, DWORD keys, POINTL point, DWORD* effect) override {
@@ -315,8 +363,10 @@ public:
                     target_ = nullptr;
                 }
                 POINT p{point.x, point.y};
-                if (helper_) helper_->Drop(data, &p, *effect);
+                if (helper_ && !own_source_) helper_->Drop(data, &p, *effect);
+                own_source_ = false;
                 reset();
+                request_ui_frame();
                 if (*effect != DROPEFFECT_NONE) resolve_(1, 0, 0, nullptr, 0, context_);
                 return S_OK;
             }
@@ -327,8 +377,10 @@ public:
         if (target_) { target_->Release(); target_ = nullptr; }
         POINT p{point.x, point.y};
         const auto logical = SUCCEEDED(hr) ? logical_effect(data, *effect) : DROPEFFECT_NONE;
-        if (helper_) helper_->Drop(data, &p, logical);
+        if (helper_ && !own_source_) helper_->Drop(data, &p, logical);
+        own_source_ = false;
         reset();
+        request_ui_frame();
         if (SUCCEEDED(hr) && logical != DROPEFFECT_NONE)
             resolve_(1, 0, 0, nullptr, 0, context_);
         return hr;
@@ -348,6 +400,11 @@ static LRESULT CALLBACK DragSubclass(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         // explicit paint request the GPUI window keeps its last frame and
         // looks hung while the pointer is over another application.
         InvalidateRect(hwnd, nullptr, FALSE);
+        // GPUI only re-runs its element tree for a forced update; a plain
+        // InvalidateRect repaints the cached frame. Ask for the forced frame so
+        // the operation label reads the latest target/position reported by the
+        // IDropTarget callbacks.
+        PostMessageW(hwnd, GPUI_FORCE_UPDATE_WINDOW, 0, 0);
         result = 0;
     } else {
         if (msg == WM_NCDESTROY) RemoveWindowSubclass(hwnd, DragSubclass, DRAG_SUBCLASS);

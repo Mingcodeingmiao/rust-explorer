@@ -633,7 +633,11 @@ pub fn folder_argument(path: &std::path::Path) -> Result<PathBuf> {
         path.is_absolute() && path.is_dir(),
         "Folder handler requires an existing absolute directory"
     );
-    let path = path.canonicalize()?;
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) if path.is_dir() => std::path::absolute(path)?,
+        Err(error) => return Err(error.into()),
+    };
     let text = path.to_string_lossy();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         return Ok(PathBuf::from(format!(r"\\{unc}")));

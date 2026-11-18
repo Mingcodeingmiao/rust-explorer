@@ -27,6 +27,7 @@ mod interaction_defaults_tests {
                 mode: Some(ViewMode::List),
                 sort: Some((Sort::Modified, true)),
                 group: Some("kind".into()),
+                group_descending: true,
             },
         );
         settings.folder_views.insert(
@@ -119,6 +120,8 @@ pub struct FolderView {
     pub sort: Option<(Sort, bool)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub group: Option<String>,
+    #[serde(default)]
+    pub group_descending: bool,
 }
 
 #[derive(Deserialize)]
@@ -129,6 +132,8 @@ enum StoredFolderView {
         mode: Option<ViewMode>,
         sort: Option<(Sort, bool)>,
         group: Option<String>,
+        #[serde(default)]
+        group_descending: bool,
     },
 }
 
@@ -139,7 +144,17 @@ impl From<StoredFolderView> for FolderView {
                 mode: Some(mode),
                 ..Self::default()
             },
-            StoredFolderView::Listing { mode, sort, group } => Self { mode, sort, group },
+            StoredFolderView::Listing {
+                mode,
+                sort,
+                group,
+                group_descending,
+            } => Self {
+                mode,
+                sort,
+                group,
+                group_descending,
+            },
         }
     }
 }

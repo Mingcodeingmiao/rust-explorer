@@ -180,6 +180,7 @@ impl Explorer {
                     .into(),
                     descending: self.descending,
                     group: self.group.clone(),
+                    group_descending: self.group_descending,
                     undo: !self.undo_stack.is_empty(),
                     redo: !self.redo_stack.is_empty(),
                     can_paste: false,
@@ -389,6 +390,11 @@ impl Explorer {
             .map(|item| (item.name.clone(), item.path.clone()))
             .collect();
         for path in &self.settings.favorites {
+            // Virtual roots (This PC, Network, Libraries) cannot be Quick Access
+            // targets; older builds could leave such a dead entry here.
+            if is_virtual(path) {
+                continue;
+            }
             if self.settings.quick_access_hidden.contains(path) {
                 continue;
             }
@@ -1057,8 +1063,7 @@ impl Explorer {
                                     this.dir() == path
                                 };
                                 let target =
-                                    this.file_drag.as_ref().and_then(|d| d.target.as_ref())
-                                        == Some(&path);
+                                    this.drop_target_path(window).as_deref() == Some(path.as_path());
                                 let bounds_path = path.clone();
                                 let drop_bounds = this.file_drop_bounds.clone();
                                 div()
@@ -1223,6 +1228,14 @@ impl Explorer {
                                                 }
                                             }
                                         }),
+                                    )
+                                    // A navigation row owns its right-click menu. Without
+                                    // this, the sidebar background handler below also ran on
+                                    // button-down, so every row first opened "显示此电脑/
+                                    // 显示网络/显示库" before its own menu replaced it.
+                                    .on_mouse_down(
+                                        MouseButton::Right,
+                                        cx.listener(|_, _, _, cx| cx.stop_propagation()),
                                     )
                                     .on_mouse_up(
                                         MouseButton::Right,
@@ -1758,6 +1771,34 @@ impl Explorer {
         }
         if list {
             body = body.flex_row().items_start().gap_4();
+        }
+        if grouped {
+            // The This PC page groups drives by type/name/size just like a
+            // folder; apply the group direction selected in the menu. "Kind"
+            // keeps Explorer's canonical order: devices first, network last.
+            let kind_rank = |title: &str| {
+                if title == rust_explorer::i18n::text("设备和驱动器") {
+                    0
+                } else if title == rust_explorer::i18n::text("便携设备") {
+                    1
+                } else if title == rust_explorer::i18n::text("网络位置") {
+                    2
+                } else {
+                    3
+                }
+            };
+            groups.sort_by(|a, b| {
+                let order = if self.group == "kind" {
+                    kind_rank(&a.0).cmp(&kind_rank(&b.0))
+                } else {
+                    rust_explorer::fs::natural_cmp(&a.0, &b.0)
+                };
+                if self.group_descending {
+                    order.reverse()
+                } else {
+                    order
+                }
+            });
         }
         if details {
             let mut header = div()

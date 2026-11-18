@@ -12,9 +12,16 @@ pub struct LaunchRequest {
 }
 
 fn canonical(path: &Path) -> Result<PathBuf> {
-    let path = path
-        .canonicalize()
-        .with_context(|| format!("找不到项目：{}", path.display()))?;
+    let path = match path.canonicalize() {
+        Ok(path) => path,
+        // RAM disks and some virtual filesystems reject GetFinalPathNameByHandle
+        // with ERROR_INVALID_FUNCTION even though the path exists. Keep the
+        // absolute spelling instead of refusing to open the folder.
+        Err(_) if path.exists() => std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("找不到项目：{}", path.display()));
+        }
+    };
     let text = path.to_string_lossy();
     Ok(if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         PathBuf::from(format!(r"\\{unc}"))
