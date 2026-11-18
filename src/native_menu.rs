@@ -104,6 +104,7 @@ pub(super) struct Options {
     pub sort: String,
     pub descending: bool,
     pub group: String,
+    pub group_descending: bool,
     pub undo: bool,
     pub redo: bool,
     pub folder: bool,
@@ -129,7 +130,11 @@ impl Builder {
                 menu,
                 MF_STRING
                     | if checked { MF_CHECKED } else { MF_UNCHECKED }
-                    | if enabled { MF_ENABLED } else { MF_GRAYED },
+                    | if enabled {
+                        MF_ENABLED
+                    } else {
+                        MF_GRAYED | MF_DISABLED
+                    },
                 id,
                 PCWSTR(super::wide(title).as_ptr()),
             )?;
@@ -150,7 +155,13 @@ impl Builder {
             InsertMenuW(
                 menu,
                 position,
-                MF_BYPOSITION | MF_STRING | if enabled { MF_ENABLED } else { MF_GRAYED },
+                MF_BYPOSITION
+                    | MF_STRING
+                    | if enabled {
+                        MF_ENABLED
+                    } else {
+                        MF_GRAYED | MF_DISABLED
+                    },
                 id,
                 PCWSTR(super::wide(title).as_ptr()),
             )?;
@@ -287,6 +298,21 @@ pub(super) unsafe fn augment(
                     true,
                 )?;
             }
+            AppendMenuW(groups, MF_SEPARATOR, 0, PCWSTR::null())?;
+            builder.item(
+                groups,
+                crate::i18n::text("递增"),
+                "group-ascending",
+                !options.group_descending,
+                !options.group.is_empty(),
+            )?;
+            builder.item(
+                groups,
+                crate::i18n::text("递减"),
+                "group-descending",
+                options.group_descending,
+                !options.group.is_empty(),
+            )?;
             builder.root(
                 menu,
                 position,

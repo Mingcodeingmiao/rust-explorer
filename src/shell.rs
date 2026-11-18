@@ -437,6 +437,8 @@ pub enum Request {
         descending: bool,
         group: String,
         #[serde(default)]
+        group_descending: bool,
+        #[serde(default)]
         undo: bool,
         #[serde(default)]
         redo: bool,
@@ -479,6 +481,22 @@ pub enum Request {
         paths: Vec<PathBuf>,
         folder: PathBuf,
         menu_path: Vec<String>,
+        /// Position of each selected level among sibling items that share the
+        /// same visible title. 7-Zip exposes two "打开压缩包" entries (direct
+        /// open and the open-with-type cascade); titles alone cannot tell the
+        /// rebuilt menu which one the user clicked.
+        #[serde(default)]
+        menu_ordinals: Vec<u32>,
+        /// Canonical command verb (`GetCommandString`) of the selected leaf.
+        /// It is the extension's own stable name and disambiguates equal titles
+        /// across processes better than a temporary command id.
+        #[serde(default)]
+        menu_verb: String,
+        /// The selected menu was the Shell's "This PC" item menu, not an
+        /// ordinary file/folder menu. Rebuilding it as a folder background menu
+        /// loses provider commands such as "管理".
+        #[serde(default)]
+        computer: bool,
     },
     RenameComputer {
         dark: bool,
@@ -1015,6 +1033,7 @@ fn execute_menu_on_sta(request: Request) -> Result<String> {
             sort,
             descending,
             group,
+            group_descending,
             undo,
             redo,
             can_paste,
@@ -1034,6 +1053,7 @@ fn execute_menu_on_sta(request: Request) -> Result<String> {
                 sort,
                 descending,
                 group,
+                group_descending,
                 undo,
                 redo,
                 folder: false,
@@ -1081,6 +1101,7 @@ fn execute_menu_on_sta(request: Request) -> Result<String> {
                 sort: "name".into(),
                 descending: false,
                 group: String::new(),
+                group_descending: false,
                 undo: true,
                 redo: true,
                 folder: false,
@@ -1289,10 +1310,69 @@ mod protocol_tests {
             .unwrap();
             assert_eq!(
                 selected_menu_path(root.0, 73, 0),
-                Some(vec!["Extension".into(), "Compress...".into()])
+                Some(vec![
+                    MenuPathItem {
+                        label: "Extension".into(),
+                        ordinal: 0,
+                    },
+                    MenuPathItem {
+                        label: "Compress...".into(),
+                        ordinal: 0,
+                    },
+                ])
             );
             assert!(selected_menu_path(root.0, 74, 0).is_none());
         }
+    }
+
+    /// 7-Zip 在同一层提供两个“打开压缩包”条目（直接打开与按类型打开的级联）。
+    /// 重建菜单时只比较标题会得到两个候选；必须保留用户点击的是第几个。
+    #[test]
+    fn duplicate_menu_titles_keep_their_ordinal() {
+        unsafe {
+            let root = Popup(CreatePopupMenu().unwrap());
+            for id in 71..74 {
+                AppendMenuW(root.0, MF_STRING, id, PCWSTR(wide("打开压缩包").as_ptr())).unwrap();
+            }
+            assert_eq!(
+                selected_menu_path(root.0, 72, 0),
+                Some(vec![MenuPathItem {
+                    label: "打开压缩包".into(),
+                    ordinal: 1,
+                }])
+            );
+        }
+    }
+
+    #[test]
+    fn equal_titles_resolve_by_verb_then_ordinal() {
+        let candidate = |verb: &str| MenuCandidate {
+            position: 0,
+            id: 1,
+            submenu: HMENU::default(),
+            disabled: false,
+            verb: verb.into(),
+        };
+        let duplicates = [
+            candidate("sevenzipopen"),
+            candidate("sevenzip.openwithtype."),
+        ];
+        // The extension's canonical verb identifies the entry the user clicked.
+        assert_eq!(
+            choose_candidate(&duplicates, 0, "sevenzip.openwithtype."),
+            Some(1)
+        );
+        // Extensions without GetCommandString fall back to the recorded ordinal.
+        assert_eq!(choose_candidate(&duplicates, 1, ""), Some(1));
+        // A changed or differently named sibling must not be invoked silently.
+        assert_eq!(choose_candidate(&duplicates, 0, "different"), None);
+        assert_eq!(
+            choose_candidate(&[candidate(""), candidate("")], 1, "different"),
+            Some(1)
+        );
+        // A changed menu must not silently pick an unrelated command.
+        assert_eq!(choose_candidate(&duplicates, 5, ""), None);
+        assert_eq!(choose_candidate(&duplicates[..1], 5, ""), Some(0));
     }
 
     /// 回归测试：右键菜单必须留在应用进程内（见 `execute_controlled` 的警告）。
@@ -1306,6 +1386,9 @@ mod protocol_tests {
                 paths: vec![],
                 folder: PathBuf::from("C:\\"),
                 menu_path: vec!["Example".into()],
+                menu_ordinals: vec![0],
+                menu_verb: String::new(),
+                computer: false,
             }),
             "selected commands must use the cancellable operation lifecycle"
         );
@@ -1321,6 +1404,7 @@ mod protocol_tests {
             sort: "name".into(),
             descending: false,
             group: String::new(),
+            group_descending: false,
             undo: false,
             redo: false,
             can_paste: false,
@@ -1343,6 +1427,34 @@ mod protocol_tests {
         assert!(menu_owner(&computer).is_some());
         // 非菜单请求没有 owner，仍走一次性 helper（可取消）。
         assert!(menu_owner(&Request::Open { path }).is_none());
+    }
+
+    /// “此电脑”菜单必须按 item 菜单重建，否则 helper 会把它当成文件夹背景菜单，
+    /// “管理”等提供程序命令就不存在了。旧请求（无该字段）仍按普通项目菜单处理。
+    #[test]
+    fn registered_computer_menu_keeps_its_menu_kind() {
+        let request = Request::InvokeRegistered {
+            paths: vec![],
+            folder: PathBuf::from("::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"),
+            menu_path: vec!["管理(&G)".into()],
+            menu_ordinals: vec![0],
+            menu_verb: "manage".into(),
+            computer: true,
+        };
+        let encoded = serde_json::to_string(&request).unwrap();
+        let Request::InvokeRegistered { computer, .. } =
+            serde_json::from_str::<Request>(&encoded).unwrap()
+        else {
+            panic!("expected InvokeRegistered");
+        };
+        assert!(computer, "This PC command lost its menu kind");
+        let legacy = r#"{"InvokeRegistered":{"paths":[],"folder":"C:\\","menu_path":["管理"]}}"#;
+        let Request::InvokeRegistered { computer, .. } =
+            serde_json::from_str::<Request>(legacy).unwrap()
+        else {
+            panic!("expected InvokeRegistered");
+        };
+        assert!(!computer, "legacy requests must stay ordinary item menus");
     }
     #[test]
     fn format_targets_are_exact_drive_roots_and_failures_are_not_success() {
@@ -1591,7 +1703,12 @@ pub fn dispatch(request: Request) -> Result<()> {
                     .iter()
                     .filter(|path| !crate::shell_folder::is_shell_path(path))
                 {
-                    let source = std::fs::canonicalize(path)?;
+                    // Some virtual/RAM volumes reject GetFinalPathNameByHandle
+                    // with ERROR_INVALID_FUNCTION. The path is still a valid
+                    // source; fall back to the lexical absolute path instead of
+                    // failing the whole transfer. The containment check is best
+                    // effort on such volumes.
+                    let source = std::fs::canonicalize(path).unwrap_or_else(|_| path.clone());
                     anyhow::ensure!(
                         !target.starts_with(&source),
                         "不能将项目放入自身或其子文件夹"
@@ -1727,6 +1844,7 @@ pub fn dispatch(request: Request) -> Result<()> {
             sort,
             descending,
             group,
+            group_descending,
             undo,
             redo,
             can_paste,
@@ -1747,6 +1865,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                     sort,
                     descending,
                     group,
+                    group_descending,
                     undo,
                     redo,
                     folder: false,
@@ -1788,11 +1907,20 @@ pub fn dispatch(request: Request) -> Result<()> {
             paths,
             folder,
             menu_path,
+            menu_ordinals,
+            menu_verb,
+            computer,
         } => {
             anyhow::ensure!(!menu_path.is_empty(), "Missing registered menu command");
-            REGISTERED_SELECTION.with(|pending| *pending.borrow_mut() = Some(menu_path));
+            REGISTERED_SELECTION.with(|pending| {
+                *pending.borrow_mut() = Some(RegisteredSelection {
+                    path: menu_path,
+                    ordinals: menu_ordinals,
+                    verb: menu_verb,
+                });
+            });
             let result = context_menu_options(
-                &paths, &folder, 0, 0, None, false, false, false, None, false, None,
+                &paths, &folder, 0, 0, None, computer, false, false, None, false, None,
             );
             REGISTERED_SELECTION.with(|pending| pending.borrow_mut().take());
             result.map(|_| ())
@@ -1822,6 +1950,7 @@ pub fn dispatch(request: Request) -> Result<()> {
                     sort: "name".into(),
                     descending: false,
                     group: String::new(),
+                    group_descending: false,
                     undo: true,
                     redo: true,
                     folder: false,
@@ -2336,9 +2465,25 @@ pub fn clear_clipboard() {
     }
 }
 
+/// The third-party command the application asked the rebuilt menu to execute.
+/// Titles are the only cross-process identity the Shell menus share; `ordinals`
+/// and `verb` keep equal titles apart without reusing temporary command ids.
+#[derive(Clone, Debug)]
+struct RegisteredSelection {
+    path: Vec<String>,
+    ordinals: Vec<u32>,
+    verb: String,
+}
+/// One selected menu level: its visible title plus the zero-based position among
+/// siblings carrying that same normalized title.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MenuPathItem {
+    label: String,
+    ordinal: u32,
+}
 thread_local! {
-    static MENU:RefCell<Option<IContextMenu>>=const{RefCell::new(None)};
-    static REGISTERED_SELECTION: RefCell<Option<Vec<String>>> = const {RefCell::new(None)};
+    static MENU: RefCell<Option<IContextMenu>>=const{RefCell::new(None)};
+    static REGISTERED_SELECTION: RefCell<Option<RegisteredSelection>> = const {RefCell::new(None)};
 }
 unsafe extern "system" fn menu_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     // Trace every window message while a menu is up: a dismissal that is not our
@@ -2677,11 +2822,12 @@ fn selected_menu_label(popup: HMENU, command: u32, depth: u8) -> Option<String> 
     }
     None
 }
-fn selected_menu_path(popup: HMENU, command: u32, depth: u8) -> Option<Vec<String>> {
+fn selected_menu_path(popup: HMENU, command: u32, depth: u8) -> Option<Vec<MenuPathItem>> {
     if depth > 5 {
         return None;
     }
     unsafe {
+        let mut ordinals: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
         for index in 0..GetMenuItemCount(Some(popup)).clamp(0, 256) {
             let mut text = [0u16; 1024];
             let mut item = MENUITEMINFOW {
@@ -2694,19 +2840,24 @@ fn selected_menu_path(popup: HMENU, command: u32, depth: u8) -> Option<Vec<Strin
             if GetMenuItemInfoW(popup, index as u32, true, &mut item).is_err() {
                 continue;
             }
+            let label = String::from_utf16_lossy(
+                &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
+            );
+            // Remember which of several equally titled siblings this is. The
+            // rebuilt menu must not guess between "打开压缩包" (direct open) and
+            // "打开压缩包" (open-with-type cascade) by title alone.
+            let ordinal = {
+                let counter = ordinals.entry(normalized_menu_title(&label)).or_insert(0);
+                let ordinal = *counter;
+                *counter += 1;
+                ordinal
+            };
             if item.wID == command {
-                return Some(vec![String::from_utf16_lossy(
-                    &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
-                )]);
+                return Some(vec![MenuPathItem { label, ordinal }]);
             }
             if !item.hSubMenu.is_invalid() {
                 if let Some(mut path) = selected_menu_path(item.hSubMenu, command, depth + 1) {
-                    path.insert(
-                        0,
-                        String::from_utf16_lossy(
-                            &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
-                        ),
-                    );
+                    path.insert(0, MenuPathItem { label, ordinal });
                     return Some(path);
                 }
             }
@@ -2714,13 +2865,101 @@ fn selected_menu_path(popup: HMENU, command: u32, depth: u8) -> Option<Vec<Strin
     }
     None
 }
-unsafe fn registered_command_id(menu: &IContextMenu, popup: HMENU, path: &[String]) -> Result<u32> {
+/// One reconstructed entry of the selected menu level.
+struct MenuCandidate {
+    position: u32,
+    id: u32,
+    submenu: HMENU,
+    disabled: bool,
+    verb: String,
+}
+/// Pick the same entry the user clicked. Equal titles are common (7-Zip's two
+/// "打开压缩包" entries); the extension's canonical verb is the strongest
+/// cross-process identity, the ordinal among equal titles is the backup.
+fn choose_candidate(
+    candidates: &[MenuCandidate],
+    ordinal: u32,
+    expected_verb: &str,
+) -> Option<usize> {
+    match candidates.len() {
+        0 => None,
+        1 => Some(0),
+        _ => {
+            if !expected_verb.is_empty() {
+                let matches: Vec<usize> = candidates
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, candidate)| candidate.verb == expected_verb)
+                    .map(|(index, _)| index)
+                    .collect();
+                if matches.len() == 1 {
+                    return Some(matches[0]);
+                }
+            }
+            let ordinal = ordinal as usize;
+            if ordinal >= candidates.len() {
+                return None;
+            }
+            // Never invoke a sibling the extension itself names differently:
+            // that means the rebuilt menu no longer matches what the user saw.
+            if !expected_verb.is_empty()
+                && !candidates[ordinal].verb.is_empty()
+                && candidates[ordinal].verb != expected_verb
+            {
+                return None;
+            }
+            Some(ordinal)
+        }
+    }
+}
+/// Populate an extension-owned submenu before enumerating it. This mirrors
+/// `menu_proc` while the menu is displayed: IContextMenu3 first, then
+/// IContextMenu2. A handler that populates its submenu in `QueryContextMenu`
+/// (7-Zip does) legitimately answers E_NOTIMPL; that must never abort the
+/// selected command, only leave the already-populated submenu in place.
+unsafe fn initialize_submenu(menu: &IContextMenu, submenu: HMENU, position: u32) {
+    if let Ok(extension) = menu.cast::<IContextMenu3>() {
+        match unsafe {
+            extension.HandleMenuMsg2(
+                WM_INITMENUPOPUP,
+                WPARAM(submenu.0 as usize),
+                LPARAM(position as isize),
+                None,
+            )
+        } {
+            Ok(_) => return,
+            Err(error) => menu_trace(format!(
+                "menu: IContextMenu3 submenu init skipped for position {position}: {error}"
+            )),
+        }
+    }
+    if let Ok(extension) = menu.cast::<IContextMenu2>() {
+        if let Err(error) = unsafe {
+            extension.HandleMenuMsg(
+                WM_INITMENUPOPUP,
+                WPARAM(submenu.0 as usize),
+                LPARAM(position as isize),
+            )
+        } {
+            menu_trace(format!(
+                "menu: IContextMenu2 submenu init skipped for position {position}: {error}"
+            ));
+        }
+    }
+}
+unsafe fn registered_command_id(
+    menu: &IContextMenu,
+    popup: HMENU,
+    path: &[String],
+    ordinals: &[u32],
+    leaf_verb: &str,
+) -> Result<u32> {
     anyhow::ensure!(
         !path.is_empty() && path.len() <= 6,
         "Invalid menu command path"
     );
-    let mut found = Vec::new();
-    for index in 0..unsafe { GetMenuItemCount(Some(popup)) }.clamp(0, 256) {
+    let mut candidates = Vec::new();
+    for position in 0..unsafe { GetMenuItemCount(Some(popup)) }.clamp(0, 256) {
         let mut text = [0u16; 1024];
         let mut item = MENUITEMINFOW {
             cbSize: size_of::<MENUITEMINFOW>() as u32,
@@ -2729,50 +2968,51 @@ unsafe fn registered_command_id(menu: &IContextMenu, popup: HMENU, path: &[Strin
             cch: text.len() as u32,
             ..Default::default()
         };
-        unsafe { GetMenuItemInfoW(popup, index as u32, true, &mut item) }?;
+        unsafe { GetMenuItemInfoW(popup, position as u32, true, &mut item) }?;
         let label = String::from_utf16_lossy(
             &text[..text.iter().position(|c| *c == 0).unwrap_or(text.len())],
         );
         if normalized_menu_title(&label) == normalized_menu_title(&path[0]) {
-            found.push((index, item));
+            candidates.push(MenuCandidate {
+                position: position as u32,
+                id: item.wID,
+                submenu: item.hSubMenu,
+                disabled: item.fState.contains(MFS_DISABLED),
+                verb: canonical_verb(menu, item.wID),
+            });
         }
     }
     anyhow::ensure!(
-        found.len() == 1,
-        "Registered menu changed or command is ambiguous; reopen the menu"
+        !candidates.is_empty(),
+        "系统菜单已变化：没有找到所选命令，请重新打开菜单"
     );
-    let (index, item) = found.pop().unwrap();
+    let expected_verb = if path.len() == 1 { leaf_verb } else { "" };
+    let ordinal = ordinals.first().copied().unwrap_or(0);
+    let chosen = choose_candidate(&candidates, ordinal, expected_verb).with_context(|| {
+        format!(
+            "系统菜单已变化：无法唯一确定“{}”命令，请重新打开菜单",
+            path[0]
+        )
+    })?;
+    let candidate = &candidates[chosen];
     anyhow::ensure!(
-        !item.fState.contains(MFS_DISABLED),
-        "Registered menu command is disabled"
+        !candidate.disabled,
+        "系统菜单命令当前不可用，请重新打开菜单"
     );
     if path.len() == 1 {
         anyhow::ensure!(
-            item.hSubMenu.is_invalid() && (1..=0x6fff).contains(&item.wID),
+            candidate.submenu.is_invalid() && (1..=0x6fff).contains(&candidate.id),
             "Invalid registered menu command"
         );
-        return Ok(item.wID);
+        return Ok(candidate.id);
     }
-    anyhow::ensure!(!item.hSubMenu.is_invalid(), "Registered submenu is missing");
-    if let Ok(extension) = menu.cast::<IContextMenu3>() {
-        unsafe {
-            extension.HandleMenuMsg2(
-                WM_INITMENUPOPUP,
-                WPARAM(item.hSubMenu.0 as usize),
-                LPARAM(index as isize),
-                None,
-            )
-        }?;
-    } else if let Ok(extension) = menu.cast::<IContextMenu2>() {
-        unsafe {
-            extension.HandleMenuMsg(
-                WM_INITMENUPOPUP,
-                WPARAM(item.hSubMenu.0 as usize),
-                LPARAM(index as isize),
-            )
-        }?;
-    }
-    unsafe { registered_command_id(menu, item.hSubMenu, &path[1..]) }
+    anyhow::ensure!(
+        !candidate.submenu.is_invalid(),
+        "Registered submenu is missing"
+    );
+    unsafe { initialize_submenu(menu, candidate.submenu, candidate.position) };
+    let rest = ordinals.get(1..).unwrap_or(&[]);
+    unsafe { registered_command_id(menu, candidate.submenu, &path[1..], rest, leaf_verb) }
 }
 /// Shell's background Sharing submenu expects Explorer's IShellView site.
 /// Keep the system's parent label, but give its context-appropriate commands application
@@ -2906,19 +3146,8 @@ fn invoke_sharing_menu(path: &Path, remove: bool) -> Result<()> {
                 || (!parent_title.is_empty()
                     && normalized_menu_title(&label) == normalized_menu_title(&parent_title))
             {
-                if let Ok(extension) = menu.cast::<IContextMenu3>() {
-                    let _ = extension.HandleMenuMsg2(
-                        WM_INITMENUPOPUP,
-                        WPARAM(item.hSubMenu.0 as usize),
-                        LPARAM(index as isize),
-                        None,
-                    );
-                } else if let Ok(extension) = menu.cast::<IContextMenu2>() {
-                    let _ = extension.HandleMenuMsg(
-                        WM_INITMENUPOPUP,
-                        WPARAM(item.hSubMenu.0 as usize),
-                        LPARAM(index as isize),
-                    );
+                if !item.hSubMenu.is_invalid() {
+                    initialize_submenu(&menu, item.hSubMenu, index as u32);
                 }
                 entries = menu_entries(&menu, item.hSubMenu, 1);
                 break;
@@ -3016,24 +3245,7 @@ unsafe fn menu_entries(menu: &IContextMenu, popup: HMENU, depth: u8) -> Vec<Menu
             continue;
         }
         let children = if !item.hSubMenu.is_invalid() {
-            if let Ok(extension) = menu.cast::<IContextMenu3>() {
-                let _ = unsafe {
-                    extension.HandleMenuMsg2(
-                        WM_INITMENUPOPUP,
-                        WPARAM(item.hSubMenu.0 as usize),
-                        LPARAM(index as isize),
-                        None,
-                    )
-                };
-            } else if let Ok(extension) = menu.cast::<IContextMenu2>() {
-                let _ = unsafe {
-                    extension.HandleMenuMsg(
-                        WM_INITMENUPOPUP,
-                        WPARAM(item.hSubMenu.0 as usize),
-                        LPARAM(index as isize),
-                    )
-                };
-            }
+            unsafe { initialize_submenu(menu, item.hSubMenu, index as u32) };
             unsafe { menu_entries(menu, item.hSubMenu, depth + 1) }
         } else {
             Vec::new()
@@ -3347,8 +3559,16 @@ fn context_menu_options(
             return Ok(output);
         }
         if computer {
-            let native_quick_pin = (0..GetMenuItemCount(Some(popup.0)))
-                .any(|index| verbs.verb(GetMenuItemID(popup.0, index)) == "pintohome");
+            // "This PC" is a virtual root. A Quick Access pin for it is a dead
+            // link, so drop the provider entry and never add an application one.
+            for position in (0..GetMenuItemCount(Some(popup.0))).rev() {
+                if verbs.verb(GetMenuItemID(popup.0, position)) == "pintohome" {
+                    menu_trace(format!(
+                        "menu: removed pintohome from This PC menu at position {position}"
+                    ));
+                    DeleteMenu(popup.0, position as u32, MF_BYPOSITION)?;
+                }
+            }
             for (position, id, label) in [
                 (0, 0x8000, if expanded { "折叠" } else { "展开" }),
                 (1, 0x8001, "在新标签页中打开"),
@@ -3360,15 +3580,6 @@ fn context_menu_options(
                     MF_BYPOSITION | MF_STRING,
                     id,
                     PCWSTR(wide(label).as_ptr()),
-                )?;
-            }
-            if !native_quick_pin {
-                InsertMenuW(
-                    popup.0,
-                    3,
-                    MF_BYPOSITION | MF_STRING,
-                    0x8003,
-                    crate::i18n::wide("固定到快速访问"),
                 )?;
             }
             // Guarantee a rename entry: the window owns the name and shows its
@@ -3386,7 +3597,7 @@ fn context_menu_options(
             }
             InsertMenuW(
                 popup.0,
-                if native_quick_pin { 3 } else { 4 },
+                if native_rename { 3 } else { 4 },
                 MF_BYPOSITION | MF_SEPARATOR,
                 0,
                 PCWSTR::null(),
@@ -3431,8 +3642,14 @@ fn context_menu_options(
         }
         let started = std::time::Instant::now();
         let requested = REGISTERED_SELECTION.with(|pending| pending.borrow().clone());
-        let command = if let Some(path) = requested {
-            registered_command_id(&menu, popup.0, &path)?
+        let command = if let Some(selection) = requested {
+            registered_command_id(
+                &menu,
+                popup.0,
+                &selection.path,
+                &selection.ordinals,
+                &selection.verb,
+            )?
         } else {
             TrackPopupMenuEx(
                 popup.0,
@@ -3466,7 +3683,6 @@ fn context_menu_options(
                 0x8000 => Some("computer-expand"),
                 0x8001 => Some("computer-tab"),
                 0x8002 => Some("computer-window"),
-                0x8003 => Some("computer-pin"),
                 0x8005 => Some("computer-rename"),
                 _ => None,
             };
@@ -3517,7 +3733,10 @@ fn context_menu_options(
                 }
             }
             if computer && verb == "pintohome" {
-                emit!("command:computer-pin");
+                // "This PC" is a namespace root, not a folder: pinning it yields
+                // a Quick Access entry that cannot be opened. The item is also
+                // removed when the menu is built; never route this verb.
+                menu_trace("menu: ignored pintohome on This PC");
                 return Ok(output);
             }
             if computer && verb == "rename" {
@@ -3578,9 +3797,7 @@ fn context_menu_options(
                 crate::shell::copy_to_clipboard(paths, verb == "cut")?;
                 return Ok(output);
             }
-            if is_start_pin_verb(&verb)
-                || matches!(verb.as_str(), "format" | "print" | "share" | "burn")
-            {
+            if matches!(verb.as_str(), "format" | "print" | "share" | "burn") {
                 // Return the request to the UI so failures are displayed, instead
                 // of discarding them in an unobserved detached thread.
                 let request = Request::InvokeVerb {
@@ -3592,10 +3809,6 @@ fn context_menu_options(
                     verb: verb.clone(),
                 };
                 emit!("command:shell-verb:{}", serde_json::to_string(&request)?);
-                return Ok(output);
-            }
-            if is_start_pin_verb(&verb) && paths.len() == 1 {
-                invoke_start_pin(&paths[0], &verb, hwnd)?;
                 return Ok(output);
             }
             // `delete` and `paste` show a confirmation/progress dialog and, with
@@ -3611,12 +3824,15 @@ fn context_menu_options(
             // extension command crosses into the cancellable operation lifecycle:
             // extensions may block in InvokeCommand or keep modal windows alive.
             if app_owner.is_some() {
-                let menu_path = selected_menu_path(popup.0, command, 0)
+                let selection = selected_menu_path(popup.0, command, 0)
                     .context("Could not identify the selected registered command")?;
                 let request = Request::InvokeRegistered {
                     paths: paths.to_vec(),
                     folder: folder.to_path_buf(),
-                    menu_path,
+                    menu_path: selection.iter().map(|entry| entry.label.clone()).collect(),
+                    menu_ordinals: selection.iter().map(|entry| entry.ordinal).collect(),
+                    menu_verb: canonical_verb(&menu, command),
+                    computer,
                 };
                 emit!("command:shell-verb:{}", serde_json::to_string(&request)?);
                 return Ok(output);

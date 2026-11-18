@@ -95,7 +95,13 @@ fn shortcut_chain(
     bail!("快捷方式跳转层数过多")
 }
 fn canonical_directory(path: &Path) -> Result<PathBuf> {
-    let path = std::fs::canonicalize(path)?;
+    let path = match std::fs::canonicalize(path) {
+        Ok(path) => path,
+        // Some RAM/virtual volumes return ERROR_INVALID_FUNCTION here while the
+        // directory is perfectly usable by the Shell.
+        Err(_) if path.exists() => std::path::absolute(path)?,
+        Err(error) => return Err(error.into()),
+    };
     let text = path.to_string_lossy();
     if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
         Ok(PathBuf::from(format!(r"\\{unc}")))

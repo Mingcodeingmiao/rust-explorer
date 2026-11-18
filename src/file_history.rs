@@ -189,13 +189,30 @@ fn file_identity(path: &Path) -> Result<(u64, [u8; 16])> {
         .custom_flags(FILE_FLAG_BACKUP_SEMANTICS.0 | FILE_FLAG_OPEN_REPARSE_POINT.0)
         .open(path)?;
     let mut info = FILE_ID_INFO::default();
-    unsafe {
+    let queried = unsafe {
         GetFileInformationByHandleEx(
             HANDLE(file.as_raw_handle()),
             FileIdInfo,
             (&mut info as *mut FILE_ID_INFO).cast(),
             std::mem::size_of_val(&info) as u32,
-        )?;
+        )
+    };
+    if queried.is_err() {
+        // Network shares and some virtual filesystems return
+        // ERROR_INVALID_FUNCTION for FileIdInfo. Fall back to the legacy
+        // volume serial + file index so undo history does not reject an
+        // otherwise valid transfer.
+        let mut legacy = windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION::default();
+        unsafe {
+            windows::Win32::Storage::FileSystem::GetFileInformationByHandle(
+                HANDLE(file.as_raw_handle()),
+                &mut legacy,
+            )?;
+        }
+        let mut identifier = [0u8; 16];
+        identifier[..4].copy_from_slice(&legacy.nFileIndexHigh.to_le_bytes());
+        identifier[4..8].copy_from_slice(&legacy.nFileIndexLow.to_le_bytes());
+        return Ok((u64::from(legacy.dwVolumeSerialNumber), identifier));
     }
     Ok((info.VolumeSerialNumber, info.FileId.Identifier))
 }
