@@ -1,6 +1,8 @@
 param(
     [string]$BuildDirectory = 'dist\RustExplorer-windows-x64-native',
-    [string]$ReleaseLabel = ''
+    [string]$ReleaseLabel = '',
+    [switch]$StandaloneExe,
+    [string]$OutputDirectory = 'artifacts'
 )
 $ErrorActionPreference = 'Stop'
 $projectRoot = Split-Path -Parent $PSScriptRoot
@@ -15,7 +17,7 @@ if ($ReleaseLabel) {
 }
 $source = if ([IO.Path]::IsPathRooted($BuildDirectory)) { $BuildDirectory } else { Join-Path $projectRoot $BuildDirectory }
 if (-not (Test-Path -LiteralPath (Join-Path $source 'rust-explorer.exe'))) { throw 'Build the application first.' }
-$outputRoot = Join-Path $projectRoot 'artifacts'
+$outputRoot = if ([IO.Path]::IsPathRooted($OutputDirectory)) { $OutputDirectory } else { Join-Path $projectRoot $OutputDirectory }
 New-Item -ItemType Directory -Path $outputRoot -Force | Out-Null
 $staging = Join-Path $outputRoot ("package-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $staging | Out-Null
@@ -28,6 +30,7 @@ foreach ($name in @('README.md', 'README.en.md', 'LICENSE', 'NOTICE', 'THIRD_PAR
 }
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\pinyin-LICENSE.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\rusqlite-MIT.txt') -Destination $staging
+Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\licenses\zip-MIT.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\files-MIT.txt') -Destination $staging
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\LICENSE') -Destination (Join-Path $staging 'FluentUI-System-Icons-LICENSE.txt')
 Copy-Item -LiteralPath (Join-Path $projectRoot 'resources\fluent-icons\SOURCES.json') -Destination (Join-Path $staging 'FluentUI-System-Icons-SOURCES.json')
@@ -47,7 +50,16 @@ if ((Test-Path -LiteralPath (Join-Path $staging 'libgcc_s_seh-1.dll')) -or (Test
 $archive = Join-Path $outputRoot "RustExplorer-$version-windows-x64.zip"
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $archive -Force
 $hash = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
-[IO.File]::WriteAllText((Join-Path $outputRoot 'SHA256SUMS.txt'), "$hash  $([IO.Path]::GetFileName($archive))`n", [Text.UTF8Encoding]::new($false))
+$checksums = "$hash  $([IO.Path]::GetFileName($archive))`n"
+if ($StandaloneExe) {
+    # The official MSVC build embeds the app resources. Everything is optional.
+    $exeName = "RustExplorer-$version-windows-x64.exe"
+    $exe = Join-Path $outputRoot $exeName
+    Copy-Item -LiteralPath (Join-Path $source 'rust-explorer.exe') -Destination $exe -Force
+    $exeHash = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+    $checksums += "$exeHash  $exeName`n"
+}
+[IO.File]::WriteAllText((Join-Path $outputRoot 'SHA256SUMS.txt'), $checksums, [Text.UTF8Encoding]::new($false))
 Write-Host "Package: $archive"
 Write-Host "SHA256: $hash"
 Write-Host "Staging retained for inspection: $staging"

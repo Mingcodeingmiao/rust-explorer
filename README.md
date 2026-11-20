@@ -9,12 +9,12 @@
 
 <p align="center"><img src="docs/screenshot.jpg" width="880" alt="Rust Explorer 深色主题界面：多标签、面包屑地址栏、驱动器容量卡片、左侧导航树与状态栏"></p>
 
-**当前版本为 0.8.8。** 改进系统右键菜单兼容性、拖动提示与目标高亮，完善“此电脑”菜单和分组方向，并适配内存盘路径。[0.8.8 中文发行说明](docs/v0.8.8.md)
+**0.8.9** 加入便携 EXE 和一键更新，修复第三方菜单命令匹配、拖放计数及多窗口设置保存。[0.8.9 中文发行说明](docs/v0.8.9.md)
 
 > [!WARNING]
 > **Windows 原生右键菜单仍存在已知问题，尚未完全修复。** 部分 Windows 10 环境下文件菜单的深浅色或样式仍可能不一致；不同系统与 Shell 扩展的表现也可能不同。本次为阶段性更新，请勿视为菜单问题已全部解决。
 
-请完整解压 Windows x64 ZIP 并核对 `SHA256SUMS.txt`。升级前退出旧版。已启用文件夹关联时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer 0.8.8](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.8) · [恢复说明](docs/default-folder-browser.md)
+可以直接运行 Windows x64 EXE，也可以完整解压 ZIP 后运行。下载后请核对 `SHA256SUMS.txt`。已启用文件夹关联且需要迁移程序路径时，先恢复系统默认，再迁移并重新启用。[下载 Rust Explorer](https://github.com/Mingcodeingmiao/rust-explorer/releases/latest) · [恢复说明](docs/default-folder-browser.md)
 
 [English](README.en.md) · [下载 Releases](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [更新记录](CHANGELOG.md) · [已知边界](KNOWN_ISSUES.md)
 
@@ -26,7 +26,7 @@
 - 原生文件剪贴板、复制/移动/重命名/回收站操作，以及本程序事务的撤销/重做；本地文件通过 Windows OLE 与 Shell 协商拖放操作。MTP 删除为永久删除；可移动设备删除前检测回收站是否可用。
 - 真实 Windows Shell 完整菜单，保留系统提供的文件、目录、驱动器和背景菜单；文件夹菜单提供新标签页/新窗口打开，空白菜单提供粘贴。
 - 可选 Windows 完整系统菜单，显示已注册的第三方 Shell 命令；关闭对应选项后使用应用菜单，也可手动打开完整系统菜单。
-- 文件夹选项提供自动/手动检查更新、取消和 ZIP 下载，下载后验证 SHA-256，不会自动覆盖运行中的程序。
+- 在文件夹选项 → 常规点击“检查更新”。发现新版后，程序会下载并校验 ZIP、备份旧版 EXE、安装并重启。
 - 图片、视频单帧、PDF、字体与文件夹缩略图，链接箭头和隐藏文件半透明。
 - 明色/暗色/跟随系统主题、界面缩放和高 DPI 图标。
 - 可选 Everything 搜索；不可用时明确回退到当前文件夹名称筛选。

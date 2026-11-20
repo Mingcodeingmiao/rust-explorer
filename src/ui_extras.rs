@@ -547,30 +547,43 @@ fn menu_icon(id: &str) -> Option<&'static str> {
 }
 
 impl Explorer {
-    pub(super) fn check_for_updates(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn check_for_updates(&mut self, install: bool, cx: &mut Context<Self>) {
         if self.update_task.is_some() {
-            return;
+            if !install || self.update_installing {
+                return;
+            }
+            self.cancel_update(cx);
         }
-        self.update_status = rust_explorer::i18n::text("正在检查更新…").into();
+        self.update_status = rust_explorer::i18n::text(if install {
+            "正在检查更新，有新版时将下载并安装"
+        } else {
+            "正在检查更新…"
+        })
+        .into();
         let control = rust_explorer::updater::Control::default();
         self.update_control = Some(control.clone());
-        self.update_downloading = false;
+        self.update_installing = install;
         self.update_progress = None;
         let (send, receive) = std::sync::mpsc::channel();
         self.update_task = Some(receive);
         let worker = std::thread::Builder::new()
-            .name("release-check".into())
+            .name("release-update".into())
             .spawn(move || {
-                let result =
-                    std::panic::catch_unwind(|| rust_explorer::updater::check_with(&control))
-                        .map_err(|_| {
-                            rust_explorer::i18n::text("更新任务已结束，请重试").to_string()
+                use rust_explorer::updater;
+                let result = (|| {
+                    let available =
+                        updater::check_with(&control).map_err(|e| updater::error_message(&e))?;
+                    let Some(update) = available.as_ref().filter(|_| install) else {
+                        return Ok(UpdateResult::Checked(available));
+                    };
+                    let download = updater::download_verified(update, &control)
+                        .map_err(|e| updater::error_message(&e))?;
+                    updater::install::prepare(&download, &control)
+                        .map(UpdateResult::Prepared)
+                        .map_err(|error| {
+                            format!("{}: {error:#}", rust_explorer::i18n::text("安装更新失败"))
                         })
-                        .and_then(|result| {
-                            result
-                                .map(UpdateResult::Checked)
-                                .map_err(|error| rust_explorer::updater::error_message(&error))
-                        });
+                })();
                 let _ = send.send(result);
             });
         if worker.is_err() {
@@ -580,39 +593,17 @@ impl Explorer {
         cx.notify();
     }
 
-    fn download_update(&mut self, cx: &mut Context<Self>) {
-        if self.update_task.is_some() {
-            return;
-        }
-        let Some(update) = self.update_available.clone() else {
-            return;
-        };
-        self.update_status = rust_explorer::i18n::text("正在下载更新…").into();
-        let control = rust_explorer::updater::Control::default();
-        self.update_control = Some(control.clone());
-        self.update_downloading = true;
-        self.update_progress = None;
-        let (send, receive) = std::sync::mpsc::channel();
-        self.update_task = Some(receive);
-        let worker = std::thread::Builder::new()
-            .name("release-download".into())
-            .spawn(move || {
-                let result = std::panic::catch_unwind(|| {
-                    rust_explorer::updater::download_with(&update, &control)
-                })
-                .map_err(|_| rust_explorer::i18n::text("更新任务已结束，请重试").to_string())
-                .and_then(|result| {
-                    result
-                        .map(UpdateResult::Downloaded)
-                        .map_err(|error| rust_explorer::updater::error_message(&error))
-                });
-                let _ = send.send(result);
-            });
-        if worker.is_err() {
-            self.cancel_update(cx);
-            self.update_status = rust_explorer::i18n::text("更新任务已结束，请重试").into();
-        }
-        cx.notify();
+    pub(super) fn can_restart_for_update(&self, cx: &App) -> bool {
+        cx.windows().len() == 1
+            && !self.busy
+            && !self.association_busy
+            && !self.volume_busy
+            && !self.computer_name_busy
+            && !self.quick_access_busy
+            && !self.system_menu_active
+            && self.dialog.is_none()
+            && self.native_file_drag.is_none()
+            && self.right_file_drag.is_none()
     }
 
     fn cancel_update(&mut self, cx: &mut Context<Self>) {
@@ -621,7 +612,7 @@ impl Explorer {
         }
         // Detach the old receiver: a late result must not overwrite a newer check.
         self.update_task = None;
-        self.update_downloading = false;
+        self.update_installing = false;
         self.update_progress = None;
         self.update_status = rust_explorer::i18n::text("已取消更新操作").into();
         cx.notify();
@@ -1973,10 +1964,14 @@ impl Explorer {
             .child(div().min_w(ui(64.)).h_full().flex_1())
             .into_any_element()
     }
-    pub(super) fn save_settings(&self, cx: &mut Context<Self>) {
-        let mut settings = self.settings.clone();
+    pub(super) fn save_settings(&mut self, cx: &mut Context<Self>) {
+        let before = cx.global::<SharedSettings>().0.clone();
+        let mut settings = before.clone();
+        settings.merge_changes(&self.saved_settings, &self.settings);
+        self.saved_settings = self.settings.clone();
         settings.folder_views = cx.global::<SavedFolderViews>().0.clone();
-        settings.enqueue_save();
+        settings.enqueue_changes(before);
+        cx.global_mut::<SharedSettings>().0 = settings;
     }
     pub(super) fn rebuild_rows(&mut self) {
         shell::menu_trace(format!(
@@ -6001,7 +5996,9 @@ impl Explorer {
                 self.change_quick_access(self.paths(), true, cx);
             }
             "options" => {
-                self.options = Some(self.settings.clone());
+                self.options_baseline = cx.global::<SharedSettings>().0.clone();
+                self.options_baseline.folder_views.clear();
+                self.options = Some(self.options_baseline.clone());
                 self.options_page = 0;
                 self.reset_folder_views = false;
             }
@@ -6123,11 +6120,18 @@ impl Explorer {
         cx.notify();
     }
     fn apply_options(&mut self, close: bool, cx: &mut Context<Self>) {
-        if let Some(settings) = self.options.clone() {
+        if let Some(draft) = self.options.clone() {
             let reset = std::mem::take(&mut self.reset_folder_views);
+            let mut settings = cx.global::<SharedSettings>().0.clone();
+            settings.folder_views.clear();
+            self.saved_settings = settings.clone();
             if reset {
                 cx.global_mut::<SavedFolderViews>().0.clear();
+                settings = draft.clone();
+            } else {
+                settings.merge_changes(&self.options_baseline, &draft);
             }
+            self.options_baseline = draft;
             let remember_changed = settings.remember_views != self.settings.remember_views;
             let reload_listing = reset || settings.listing_requires_reload(&self.settings);
             let warm_menu = settings.full_system_menu && !self.settings.full_system_menu;
@@ -6397,7 +6401,7 @@ impl Explorer {
                 .child(
                     button("check-updates", rust_explorer::i18n::text("检查更新"), t)
                         .when(checking, |b| b.opacity(0.5))
-                        .on_click(cx.listener(|v, _, _, cx| v.check_for_updates(cx))),
+                        .on_click(cx.listener(|v, _, _, cx| v.check_for_updates(true, cx))),
                 );
             // Keep Cancel in the same position when a request completes, so a
             // late click cannot accidentally activate a newly shifted button.
@@ -6420,33 +6424,11 @@ impl Explorer {
                     cx.open_url("https://github.com/Mingcodeingmiao/rust-explorer/releases/latest")
                 })),
             );
-            if self.update_available.is_some() && self.update_file.is_none() {
-                updates = updates.child(
-                    button("download-update", rust_explorer::i18n::text("下载更新"), t)
-                        .when(checking, |b| b.opacity(0.5))
-                        .on_click(cx.listener(|v, _, _, cx| v.download_update(cx))),
-                );
-            }
-            if self.update_file.is_some() {
-                updates = updates.child(
-                    button(
-                        "open-update-download",
-                        rust_explorer::i18n::text("打开下载目录"),
-                        t,
-                    )
-                    .on_click(cx.listener(move |v, _, _, cx| {
-                        if let Some(path) = &v.update_file {
-                            let target = path.parent().unwrap_or(path).to_path_buf();
-                            v.run_shell(shell::Request::Open { path: target }, cx);
-                        }
-                    })),
-                );
-            }
             body = body.child(updates);
             if !self.update_status.is_empty() {
                 body = body.child(div().w_full().min_w_0().child(self.update_status.clone()));
             }
-            if self.update_downloading {
+            if self.update_installing {
                 if let Some((received, total)) = self.update_progress {
                     let label = if let Some(total) = total {
                         format!(
@@ -6472,7 +6454,7 @@ impl Explorer {
                 )));
             }
             body = body.child(div().w_full().min_w_0().text_color(rgb(t.muted)).child(
-                rust_explorer::i18n::text("自动检查仅检查版本；下载后请手动解压更新"),
+                rust_explorer::i18n::text("点击检查更新，发现新版后将自动下载、安装并重启"),
             ));
             if let Some(update) = &self.update_available {
                 body = body.child(div().child(format!("v{}", update.version)));

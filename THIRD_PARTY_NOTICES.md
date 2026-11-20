@@ -11,6 +11,7 @@ Rust Explorer's own code is distributed under [Apache-2.0](LICENSE). Dependencie
 | Windows Shell and Windows SDK | Native file operations, icons, menus, previews and OS bindings | System components are not licensed by this project or bundled as artwork. Runtime access uses the user's installed Windows resources. |
 | Other Rust dependencies | See the exact dependency graph in `Cargo.lock` | Each crate's published license applies. Use `cargo metadata --locked --format-version 1` to inspect dependency metadata and review license files before redistribution. |
 | [reqwest](https://github.com/seanmonstar/reqwest), version 0.12 | HTTPS release checks and verified package downloads, using rustls | MIT OR Apache-2.0; distributed here under Apache-2.0 (see `LICENSE`). Transitive dependencies retain their own licenses in their published crate metadata. |
+| [zip](https://github.com/zip-rs/zip2), version 9.8.0 | Reads the executable from the verified update ZIP | MIT; the full license is included in `resources/licenses/zip-MIT.txt`. |
 
 Binary packaging includes this file, `NOTICE`, `LICENSE`, and the pinyin notice. Include the Everything SDK notice when redistributing `Everything64.dll`. GNU builds may depend on GCC runtime libraries; their upstream terms, including applicable runtime exceptions, must also be reviewed when redistributing them. The automated Windows release workflow uses MSVC and does not package GCC DLLs.
 

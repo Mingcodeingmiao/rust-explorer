@@ -4,12 +4,12 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.8** improves system context-menu compatibility, drag feedback and target highlighting, completes This PC menus and group direction, and adapts RAM-disk paths. [0.8.8 release notes (Chinese)](docs/v0.8.8.md)
+Version **0.8.9** adds a standalone EXE and one-click updates. It also fixes third-party menu command matching, drag item counting, and settings saves across windows. [0.8.9 release notes (Chinese)](docs/v0.8.9.md)
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.
 
-Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old version before upgrading. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer 0.8.8](https://github.com/Mingcodeingmiao/rust-explorer/releases/tag/v0.8.8) · [Recovery guide](docs/default-folder-browser.md)
+Run the standalone Windows x64 EXE directly, or extract the entire ZIP. Verify the download against `SHA256SUMS.txt`. If folder associations are enabled, restore the system default before moving the app and re-enabling them. [Download Rust Explorer](https://github.com/Mingcodeingmiao/rust-explorer/releases/latest) · [Recovery guide](docs/default-folder-browser.md)
 
 ## Features
 
@@ -19,7 +19,7 @@ Fully extract the Windows x64 ZIP and verify `SHA256SUMS.txt`. Exit the old vers
 - Native clipboard/Shell operations, Windows OLE file drag and drop, and receipt-based undo/redo. MTP items are permanently deleted; removable drives are checked for a usable Recycle Bin first.
 - Actual Windows Shell menus for files, folders, drives and backgrounds, including paste in the background menu and open-in-tab/window for folders.
 - Optional full Windows Shell menus display registered third-party commands. Disable the preference to use application menus, or explicitly open the full system menu.
-- Automatic/manual update checks, cancellation and SHA-256-verified ZIP downloads in Folder Options. Downloads do not overwrite the running application.
+- Select **Check for updates** in Folder Options to download, verify, install, and restart when a new release is available. The previous executable is backed up before installation.
 - Asynchronous image, video-frame, PDF, font and folder thumbnails; shortcut arrows and translucent hidden items.
 - Light/dark/system themes, zoom, high-DPI icons and optional Everything integration.
 

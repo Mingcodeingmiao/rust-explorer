@@ -240,7 +240,7 @@ struct CrumbRow {
 
 enum UpdateResult {
     Checked(Option<rust_explorer::updater::Available>),
-    Downloaded(PathBuf),
+    Prepared(rust_explorer::updater::install::Prepared),
 }
 static AUTO_UPDATE_CHECK_STARTED: AtomicBool = AtomicBool::new(false);
 
@@ -249,15 +249,16 @@ struct Explorer {
     tooltip_generation: std::rc::Rc<std::cell::Cell<u64>>,
     update_task: Option<mpsc::Receiver<Result<UpdateResult, String>>>,
     update_control: Option<rust_explorer::updater::Control>,
-    update_downloading: bool,
+    update_installing: bool,
     update_progress: Option<(u64, Option<u64>)>,
     update_checked_at: Option<String>,
     update_available: Option<rust_explorer::updater::Available>,
-    update_file: Option<PathBuf>,
     update_status: String,
     marquee: Option<Marquee>,
     settings: Settings,
     options: Option<Settings>,
+    options_baseline: Settings,
+    saved_settings: Settings,
     reset_folder_views: bool,
     menu_action_hover: Option<&'static str>,
     options_page: usize,
@@ -469,6 +470,8 @@ impl Drop for Explorer {
 // Windows share the latest folder preferences, including changes still queued for disk.
 struct SavedFolderViews(FolderViews);
 impl Global for SavedFolderViews {}
+struct SharedSettings(Settings);
+impl Global for SharedSettings {}
 
 struct ListingPresentation {
     view: ViewMode,
@@ -637,13 +640,17 @@ impl Explorer {
         let folder_handler = std::env::args_os()
             .nth(1)
             .is_some_and(|a| a == "--open-folder");
-        let mut settings = Settings::load();
-        if !Settings::exists() {
+        let mut settings = if cx.has_global::<SharedSettings>() {
+            cx.global::<SharedSettings>().0.clone()
+        } else {
+            Settings::load()
+        };
+        let settings_before_startup = settings.clone();
+        if !cx.has_global::<SharedSettings>() && !Settings::exists() {
             // First launch: follow the Windows UI language. Chinese locales all
             // collapse to the Simplified Chinese catalog; unsupported languages
             // fall back to English inside `Language::system`.
             settings.language = rust_explorer::i18n::Language::system().tag().into();
-            settings.save();
         }
         if !cx.has_global::<SavedFolderViews>() {
             cx.set_global(SavedFolderViews(std::mem::take(&mut settings.folder_views)));
@@ -915,9 +922,12 @@ impl Explorer {
             }
             settings.quick_access_initialized = true;
             settings.quick_access_system_migrated = true;
-            settings.folder_views = cx.global::<SavedFolderViews>().0.clone();
-            settings.enqueue_save();
-            settings.folder_views.clear();
+        }
+        if !cx.has_global::<SharedSettings>() {
+            let mut snapshot = settings.clone();
+            snapshot.folder_views = cx.global::<SavedFolderViews>().0.clone();
+            snapshot.enqueue_changes(settings_before_startup);
+            cx.set_global(SharedSettings(snapshot));
         }
         let ListingPresentation {
             view,
@@ -935,15 +945,16 @@ impl Explorer {
             tooltip_generation: std::rc::Rc::new(std::cell::Cell::new(0)),
             update_task: None,
             update_control: None,
-            update_downloading: false,
+            update_installing: false,
             update_progress: None,
             update_checked_at: None,
             update_available: None,
-            update_file: None,
             update_status: String::new(),
             marquee: None,
             view,
             options: None,
+            options_baseline: settings.clone(),
+            saved_settings: settings.clone(),
             reset_folder_views: false,
             menu_action_hover: None,
             options_page: 0,
@@ -1137,7 +1148,7 @@ impl Explorer {
         });
         window.focus(&this.focus);
         if this.settings.check_updates && !AUTO_UPDATE_CHECK_STARTED.swap(true, Ordering::Relaxed) {
-            this.check_for_updates(cx);
+            this.check_for_updates(false, cx);
         }
         let launch_hwnd = native_hwnd(window);
         cx.spawn(async move |view, cx| {
@@ -1147,11 +1158,12 @@ impl Explorer {
                     .await;
                 if view
                     .update(cx, |this, cx| {
-                        if this.update_downloading {
+                        if this.update_installing {
                             let progress = this
                                 .update_control
                                 .as_ref()
-                                .map(|control| control.progress());
+                                .map(|control| control.progress())
+                                .filter(|(received, total)| *received > 0 || total.is_some());
                             if progress != this.update_progress {
                                 this.update_progress = progress;
                                 cx.notify();
@@ -1170,7 +1182,7 @@ impl Explorer {
                         if let Some(result) = update_result {
                             this.update_task = None;
                             this.update_control = None;
-                            this.update_downloading = false;
+                            this.update_installing = false;
                             this.update_progress = None;
                             match result {
                                 Ok(UpdateResult::Checked(available)) => {
@@ -1184,18 +1196,30 @@ impl Explorer {
                                     } else {
                                         rust_explorer::i18n::text("当前已是最新版本").into()
                                     };
-                                    if this.update_available.as_ref().map(|u| &u.filename)
-                                        != available.as_ref().map(|u| &u.filename)
-                                    {
-                                        this.update_file = None;
-                                    }
                                     this.update_available = available;
                                 }
-                                Ok(UpdateResult::Downloaded(path)) => {
-                                    this.update_file = Some(path);
-                                    this.update_status =
-                                        rust_explorer::i18n::text("下载完成，SHA-256 校验通过")
-                                            .into();
+                                Ok(UpdateResult::Prepared(update)) => {
+                                    if this.can_restart_for_update(cx) {
+                                        match update.start() {
+                                            Ok(writer) => {
+                                                // EOF must be caused by process exit, not
+                                                // by a local writer going out of scope.
+                                                std::mem::forget(writer);
+                                                cx.quit();
+                                            }
+                                            Err(error) => {
+                                                this.update_status = format!(
+                                                    "{}: {error}",
+                                                    rust_explorer::i18n::text("安装更新失败")
+                                                )
+                                            }
+                                        }
+                                    } else {
+                                        this.update_status = rust_explorer::i18n::text(
+                                            "请关闭其他窗口并等待文件操作完成后再安装",
+                                        )
+                                        .into();
+                                    }
                                 }
                                 Err(error) => this.update_status = error,
                             }

@@ -1,5 +1,19 @@
 # 更新检测与右键菜单修复（0.8.7）
 
+## 后续补充：在程序内安装更新
+
+在支持安装更新的版本中，打开**文件夹选项 → 常规**，点击**检查更新**即可。发现新版后，程序从 GitHub 下载、验证、安装并重启。可在安装前取消。请先关闭其他 Rust Explorer 窗口，等文件操作结束。安装目录须允许当前账号写入。启动时的自动检查会提示有无新版。
+
+本项目沿用 GitHub Releases 的稳定版 ZIP 与 SHA-256 校验文件，由独立更新进程在退出后替换 EXE。这适合现有便携包和默认文件夹关联所需的稳定 EXE 路径。Velopack 的完整方案适合采用其打包布局和发布索引的应用，MSIX App Installer 适合签名后的 MSIX 包。参考 [Velopack 更新流程](https://docs.velopack.io/integrating/overview) 与 [MSIX 更新设置](https://learn.microsoft.com/windows/msix/app-installer/update-settings)。
+
+GitHub API 限流时，版本检测回退到同仓库的官方最新发行链接。下载仍要求匹配当前版本标签、附件名称及其 SHA-256 校验值。
+
+安装只替换当前 EXE，保留同目录的其他文件和用户配置。升级前会重新核对下载包的 SHA-256，并把旧版保存在程序旁的 `.rust-explorer-update-…\previous-rust-explorer.exe`。如果新版启动失败或启动后立即退出，更新助手会尝试还原并启动旧版。需要手动恢复时，退出 Rust Explorer，将备份复制到原目录并改回原 EXE 文件名。
+
+支持该功能的 Windows 发布构建会同时产出 ZIP、可直接运行的独立 EXE 和 `SHA256SUMS.txt`。独立 EXE 可放在自选的可写目录中运行。发布时应一同上传 ZIP 和校验文件，供旧版本及程序内更新使用。0.8.8 正式版用户需要先手动换到包含安装功能的版本，之后即可在应用内安装后续更新。
+
+以下是 0.8.7 的原始实现和实测记录。
+
 ## 更新功能
 
 - 文件夹选项 → 常规：自动检查更新、手动检查更新、下载更新。
