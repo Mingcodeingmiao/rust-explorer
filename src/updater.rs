@@ -14,6 +14,14 @@ use std::{
 
 const REPOSITORY: &str = "Mingcodeingmiao/rust-explorer";
 const LIMIT: u64 = 512 * 1024 * 1024;
+pub mod install;
+
+#[derive(Debug)]
+pub struct Downloaded {
+    pub path: PathBuf,
+    pub(super) sha256: String,
+    pub(super) version: String,
+}
 
 #[derive(Clone, Default)]
 pub struct Control {
@@ -125,6 +133,13 @@ fn client() -> Result<reqwest::blocking::Client> {
         .timeout(Duration::from_secs(300))
         .https_only(true)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            // Inspect the stable-release permalink's first redirect ourselves.
+            if attempt.previous().first().is_some_and(|url| {
+                url.host_str() == Some("github.com")
+                    && url.path() == format!("/{REPOSITORY}/releases/latest")
+            }) {
+                return attempt.stop();
+            }
             if attempt.previous().len() >= 5 {
                 return attempt.error("Too many redirects");
             }
@@ -203,19 +218,50 @@ pub fn check() -> Result<Option<Available>> {
 
 pub fn check_with(control: &Control) -> Result<Option<Available>> {
     control.checkpoint()?;
-    let response = client()?
+    let client = client()?;
+    let response = client
         .get(format!(
             "https://api.github.com/repos/{REPOSITORY}/releases/latest"
         ))
         .header("Accept", "application/vnd.github+json")
         .timeout(Duration::from_secs(25))
         .send()?;
-    let selected = choose(
-        serde_json::from_str(&bounded_text(response)?)?,
-        env!("CARGO_PKG_VERSION"),
-    )?;
+    let current = env!("CARGO_PKG_VERSION");
+    let selected = if matches!(response.status().as_u16(), 403 | 429) {
+        control.checkpoint()?;
+        let latest = client
+            .get(format!("https://github.com/{REPOSITORY}/releases/latest"))
+            .timeout(Duration::from_secs(25))
+            .send()?;
+        ensure!(
+            latest.status().is_redirection(),
+            "GitHub latest release redirect is unavailable"
+        );
+        let location = latest
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .context("Missing latest release location")?
+            .to_str()?;
+        choose_permalink(location, current)?
+    } else {
+        choose(serde_json::from_str(&bounded_text(response)?)?, current)?
+    };
     control.checkpoint()?;
     Ok(selected)
+}
+
+fn choose_permalink(location: &str, current: &str) -> Result<Option<Available>> {
+    let prefix = format!("https://github.com/{REPOSITORY}/releases/tag/v");
+    let tag = location
+        .strip_prefix(&prefix)
+        .context("Unexpected latest release location")?;
+    let parsed = version(tag)?;
+    let expected = format!("{}.{}.{}", parsed[0], parsed[1], parsed[2]);
+    ensure!(tag == expected, "Unexpected latest release tag");
+    Ok((parsed > version(current)?).then(|| Available {
+        filename: format!("RustExplorer-{expected}-windows-x64.zip"),
+        version: expected,
+    }))
 }
 
 fn checksum(text: &str, name: &str) -> Result<String> {
@@ -270,6 +316,10 @@ fn copy_checked(
 }
 
 pub fn download_with(update: &Available, control: &Control) -> Result<PathBuf> {
+    Ok(download_verified(update, control)?.path)
+}
+
+pub fn download_verified(update: &Available, control: &Control) -> Result<Downloaded> {
     control.checkpoint()?;
     version(&update.version)?;
     let expected_name = format!("RustExplorer-{}-windows-x64.zip", update.version);
@@ -327,7 +377,11 @@ pub fn download_with(update: &Available, control: &Control) -> Result<PathBuf> {
         let _ = std::fs::remove_dir(&directory);
     }
     result?;
-    Ok(target)
+    Ok(Downloaded {
+        path: target,
+        sha256: expected,
+        version: update.version.clone(),
+    })
 }
 
 #[cfg(test)]
@@ -410,6 +464,27 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         std::fs::remove_dir(path.parent().unwrap()).unwrap();
     }
+    #[test]
+    fn latest_permalink_requires_the_official_stable_tag() {
+        let source = format!("https://github.com/{REPOSITORY}/releases/tag/");
+        assert!(
+            choose_permalink(&format!("{source}v1.2.3"), "1.2.3")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            choose_permalink(&format!("{source}v1.2.4"), "1.2.3")
+                .unwrap()
+                .unwrap()
+                .filename,
+            "RustExplorer-1.2.4-windows-x64.zip"
+        );
+        for tag in ["v1.2.4-beta", "v01.2.4", "v1.2.4?x=1", "v1.2.4/extra"] {
+            assert!(choose_permalink(&format!("{source}{tag}"), "1.2.3").is_err());
+        }
+        assert!(choose_permalink("https://example.com/releases/tag/v1.2.4", "1.2.3").is_err());
+    }
+
     #[test]
     fn stable_versions_and_checksums_are_strict() {
         assert!(version("0.8.10").unwrap() > version("v0.8.9").unwrap());

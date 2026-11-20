@@ -8,6 +8,45 @@ use std::sync::{OnceLock, mpsc};
 mod interaction_defaults_tests {
     use super::{FolderView, Settings, ViewMode};
     use crate::fs::Sort;
+
+    #[test]
+    fn stale_window_edits_preserve_other_changes_and_favorites() {
+        use std::path::PathBuf;
+        let base = Settings::default();
+        let mut first = base.clone();
+        first.theme = "dark".into();
+        first.favorites.push(PathBuf::from(r"C:\first"));
+        first
+            .folder_views
+            .insert(PathBuf::from(r"C:\first"), FolderView::default());
+        let mut second = base.clone();
+        second.preview = !base.preview;
+        second.favorites.push(PathBuf::from(r"C:\second"));
+        second
+            .folder_views
+            .insert(PathBuf::from(r"C:\second"), FolderView::default());
+
+        let mut saved = first.clone();
+        saved.merge_changes(&base, &second);
+        assert_eq!(saved.theme, "dark");
+        assert_eq!(saved.preview, second.preview);
+        assert_eq!(
+            saved.favorites,
+            [PathBuf::from(r"C:\first"), PathBuf::from(r"C:\second")]
+        );
+        assert_eq!(saved.folder_views.len(), 2);
+
+        let mut removed = first.clone();
+        removed.favorites.clear();
+        removed.folder_views.clear();
+        saved.merge_changes(&first, &removed);
+        assert_eq!(saved.favorites, [PathBuf::from(r"C:\second")]);
+        assert!(
+            saved
+                .folder_views
+                .contains_key(&PathBuf::from(r"C:\second"))
+        );
+    }
     use std::path::Path;
 
     #[test]
@@ -160,7 +199,7 @@ impl From<StoredFolderView> for FolderView {
 }
 
 enum SettingsWrite {
-    Save(Box<Settings>),
+    Change(Box<(Settings, Settings)>),
     Flush(mpsc::Sender<()>),
 }
 static SETTINGS_WRITER: OnceLock<mpsc::Sender<SettingsWrite>> = OnceLock::new();
@@ -285,6 +324,109 @@ impl Default for Settings {
     }
 }
 impl Settings {
+    /// Apply only changes made since the window (or dialog) took its snapshot.
+    pub fn merge_changes(&mut self, before: &Self, after: &Self) {
+        macro_rules! replace_changed {
+            ($($field:ident),+ $(,)?) => {$(
+                if before.$field != after.$field {
+                    self.$field = after.$field.clone();
+                }
+            )+};
+        }
+        replace_changed!(
+            language,
+            view,
+            extensions,
+            hidden,
+            protected,
+            checkboxes,
+            compact,
+            high_performance,
+            thumbnails,
+            immediate_thumbnails,
+            blank_double_click_up,
+            thumbnail_cache_directory,
+            wrap_names,
+            single_click,
+            shift_open_tab,
+            quick_access_new_tab,
+            new_tab_this_pc,
+            focus_existing_tab,
+            startup_page,
+            separate_process,
+            full_path,
+            preview,
+            details_pane,
+            folders_first,
+            remember_views,
+            check_updates,
+            columns,
+            recycle_columns,
+            search_columns,
+            volume_columns,
+            volume_sort,
+            volume_descending,
+            show_computer,
+            show_network,
+            show_libraries,
+            show_all_folders,
+            expand_current,
+            quick_access_initialized,
+            quick_access_system_migrated,
+            sidebar_width,
+            preview_width,
+            theme,
+            full_system_menu,
+        );
+        for path in before.folder_views.keys() {
+            if !after.folder_views.contains_key(path) {
+                self.folder_views.remove(path);
+            }
+        }
+        for (path, view) in &after.folder_views {
+            let previous = before.folder_views.get(path);
+            if previous == Some(view) {
+                continue;
+            }
+            let empty = FolderView::default();
+            let previous = previous.unwrap_or(&empty);
+            let current = self.folder_views.entry(path.clone()).or_default();
+            if previous.mode != view.mode {
+                current.mode = view.mode;
+            }
+            if previous.sort != view.sort {
+                current.sort = view.sort;
+            }
+            if previous.group != view.group {
+                current.group.clone_from(&view.group);
+            }
+            if previous.group_descending != view.group_descending {
+                current.group_descending = view.group_descending;
+            }
+        }
+        fn merge_paths(current: &mut Vec<PathBuf>, before: &[PathBuf], after: &[PathBuf]) {
+            if before == after {
+                return;
+            }
+            current.retain(|path| !before.contains(path) || after.contains(path));
+            for path in after {
+                if !before.contains(path) && !current.contains(path) {
+                    current.push(path.clone());
+                }
+            }
+        }
+        merge_paths(&mut self.favorites, &before.favorites, &after.favorites);
+        merge_paths(
+            &mut self.quick_access_hidden,
+            &before.quick_access_hidden,
+            &after.quick_access_hidden,
+        );
+        merge_paths(
+            &mut self.file_favorites,
+            &before.file_favorites,
+            &after.file_favorites,
+        );
+    }
     /// UI preferences should not re-enumerate a potentially slow network folder.
     pub fn listing_requires_reload(&self, previous: &Self) -> bool {
         self.hidden != previous.hidden
@@ -354,32 +496,65 @@ impl Settings {
             }
         }
     }
-    pub fn enqueue_save(&self) {
+    pub fn enqueue_changes(&self, before: Self) {
         let sender = SETTINGS_WRITER.get_or_init(|| {
             let (tx, rx) = mpsc::channel::<SettingsWrite>();
             std::thread::spawn(move || {
+                let mut pending = Vec::new();
                 while let Ok(first) = rx.recv() {
-                    let mut pending = None;
                     for request in std::iter::once(first).chain(rx.try_iter()) {
                         match request {
-                            SettingsWrite::Save(settings) => pending = Some(settings),
+                            SettingsWrite::Change(change) => pending.push(change),
                             SettingsWrite::Flush(done) => {
-                                if let Some(settings) = pending.take() {
-                                    settings.save();
-                                }
+                                Self::write_changes(&mut pending);
                                 let _ = done.send(());
                             }
                         }
                     }
-                    if let Some(settings) = pending {
-                        settings.save();
-                    }
+                    Self::write_changes(&mut pending);
                 }
             });
             tx
         });
-        let _ = sender.send(SettingsWrite::Save(Box::new(self.clone())));
+        let _ = sender.send(SettingsWrite::Change(Box::new((before, self.clone()))));
     }
+
+    fn write_changes(pending: &mut Vec<Box<(Self, Self)>>) {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+        if pending.is_empty() {
+            return;
+        }
+        let lock_path = Self::path().with_extension("lock");
+        if let Some(parent) = lock_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let _lock = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .share_mode(0)
+                .open(&lock_path)
+            {
+                Ok(lock) => break lock,
+                Err(error) if error.raw_os_error() == Some(32) && Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(15));
+                }
+                Err(error) => {
+                    eprintln!("Could not lock Rust Explorer settings: {error}");
+                    return;
+                }
+            }
+        };
+        let mut settings = Self::load();
+        for change in pending.drain(..) {
+            settings.merge_changes(&change.0, &change.1);
+        }
+        settings.save();
+    }
+
     pub fn flush_pending_saves() {
         if let Some(writer) = SETTINGS_WRITER.get() {
             let (done, flushed) = mpsc::channel();

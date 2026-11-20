@@ -24,11 +24,12 @@ jobs:
         run: ./scripts/build.ps1 -Release
       - name: Package binary, notices and checksum
         shell: pwsh
-        run: ./scripts/package.ps1
+        run: ./scripts/package.ps1 -StandaloneExe
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: RustExplorer-windows-x64
           path: |
             artifacts/RustExplorer-*-windows-x64.zip
+            artifacts/RustExplorer-*-windows-x64.exe
             artifacts/SHA256SUMS.txt
           if-no-files-found: error

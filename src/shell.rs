@@ -1368,11 +1368,19 @@ mod protocol_tests {
         assert_eq!(choose_candidate(&duplicates, 0, "different"), None);
         assert_eq!(
             choose_candidate(&[candidate(""), candidate("")], 1, "different"),
-            Some(1)
+            None
         );
         // A changed menu must not silently pick an unrelated command.
         assert_eq!(choose_candidate(&duplicates, 5, ""), None);
-        assert_eq!(choose_candidate(&duplicates[..1], 5, ""), Some(0));
+        assert_eq!(choose_candidate(&duplicates[..1], 5, ""), None);
+        assert_eq!(
+            choose_candidate(&duplicates[..1], 1, "sevenzip.openwithtype."),
+            None
+        );
+        assert_eq!(
+            choose_candidate(&duplicates[..1], 1, "sevenzipopen"),
+            Some(0)
+        );
     }
 
     /// 回归测试：右键菜单必须留在应用进程内（见 `execute_controlled` 的警告）。
@@ -2881,36 +2889,22 @@ fn choose_candidate(
     ordinal: u32,
     expected_verb: &str,
 ) -> Option<usize> {
-    match candidates.len() {
-        0 => None,
-        1 => Some(0),
-        _ => {
-            if !expected_verb.is_empty() {
-                let matches: Vec<usize> = candidates
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, candidate)| candidate.verb == expected_verb)
-                    .map(|(index, _)| index)
-                    .collect();
-                if matches.len() == 1 {
-                    return Some(matches[0]);
-                }
-            }
-            let ordinal = ordinal as usize;
-            if ordinal >= candidates.len() {
-                return None;
-            }
-            // Never invoke a sibling the extension itself names differently:
-            // that means the rebuilt menu no longer matches what the user saw.
-            if !expected_verb.is_empty()
-                && !candidates[ordinal].verb.is_empty()
-                && candidates[ordinal].verb != expected_verb
-            {
-                return None;
-            }
-            Some(ordinal)
-        }
+    let ordinal = ordinal as usize;
+    if expected_verb.is_empty() {
+        return candidates.get(ordinal).map(|_| ordinal);
     }
+    let mut matching = candidates
+        .iter()
+        .enumerate()
+        .filter(|(_, candidate)| candidate.verb == expected_verb);
+    let (index, _) = matching.next()?;
+    if matching.next().is_none() {
+        return Some(index);
+    }
+    candidates
+        .get(ordinal)
+        .filter(|candidate| candidate.verb == expected_verb)
+        .map(|_| ordinal)
 }
 /// Populate an extension-owned submenu before enumerating it. This mirrors
 /// `menu_proc` while the menu is displayed: IContextMenu3 first, then

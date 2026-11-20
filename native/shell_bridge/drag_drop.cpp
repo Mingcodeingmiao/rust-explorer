@@ -101,6 +101,16 @@ static bool same_volume(const std::wstring& source, const std::wstring& destinat
     return !source_drive.empty() &&
            _wcsicmp(source_drive.c_str(), destination_drive.c_str()) == 0;
 }
+static UINT hdrop_item_count(IDataObject* data) {
+    FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (FAILED(data->GetData(&format, &medium))) return 0;
+    const auto count = medium.tymed == TYMED_HGLOBAL && medium.hGlobal
+        ? DragQueryFileW(static_cast<HDROP>(medium.hGlobal), 0xFFFFFFFF, nullptr, 0)
+        : 0;
+    ReleaseStgMedium(&medium);
+    return count;
+}
 static bool read_hdrop_paths(IDataObject* data, std::vector<std::wstring>& paths) {
     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
     STGMEDIUM medium{};
@@ -198,7 +208,6 @@ class FileDropTarget final : public IDropTarget {
     // drags keep the standard Shell drag image.
     bool own_source_ = false;
     ULONGLONG last_force_ = 0;
-    unsigned dragged_count_ = 0;
 
     // GPUI only re-runs its element tree when it receives this message. Our own
     // drag has a 30 ms timer; external drags have none, so throttle here to let
@@ -302,13 +311,9 @@ public:
         if (!data || !effect) return E_POINTER;
         data_ = data; data_->AddRef();
         own_source_ = is_deferred_source(data);
-        std::vector<std::wstring> drag_paths;
-        dragged_count_ = read_hdrop_paths(data, drag_paths)
-            ? static_cast<unsigned>(drag_paths.size())
-            : 0;
         // The UI needs the item count for the operation label even when this is
         // a different window/process than the drag source.
-        resolve_(6, static_cast<float>(dragged_count_), 0, nullptr, 0, context_);
+        resolve_(6, static_cast<float>(hdrop_item_count(data)), 0, nullptr, 0, context_);
         const auto hr = locate(keys, point, effect);
         POINT p{point.x, point.y};
         if (helper_ && !own_source_) helper_->DragEnter(owner_, data, &p, *effect);
