@@ -3619,10 +3619,6 @@ impl Explorer {
                     }
                     cx.stop_propagation();
                     v.rename_token += 1;
-                    if e.modifiers.shift && !navigation::is_virtual(&v.dir()) {
-                        v.right_file_drag = None;
-                        return;
-                    }
                     let paths = if v.selected.contains(&index) {
                         v.paths()
                     } else {
@@ -3646,10 +3642,6 @@ impl Explorer {
                     v.rename_token += 1;
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);
-                    }
-                    if e.modifiers.shift && v.open_powershell_menu(e.position, cx) {
-                        v.right_file_drag = None;
-                        return;
                     }
                     if e.modifiers.shift {
                         v.system_menu(cx);
@@ -4452,18 +4444,6 @@ impl Explorer {
                     ]
                 }
             }
-            "shift-background-menu" | "shift-file-menu" => {
-                let base = kind.strip_prefix("shift-").expect("matched Shift menu");
-                let mut items = vec![
-                    MenuItem::new(
-                        "open-powershell",
-                        rust_explorer::i18n::text("在此处打开 PowerShell"),
-                    ),
-                    MenuItem::separator(),
-                ];
-                items.extend(self.menu_items(base, cx));
-                items
-            }
             "background-menu" => vec![
                 MenuItem::new("undo", rust_explorer::i18n::text("撤销    Ctrl+Z"))
                     .enable(!self.undo_stack.is_empty() && !self.busy),
@@ -4785,6 +4765,11 @@ impl Explorer {
                     items.push(MenuItem::separator());
                 }
                 items.extend([
+                    MenuItem::new(
+                        "open-powershell",
+                        rust_explorer::i18n::text("在此处打开 PowerShell"),
+                    )
+                    .enable(!navigation::is_virtual(&self.dir())),
                     MenuItem::new("zip", rust_explorer::i18n::text("压缩为 ZIP 文件")).enable(any),
                     MenuItem::new("undo", rust_explorer::i18n::text("撤销    Ctrl+Z"))
                         .enable(!self.undo_stack.is_empty() && !self.busy),
@@ -5405,6 +5390,25 @@ impl Explorer {
         .detach();
         cx.notify();
     }
+    pub(super) fn open_current_console(&mut self, console: shell::Console, cx: &mut Context<Self>) {
+        if navigation::is_virtual(&self.dir()) {
+            return;
+        }
+        let folder = self.dir();
+        let task = cx
+            .background_executor()
+            .spawn(async move { shell::open_console(&folder, console) });
+        cx.spawn(async move |this, cx| {
+            if let Err(error) = task.await {
+                let _ = this.update(cx, |view, cx| {
+                    view.error = Some(format!("{error:#}").into());
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     pub(super) fn menu_command(&mut self, id: &str, w: &mut Window, cx: &mut Context<Self>) {
         self.menu_action_hover = None;
         if let Some(payload) = id.strip_prefix("shell-verb:") {
@@ -5750,21 +5754,7 @@ impl Explorer {
                     self.delete_dialog(w, cx);
                 }
             }
-            "open-powershell" => {
-                let folder = self.dir();
-                let task = cx
-                    .background_executor()
-                    .spawn(async move { shell::open_powershell(&folder) });
-                cx.spawn(async move |this, cx| {
-                    if let Err(error) = task.await {
-                        let _ = this.update(cx, |view, cx| {
-                            view.error = Some(format!("{error:#}").into());
-                            cx.notify();
-                        });
-                    }
-                })
-                .detach();
-            }
+            "open-powershell" => self.open_current_console(shell::Console::PowerShell, cx),
             "system-menu" => self.system_menu(cx),
             "grant-access" | "remove-access" | "advanced-share" => {
                 let path = self

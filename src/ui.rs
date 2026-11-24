@@ -707,13 +707,24 @@ impl Explorer {
                         cx.notify();
                     }
                     InputEvent::Submit => {
+                        let text = input.read(cx).value();
+                        if text.trim().eq_ignore_ascii_case("cmd")
+                            && !navigation::is_virtual(&this.dir())
+                        {
+                            this.editing_address = false;
+                            this.address_candidates.clear();
+                            this.address_choice = None;
+                            window.focus(&this.focus);
+                            this.open_current_console(shell::Console::CommandPrompt, cx);
+                            cx.notify();
+                            return;
+                        }
                         if let Some(choice) = this.address_choice {
                             if let Some(candidate) = this.address_candidates.get(choice).cloned() {
                                 this.open_address_path(candidate.path, window, cx);
                                 return;
                             }
                         }
-                        let text = input.read(cx).value();
                         this.editing_address = false;
                         let typed = text.trim_matches('"').trim();
                         // Portable-device addresses are Shell namespace paths,
@@ -2897,24 +2908,6 @@ impl Explorer {
         ));
         self.submenu = None;
         cx.notify();
-    }
-    fn open_powershell_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
-        if navigation::is_virtual(&self.dir()) {
-            return false;
-        }
-        rust_explorer::file_tip::hide_current();
-        self.menu_action_hover = None;
-        self.submenu = None;
-        self.nested_submenu = None;
-        let kind = if self.selected.is_empty() {
-            "shift-background-menu"
-        } else {
-            "shift-file-menu"
-        };
-        self.context_origin = RenameSite::List;
-        self.popup = Some((kind.into(), position));
-        cx.notify();
-        true
     }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
         self.menu_action_hover = None;
@@ -5749,9 +5742,6 @@ impl Render for Explorer {
                             v.selected.clear();
                             v.clear_preview();
                             w.focus(&v.focus);
-                            if e.modifiers.shift && v.open_powershell_menu(e.position, cx) {
-                                return;
-                            }
                             if e.modifiers.shift {
                                 v.system_menu(cx);
                             } else {

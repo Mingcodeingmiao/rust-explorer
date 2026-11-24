@@ -3211,7 +3211,12 @@ pub fn active_window_owner() -> u64 {
     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow().0 as usize as u64 }
 }
 
-pub fn open_powershell(folder: &Path) -> Result<()> {
+pub enum Console {
+    PowerShell,
+    CommandPrompt,
+}
+
+pub fn open_console(folder: &Path, console: Console) -> Result<()> {
     use std::os::windows::{ffi::OsStringExt, process::CommandExt};
     use windows::Win32::System::Threading::CREATE_NEW_CONSOLE;
     let mut directory = [0; 260];
@@ -3222,13 +3227,51 @@ pub fn open_powershell(folder: &Path) -> Result<()> {
         length > 0 && length < directory.len(),
         "Cannot locate System32"
     );
-    let executable = PathBuf::from(std::ffi::OsString::from_wide(&directory[..length]))
-        .join(r"WindowsPowerShell\v1.0\powershell.exe");
-    std::process::Command::new(executable)
+    let (program, startup_arg) = match console {
+        Console::PowerShell => (r"WindowsPowerShell\v1.0\powershell.exe", "-NoLogo"),
+        Console::CommandPrompt => ("cmd.exe", "/d"),
+    };
+    let executable =
+        PathBuf::from(std::ffi::OsString::from_wide(&directory[..length])).join(program);
+    let mut command = std::process::Command::new(executable);
+    command
         .creation_flags(CREATE_NEW_CONSOLE.0)
-        .current_dir(folder)
-        .arg("-NoLogo")
-        .spawn()?;
+        .arg(startup_arg);
+    use std::path::{Component, Prefix};
+    match (console, folder.components().next()) {
+        (Console::CommandPrompt, Some(Component::Prefix(prefix)))
+            if matches!(prefix.kind(), Prefix::UNC(..) | Prefix::VerbatimUNC(..)) =>
+        {
+            use std::os::windows::ffi::OsStrExt;
+            // cmd.exe cannot start with a UNC working directory. Give pushd a
+            // fixed command line and pass the path in the child environment.
+            let path: Vec<_> = folder.as_os_str().encode_wide().collect();
+            anyhow::ensure!(
+                !path
+                    .iter()
+                    .any(|&unit| unit < 32 || unit == u16::from(b'"')),
+                "Invalid network directory"
+            );
+            let path = if matches!(prefix.kind(), Prefix::VerbatimUNC(..)) {
+                std::ffi::OsString::from_wide(
+                    &[u16::from(b'\\'), u16::from(b'\\')]
+                        .into_iter()
+                        .chain(path[8..].iter().copied())
+                        .collect::<Vec<_>>(),
+                )
+            } else {
+                folder.as_os_str().to_owned()
+            };
+            command
+                .env("RUST_EXPLORER_CMD_DIRECTORY", path)
+                .args(["/e:on", "/v:off", "/k"])
+                .raw_arg(r#"pushd "%RUST_EXPLORER_CMD_DIRECTORY%""#);
+        }
+        _ => {
+            command.current_dir(folder);
+        }
+    }
+    command.spawn()?;
     Ok(())
 }
 
