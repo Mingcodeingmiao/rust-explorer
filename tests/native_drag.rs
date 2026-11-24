@@ -134,4 +134,49 @@ fn transfer_fixture(root: &Path) {
             );
         }
     }
+    // An encoded MTP target need not expose an IDropTarget for our internal
+    // handoff. This sentinel is intentionally not a real device PIDL.
+    let source = root.join("mtp-handoff.txt");
+    std::fs::write(&source, b"MTP handoff fixture").unwrap();
+    for (target, keys, expected) in [
+        ("mtp:fixture", 0, 1),
+        ("mtp:fixture", 4, 2),
+        ("mtp:fixture", 12, 0),
+        ("mtp-root:fixture", 0, 0),
+    ] {
+        let mut effect = 0;
+        let mut queued = 0;
+        let hr = unsafe {
+            re_test_drop_handoff(
+                wide(&source).as_ptr(),
+                wide(Path::new(target)).as_ptr(),
+                keys,
+                &mut effect,
+                true,
+                &mut queued,
+            )
+        };
+        assert!(hr >= 0, "MTP handoff failed: 0x{:08X}", hr as u32);
+        assert_eq!(effect, expected);
+        assert_eq!(queued, u32::from(expected != 0));
+        assert!(source.exists());
+    }
+    // Optional read-only device smoke test. The callback queues nothing on
+    // disk or on the device, so this can use an existing portable-device item.
+    if let Some(device_item) = std::env::var_os("RE_OLE_TEST_MTP_ITEM") {
+        let mut effect = 0;
+        let mut queued = 0;
+        let hr = unsafe {
+            re_test_drop_handoff(
+                wide(Path::new(&device_item)).as_ptr(),
+                wide(&destination).as_ptr(),
+                0,
+                &mut effect,
+                true,
+                &mut queued,
+            )
+        };
+        assert!(hr >= 0, "MTP source drag failed: 0x{:08X}", hr as u32);
+        assert_eq!((effect, queued), (1, 1));
+    }
 }

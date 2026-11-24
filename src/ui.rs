@@ -2898,6 +2898,24 @@ impl Explorer {
         self.submenu = None;
         cx.notify();
     }
+    fn open_powershell_menu(&mut self, position: Point<Pixels>, cx: &mut Context<Self>) -> bool {
+        if navigation::is_virtual(&self.dir()) {
+            return false;
+        }
+        rust_explorer::file_tip::hide_current();
+        self.menu_action_hover = None;
+        self.submenu = None;
+        self.nested_submenu = None;
+        let kind = if self.selected.is_empty() {
+            "shift-background-menu"
+        } else {
+            "shift-file-menu"
+        };
+        self.context_origin = RenameSite::List;
+        self.popup = Some((kind.into(), position));
+        cx.notify();
+        true
+    }
     fn system_menu(&mut self, cx: &mut Context<Self>) {
         self.menu_action_hover = None;
         rust_explorer::shell::menu_trace(format!(
@@ -5731,6 +5749,9 @@ impl Render for Explorer {
                             v.selected.clear();
                             v.clear_preview();
                             w.focus(&v.focus);
+                            if e.modifiers.shift && v.open_powershell_menu(e.position, cx) {
+                                return;
+                            }
                             if e.modifiers.shift {
                                 v.system_menu(cx);
                             } else {
