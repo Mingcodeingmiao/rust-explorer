@@ -18,6 +18,7 @@ unsafe extern "C" {
         keys: u32,
         effect: *mut u32,
         marked: bool,
+        include_paths: bool,
         queued: *mut u32,
     ) -> i32;
 }
@@ -119,6 +120,7 @@ fn transfer_fixture(root: &Path) {
                 8,
                 &mut effect,
                 marked,
+                marked,
                 &mut queued,
             )
         };
@@ -138,11 +140,12 @@ fn transfer_fixture(root: &Path) {
     // handoff. This sentinel is intentionally not a real device PIDL.
     let source = root.join("mtp-handoff.txt");
     std::fs::write(&source, b"MTP handoff fixture").unwrap();
-    for (target, keys, expected) in [
-        ("mtp:fixture", 0, 1),
-        ("mtp:fixture", 4, 2),
-        ("mtp:fixture", 12, 0),
-        ("mtp-root:fixture", 0, 0),
+    for (target, keys, expected, include_paths) in [
+        ("mtp:fixture", 0, 1, true),
+        ("mtp:fixture", 0, 0, false),
+        ("mtp:fixture", 4, 2, true),
+        ("mtp:fixture", 12, 0, true),
+        ("mtp-root:fixture", 0, 0, true),
     ] {
         let mut effect = 0;
         let mut queued = 0;
@@ -153,6 +156,7 @@ fn transfer_fixture(root: &Path) {
                 keys,
                 &mut effect,
                 true,
+                include_paths,
                 &mut queued,
             )
         };
@@ -172,6 +176,7 @@ fn transfer_fixture(root: &Path) {
                 wide(&destination).as_ptr(),
                 0,
                 &mut effect,
+                true,
                 true,
                 &mut queued,
             )
