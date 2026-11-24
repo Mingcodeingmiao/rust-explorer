@@ -3619,6 +3619,10 @@ impl Explorer {
                     }
                     cx.stop_propagation();
                     v.rename_token += 1;
+                    if e.modifiers.shift && !navigation::is_virtual(&v.dir()) {
+                        v.right_file_drag = None;
+                        return;
+                    }
                     let paths = if v.selected.contains(&index) {
                         v.paths()
                     } else {
@@ -3642,6 +3646,10 @@ impl Explorer {
                     v.rename_token += 1;
                     if !v.selected.contains(&index) {
                         v.select(index, false, false, w, cx);
+                    }
+                    if e.modifiers.shift && v.open_powershell_menu(e.position, cx) {
+                        v.right_file_drag = None;
+                        return;
                     }
                     if e.modifiers.shift {
                         v.system_menu(cx);
@@ -4443,6 +4451,18 @@ impl Explorer {
                         MenuItem::new("grant-access", rust_explorer::i18n::text("特定用户…")),
                     ]
                 }
+            }
+            "shift-background-menu" | "shift-file-menu" => {
+                let base = kind.strip_prefix("shift-").expect("matched Shift menu");
+                let mut items = vec![
+                    MenuItem::new(
+                        "open-powershell",
+                        rust_explorer::i18n::text("在此处打开 PowerShell"),
+                    ),
+                    MenuItem::separator(),
+                ];
+                items.extend(self.menu_items(base, cx));
+                items
             }
             "background-menu" => vec![
                 MenuItem::new("undo", rust_explorer::i18n::text("撤销    Ctrl+Z"))
@@ -5729,6 +5749,21 @@ impl Explorer {
                 } else {
                     self.delete_dialog(w, cx);
                 }
+            }
+            "open-powershell" => {
+                let folder = self.dir();
+                let task = cx
+                    .background_executor()
+                    .spawn(async move { shell::open_powershell(&folder) });
+                cx.spawn(async move |this, cx| {
+                    if let Err(error) = task.await {
+                        let _ = this.update(cx, |view, cx| {
+                            view.error = Some(format!("{error:#}").into());
+                            cx.notify();
+                        });
+                    }
+                })
+                .detach();
             }
             "system-menu" => self.system_menu(cx),
             "grant-access" | "remove-access" | "advanced-share" => {

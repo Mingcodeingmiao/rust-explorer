@@ -3211,6 +3211,27 @@ pub fn active_window_owner() -> u64 {
     unsafe { windows::Win32::UI::Input::KeyboardAndMouse::GetActiveWindow().0 as usize as u64 }
 }
 
+pub fn open_powershell(folder: &Path) -> Result<()> {
+    use std::os::windows::{ffi::OsStringExt, process::CommandExt};
+    use windows::Win32::System::Threading::CREATE_NEW_CONSOLE;
+    let mut directory = [0; 260];
+    let length = unsafe {
+        windows::Win32::System::SystemInformation::GetSystemDirectoryW(Some(&mut directory))
+    } as usize;
+    anyhow::ensure!(
+        length > 0 && length < directory.len(),
+        "Cannot locate System32"
+    );
+    let executable = PathBuf::from(std::ffi::OsString::from_wide(&directory[..length]))
+        .join(r"WindowsPowerShell\v1.0\powershell.exe");
+    std::process::Command::new(executable)
+        .creation_flags(CREATE_NEW_CONSOLE.0)
+        .current_dir(folder)
+        .arg("-NoLogo")
+        .spawn()?;
+    Ok(())
+}
+
 #[derive(Serialize)]
 struct MenuEntry {
     label: String,

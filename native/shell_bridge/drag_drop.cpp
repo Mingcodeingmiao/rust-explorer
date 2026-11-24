@@ -1,6 +1,8 @@
 // OLE source and target are deliberately separate from context-menu dispatch.
 #include "OpenInFolder.h"
 #include <new>
+#include <algorithm>
+#include <cstring>
 #include <cstdio>
 #include <cwctype>
 #include <commctrl.h>
@@ -45,6 +47,87 @@ static bool is_deferred_source(IDataObject* data) {
     }
     ReleaseStgMedium(&medium);
     return supported;
+}
+// MTP data objects do not expose CF_HDROP. Carry the original application
+// paths separately so our destination can queue a PIDL-aware transfer.
+static CLIPFORMAT transfer_paths_format() {
+    return static_cast<CLIPFORMAT>(RegisterClipboardFormatW(L"RustExplorer.TransferPaths.v1"));
+}
+static void store_transfer_paths(IDataObject* data, const wchar_t* const* paths, unsigned count) {
+    std::wstring payload;
+    for (unsigned i = 0; i < count; ++i) {
+        payload.append(paths[i]);
+        payload.push_back(L'\0');
+    }
+    payload.push_back(L'\0');
+    FORMATETC format{transfer_paths_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    medium.tymed = TYMED_HGLOBAL;
+    const auto size = payload.size() * sizeof(wchar_t);
+    medium.hGlobal = GlobalAlloc(GMEM_MOVEABLE, size);
+    if (!medium.hGlobal) return;
+    auto buffer = GlobalLock(medium.hGlobal);
+    if (!buffer) { GlobalFree(medium.hGlobal); return; }
+    memcpy(buffer, payload.data(), size);
+    GlobalUnlock(medium.hGlobal);
+    if (FAILED(data->SetData(&format, &medium, TRUE))) ReleaseStgMedium(&medium);
+}
+static std::vector<std::wstring> read_transfer_paths(IDataObject* data) {
+    FORMATETC format{transfer_paths_format(), nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
+    STGMEDIUM medium{};
+    if (FAILED(data->GetData(&format, &medium))) return {};
+    struct Release { STGMEDIUM& medium; ~Release() { ReleaseStgMedium(&medium); } } release{medium};
+    std::vector<std::wstring> paths;
+    if (medium.tymed != TYMED_HGLOBAL || !medium.hGlobal) return paths;
+    const auto count = GlobalSize(medium.hGlobal) / sizeof(wchar_t);
+    auto buffer = static_cast<const wchar_t*>(GlobalLock(medium.hGlobal));
+    if (!buffer) return paths;
+    struct Unlock { HGLOBAL memory; ~Unlock() { GlobalUnlock(memory); } } unlock{medium.hGlobal};
+    for (size_t i = 0; i < count && buffer[i];) {
+        const auto end = std::find(buffer + i, buffer + count, L'\0');
+        if (end == buffer + count) return {};
+        paths.emplace_back(buffer + i, end);
+        i = static_cast<size_t>(end - buffer) + 1;
+    }
+    return paths;
+}
+static bool is_mtp_path(const std::wstring& path) {
+    return path.compare(0, 4, L"mtp:") == 0 || path.compare(0, 9, L"mtp-root:") == 0;
+}
+static HRESULT drag_pidl(const std::wstring& path, PIDLIST_ABSOLUTE* result) {
+    if (!is_mtp_path(path))
+        return SHParseDisplayName(path.c_str(), nullptr, result, 0, nullptr);
+
+    const size_t start = path[3] == L':' ? 4 : 9;
+    const size_t digits = path.size() - start;
+    if (digits < 4 || digits % 2) return E_INVALIDARG;
+    auto nibble = [](wchar_t code) {
+        if (code >= L'0' && code <= L'9') return code - L'0';
+        if (code >= L'a' && code <= L'f') return code - L'a' + 10;
+        if (code >= L'A' && code <= L'F') return code - L'A' + 10;
+        return -1;
+    };
+    std::vector<unsigned char> bytes(digits / 2);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        const auto high = nibble(path[start + i * 2]);
+        const auto low = nibble(path[start + i * 2 + 1]);
+        if (high < 0 || low < 0) return E_INVALIDARG;
+        bytes[i] = static_cast<unsigned char>(high * 16 + low);
+    }
+    size_t offset = 0;
+    while (offset + 2 <= bytes.size()) {
+        const size_t length = bytes[offset] | (bytes[offset + 1] << 8);
+        if (length == 0 && offset + 2 == bytes.size()) {
+            auto copy = CoTaskMemAlloc(bytes.size());
+            if (!copy) return E_OUTOFMEMORY;
+            memcpy(copy, bytes.data(), bytes.size());
+            *result = static_cast<PIDLIST_ABSOLUTE>(copy);
+            return S_OK;
+        }
+        if (length < 2 || length > bytes.size() - offset) break;
+        offset += length;
+    }
+    return E_INVALIDARG;
 }
 // Optimized Shell moves can return NONE even though the target already moved
 // the files. Use the logical effect for UI refresh only; NEVER rewrite the
@@ -141,7 +224,8 @@ static DWORD drop_effect(DWORD keys, const std::vector<std::wstring>& paths,
     if (control) return DROPEFFECT_COPY;
     if (shift) return DROPEFFECT_MOVE;
     for (const auto& path : paths) {
-        if (!same_volume(path, destination)) return DROPEFFECT_COPY;
+        if (is_mtp_path(path) || is_mtp_path(destination) || !same_volume(path, destination))
+            return DROPEFFECT_COPY;
     }
     return DROPEFFECT_MOVE;
 }
@@ -201,6 +285,8 @@ class FileDropTarget final : public IDropTarget {
     IDropTarget* target_ = nullptr;
     IDropTargetHelper* helper_ = nullptr;
     std::wstring path_;
+    std::vector<std::wstring> transfer_paths_;
+    bool mtp_source_ = false;
     std::vector<std::wstring> pending_;
     bool source_active_ = false;
     // Our own left drag already paints its GPUI preview/label. Suppress the
@@ -226,6 +312,8 @@ class FileDropTarget final : public IDropTarget {
     }
     void reset() {
         leave();
+        transfer_paths_.clear();
+        mtp_source_ = false;
         if (data_) { data_->Release(); data_ = nullptr; }
     }
     HRESULT locate(DWORD keys, POINTL point, DWORD* effect) {
@@ -237,11 +325,28 @@ class FileDropTarget final : public IDropTarget {
         const bool valid = resolve_(0, client.x / scale, client.y / scale,
                                    destination, 32768, context_) != 0;
         std::wstring next = valid ? destination : L"";
+        const bool mtp_target = is_mtp_path(next);
+        if (!next.empty() && !transfer_paths_.empty() && (mtp_source_ || mtp_target)) {
+            if (next != path_) { leave(); path_ = next; }
+            const auto chosen = drop_effect(keys, transfer_paths_, path_);
+            *effect = chosen != DROPEFFECT_LINK && (*effect & chosen) &&
+                allows_drop(transfer_paths_, path_, chosen) && path_.compare(0, 9, L"mtp-root:") != 0
+                ? chosen : DROPEFFECT_NONE;
+            return S_OK;
+        }
         if (next != path_) {
             leave();
             if (!next.empty()) {
                 ComPtr<IShellItem> item;
-                HRESULT hr = SHCreateItemFromParsingName(next.c_str(), nullptr, IID_PPV_ARGS(item.put()));
+                HRESULT hr;
+                if (mtp_target) {
+                    PIDLIST_ABSOLUTE id = nullptr;
+                    hr = drag_pidl(next, &id);
+                    if (SUCCEEDED(hr)) hr = SHCreateItemFromIDList(id, IID_PPV_ARGS(item.put()));
+                    CoTaskMemFree(id);
+                } else {
+                    hr = SHCreateItemFromParsingName(next.c_str(), nullptr, IID_PPV_ARGS(item.put()));
+                }
                 if (SUCCEEDED(hr)) hr = item->BindToHandler(nullptr, BHID_SFUIObject, IID_PPV_ARGS(&target_));
                 if (FAILED(hr)) { *effect = DROPEFFECT_NONE; return S_OK; }
                 path_ = next;
@@ -311,9 +416,19 @@ public:
         if (!data || !effect) return E_POINTER;
         data_ = data; data_->AddRef();
         own_source_ = is_deferred_source(data);
+        if (own_source_) {
+            try {
+                transfer_paths_ = read_transfer_paths(data);
+                mtp_source_ = std::any_of(transfer_paths_.begin(), transfer_paths_.end(), is_mtp_path);
+            } catch (...) {
+                reset();
+                *effect = DROPEFFECT_NONE;
+                return E_OUTOFMEMORY;
+            }
+        }
         // The UI needs the item count for the operation label even when this is
         // a different window/process than the drag source.
-        resolve_(6, static_cast<float>(hdrop_item_count(data)), 0, nullptr, 0, context_);
+        resolve_(6, static_cast<float>(transfer_paths_.empty() ? hdrop_item_count(data) : transfer_paths_.size()), 0, nullptr, 0, context_);
         const auto hr = locate(keys, point, effect);
         POINT p{point.x, point.y};
         if (helper_ && !own_source_) helper_->DragEnter(owner_, data, &p, *effect);
@@ -348,8 +463,8 @@ public:
         // and hand the transfer to the cancellable helper instead, then return
         // from Drop immediately.
         if (SUCCEEDED(hr) && drop_ && !path_.empty() && is_deferred_source(data)) {
-            std::vector<std::wstring> paths;
-            if (read_hdrop_paths(data, paths)) {
+            auto paths = std::move(transfer_paths_);
+            if (!paths.empty() || read_hdrop_paths(data, paths)) {
                 auto chosen = drop_effect(keys, paths, path_);
                 if (!(chosen & *effect) || !allows_drop(paths, path_, chosen)) chosen = DROPEFFECT_NONE;
                 if (chosen != DROPEFFECT_NONE) {
@@ -462,7 +577,9 @@ static HRESULT test_file_drop(const wchar_t* source, const wchar_t* destination,
     HWND hwnd = nullptr;
     HRESULT hr = E_FAIL;
     try {
-        hr = SHParseDisplayName(source, nullptr, &pidl, 0, nullptr);
+        const bool device_source = is_mtp_path(source);
+        if (device_source && (!handoff || !marked)) return E_INVALIDARG;
+        hr = drag_pidl(source, &pidl);
         if (SUCCEEDED(hr)) {
             ComPtr<IShellItemArray> items;
             PCIDLIST_ABSOLUTE ids[] = {pidl};
@@ -471,12 +588,15 @@ static HRESULT test_file_drop(const wchar_t* source, const wchar_t* destination,
                 ComPtr<IDataObject> data;
                 hr = items->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(data.put()));
                 if (SUCCEEDED(hr)) {
-                    if (marked) mark_deferred_source(data.get());
+                    if (marked) {
+                        mark_deferred_source(data.get());
+                        store_transfer_paths(data.get(), &source, 1);
+                    }
                     // Explorer and many third-party apps consume CF_HDROP.
                     FORMATETC format{CF_HDROP, nullptr, DVASPECT_CONTENT, -1, TYMED_HGLOBAL};
                     STGMEDIUM medium{};
-                    hr = data->GetData(&format, &medium);
-                    if (SUCCEEDED(hr)) {
+                    if (!device_source) hr = data->GetData(&format, &medium);
+                    if (!device_source && SUCCEEDED(hr)) {
                         const auto count = DragQueryFileW(reinterpret_cast<HDROP>(medium.hGlobal), 0xFFFFFFFF, nullptr, 0);
                         ReleaseStgMedium(&medium);
                         if (count != 1) hr = E_FAIL;
@@ -544,7 +664,7 @@ extern "C" HRESULT re_drag_files(HWND owner, const wchar_t* const* paths, unsign
             ids.resize(count, nullptr);
             hr = S_OK;
             for (unsigned i = 0; i < count && SUCCEEDED(hr); ++i)
-                hr = SHParseDisplayName(paths[i], nullptr, &ids[i], 0, nullptr);
+                hr = drag_pidl(paths[i], &ids[i]);
             drag_trace("pidls parsed");
             if (SUCCEEDED(hr)) {
                 ComPtr<IShellItemArray> items;
@@ -555,6 +675,7 @@ extern "C" HRESULT re_drag_files(HWND owner, const wchar_t* const* paths, unsign
                     hr = items->BindToHandler(nullptr, BHID_DataObject, IID_PPV_ARGS(data.put()));
                     drag_trace("data object created");
                     if (SUCCEEDED(hr)) {
+                        store_transfer_paths(data.get(), paths, count);
                         mark_deferred_source(data.get());
                         ComPtr<IDropSource> source;
                         *source.put() = new FileDropSource();
