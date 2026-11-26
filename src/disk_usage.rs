@@ -8,45 +8,62 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
 };
+static REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub fn revision() -> u64 {
+    REVISION.load(Ordering::Acquire)
+}
+
 pub const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
-const CACHE_LIMIT: usize = 4096;
 #[derive(Default)]
 struct Cache {
-    epoch: u64,
-    entries: HashMap<PathBuf, (Instant, Usage)>,
+    serial: u64,
+    next_expiry: Option<Instant>,
+    entries: HashMap<PathBuf, Usage>,
+    in_flight: HashMap<PathBuf, u64>,
 }
 impl Cache {
+    fn prune(&mut self, now: Instant) {
+        if self.next_expiry.is_some_and(|expiry| now >= expiry) {
+            self.entries.retain(|_, usage| !usage.expired(now));
+            self.next_expiry = self
+                .entries
+                .values()
+                .filter_map(|usage| usage.expires_at)
+                .min();
+        }
+    }
     fn get(&mut self, path: &Path, now: Instant) -> Option<Usage> {
-        if self
-            .entries
-            .get(path)
-            .is_some_and(|(when, _)| now.saturating_duration_since(*when) < CACHE_TTL)
-        {
-            return self.entries.get(path).map(|(_, usage)| usage.clone());
+        self.prune(now);
+        if let Some(usage) = self.entries.get(path).filter(|usage| !usage.expired(now)) {
+            return Some(usage.clone());
         }
         self.entries.remove(path);
         None
     }
-    fn put(&mut self, path: PathBuf, usage: Usage, now: Instant, epoch: u64) {
-        if !usage.complete || epoch != self.epoch {
-            return;
+    fn begin(&mut self, path: &Path) -> u64 {
+        self.serial = self.serial.wrapping_add(1);
+        self.in_flight.insert(path.to_path_buf(), self.serial);
+        self.serial
+    }
+    fn invalidate(&mut self, path: &Path) {
+        self.entries.remove(path);
+        self.in_flight.remove(path);
+    }
+    fn finish(&mut self, path: &Path, usage: &Usage, now: Instant, serial: u64) -> bool {
+        if self.in_flight.get(path) != Some(&serial) {
+            return false;
         }
-        self.entries
-            .retain(|_, (when, _)| now.saturating_duration_since(*when) < CACHE_TTL);
-        if self.entries.len() >= CACHE_LIMIT {
-            if let Some(oldest) = self
-                .entries
-                .iter()
-                .min_by_key(|(_, (when, _))| *when)
-                .map(|(path, _)| path.clone())
-            {
-                self.entries.remove(&oldest);
-            }
+        self.in_flight.remove(path);
+        if let Some(expiry) = usage.expires_at.filter(|_| usage.complete) {
+            self.prune(now);
+            self.next_expiry = Some(self.next_expiry.map_or(expiry, |next| next.min(expiry)));
+            self.entries.insert(path.to_path_buf(), usage.clone());
         }
-        self.entries.insert(path, (now, usage));
+        true
     }
 }
 fn cache() -> &'static Mutex<Cache> {
@@ -68,44 +85,51 @@ pub fn cached_sizes<'a>(paths: impl Iterator<Item = &'a Path>) -> HashMap<PathBu
 /// Refresh the displayed directories while retaining unrelated cached totals.
 pub fn invalidate_paths<'a>(paths: impl Iterator<Item = &'a Path>) {
     let mut cache = cache().lock().unwrap();
-    cache.epoch = cache.epoch.wrapping_add(1);
     for path in paths {
-        cache.entries.remove(path);
+        cache.invalidate(path);
     }
+    REVISION.fetch_add(1, Ordering::Release);
 }
 /// Shared across windows in this process. Cancelled traversals never enter the cache.
-pub fn calculate_cached(path: &Path, cancel: &Arc<AtomicBool>) -> (Usage, bool) {
+pub fn calculate_cached(path: &Path, cancel: &Arc<AtomicBool>) -> Option<(Usage, bool)> {
     if cancel.load(Ordering::Relaxed) {
-        return (Usage::default(), false);
+        return None;
     }
-    let epoch = {
+    let serial = {
         let mut cache = cache().lock().unwrap();
         if let Some(usage) = cache.get(path, Instant::now()) {
-            return (usage, true);
+            return Some((usage, true));
         }
-        cache.epoch
+        cache.begin(path)
     };
-    let usage = calculate(path, cancel);
-    if !cancel.load(Ordering::Relaxed) {
-        cache()
-            .lock()
-            .unwrap()
-            .put(path.to_path_buf(), usage.clone(), Instant::now(), epoch);
+    let mut usage = calculate(path, cancel);
+    let now = Instant::now();
+    if cancel.load(Ordering::Relaxed) {
+        usage.complete = false;
     }
-    (usage, false)
-}
-/// Explicit file mutations invalidate old totals, including in-flight traversals.
-pub fn invalidate_cache() {
+    if usage.complete {
+        usage.expires_at = Some(now + CACHE_TTL);
+    }
     let mut cache = cache().lock().unwrap();
-    cache.epoch = cache.epoch.wrapping_add(1);
-    cache.entries.clear();
+    if !cache.finish(path, &usage, now, serial) || !usage.complete {
+        return None;
+    }
+    REVISION.fetch_add(1, Ordering::Release);
+    Some((usage, false))
 }
-#[derive(Clone, Debug, Default)]
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Usage {
     pub bytes: u64,
     pub files: u64,
     pub skipped: u64,
     pub complete: bool,
+    pub expires_at: Option<Instant>,
+}
+impl Usage {
+    pub fn expired(&self, now: Instant) -> bool {
+        self.expires_at.is_some_and(|expiry| now >= expiry)
+    }
 }
 fn reparse(m: &std::fs::Metadata) -> bool {
     #[cfg(windows)]
@@ -176,16 +200,14 @@ mod tests {
         let mut cache = Cache::default();
         let now = Instant::now();
         let path = PathBuf::from("test-cache-entry");
-        cache.put(
-            path.clone(),
-            Usage {
-                bytes: 17,
-                complete: true,
-                ..Default::default()
-            },
-            now,
-            0,
-        );
+        let serial = cache.begin(&path);
+        let usage = Usage {
+            bytes: 17,
+            complete: true,
+            expires_at: Some(now + CACHE_TTL),
+            ..Default::default()
+        };
+        cache.finish(&path, &usage, now, serial);
         assert_eq!(
             cache
                 .get(&path, now + CACHE_TTL - Duration::from_secs(1))
@@ -194,19 +216,24 @@ mod tests {
             17
         );
         assert!(cache.get(&path, now + CACHE_TTL).is_none());
-        cache.put(path.clone(), Usage::default(), now, 0);
+        let serial = cache.begin(&path);
+        cache.finish(&path, &Usage::default(), now, serial);
         assert!(cache.get(&path, now).is_none());
-        cache.epoch = 1;
-        cache.put(
-            path.clone(),
-            Usage {
-                complete: true,
-                ..Default::default()
-            },
-            now,
-            0,
-        );
+        let serial = cache.begin(&path);
+        cache.invalidate(&path);
+        assert!(!cache.finish(&path, &usage, now, serial));
         assert!(cache.get(&path, now).is_none());
+
+        let serial = cache.begin(&path);
+        cache.invalidate(Path::new("unrelated"));
+        cache.finish(&path, &usage, now, serial);
+        assert_eq!(cache.get(&path, now).unwrap().bytes, 17);
+        for index in 0..4096 {
+            let extra = PathBuf::from(format!("entry-{index}"));
+            let serial = cache.begin(&extra);
+            cache.finish(&extra, &usage, now, serial);
+        }
+        assert_eq!(cache.get(&path, now).unwrap().bytes, 17);
     }
     #[test]
     fn cached_traversal_reuses_totals_until_invalidated() {
@@ -215,12 +242,11 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let file = root.join("fixture");
         let cancel = Arc::new(AtomicBool::new(false));
-        invalidate_cache();
         std::fs::write(&file, [0; 17]).unwrap();
-        let (first, hit) = calculate_cached(&root, &cancel);
+        let (first, hit) = calculate_cached(&root, &cancel).unwrap();
         assert_eq!((first.bytes, hit), (17, false));
         std::fs::write(&file, [0; 29]).unwrap();
-        let (cached, hit) = calculate_cached(&root, &cancel);
+        let (cached, hit) = calculate_cached(&root, &cancel).unwrap();
         assert_eq!((cached.bytes, hit), (17, true));
         assert_eq!(
             cached_sizes(std::iter::once(root.as_path()))[&root].bytes,
@@ -229,16 +255,18 @@ mod tests {
         let other = root.join("unrelated");
         {
             let mut cache = cache().lock().unwrap();
-            let epoch = cache.epoch;
-            cache.put(
-                other.clone(),
-                Usage {
+            let now = Instant::now();
+            let serial = cache.begin(&other);
+            cache.finish(
+                &other,
+                &Usage {
                     bytes: 5,
                     complete: true,
+                    expires_at: Some(now + CACHE_TTL),
                     ..Default::default()
                 },
-                Instant::now(),
-                epoch,
+                now,
+                serial,
             );
         }
         invalidate_paths(std::iter::once(root.as_path()));
@@ -247,10 +275,10 @@ mod tests {
             cached_sizes(std::iter::once(other.as_path()))[&other].bytes,
             5
         );
-        let (updated, hit) = calculate_cached(&root, &cancel);
+        let (updated, hit) = calculate_cached(&root, &cancel).unwrap();
         assert_eq!((updated.bytes, hit), (29, false));
         cancel.store(true, Ordering::Relaxed);
-        assert!(!calculate_cached(&root, &cancel).0.complete);
+        assert!(calculate_cached(&root, &cancel).is_none());
         std::fs::remove_file(file).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

@@ -417,12 +417,21 @@ impl Explorer {
         items
     }
     pub(super) fn refresh_volumes(&mut self, cx: &mut Context<Self>) {
+        self.query_volumes(false, cx);
+    }
+
+    pub(super) fn force_refresh_volumes(&mut self, cx: &mut Context<Self>) {
+        self.query_volumes(true, cx);
+    }
+
+    fn query_volumes(&mut self, force: bool, cx: &mut Context<Self>) {
         if self.volume_busy {
+            self.volume_refresh_pending |= force;
             return;
         }
         // A window opened later reuses the snapshot this process already took, so its
         // sidebar appears immediately instead of re-enumerating every drive.
-        if self.volumes.is_empty() {
+        if !force && self.volumes.is_empty() {
             if let Some(cached) = volumes::cached_snapshot() {
                 self.volume_capacity_tick = Instant::now();
                 self.volumes = cached;
@@ -434,48 +443,82 @@ impl Explorer {
             }
         }
         self.volume_busy = true;
-        self.volume_tick = Instant::now();
+        let started = Instant::now();
         let previous: Vec<_> = self
             .volumes
             .iter()
             .filter(|volume| volume.kind != 7)
             .map(|v| v.path.clone())
             .collect();
-        let capacity = self.volume_capacity_tick.elapsed() > Duration::from_secs(30);
+        let capacity = force
+            || self.volume_capacity_tick.elapsed() > Duration::from_secs(30)
+            || (self.volume_capacity_tick.elapsed() > Duration::from_secs(5)
+                && volumes::needs_local_capacity_retry(&self.volumes, self.volume_capacity_tick));
+        self.volume_tick = started;
+        let prior = self.volumes.clone();
+        let (send, receive) = std::sync::mpsc::channel();
+        self.volume_updates = Some(receive);
         let task = cx.background_executor().spawn(async move {
             if !capacity && volumes::roots() == previous {
                 None
             } else {
-                Some(volumes::snapshot())
+                Some(volumes::snapshot(&prior, |volume| {
+                    let _ = send.send(volume);
+                }))
             }
         });
         cx.spawn(async move |view, cx| {
             let result = task.await;
             let _ = view.update(cx, |v, cx| {
                 v.volume_busy = false;
-                let Some(mut volumes) = result else {
-                    return;
-                };
-                let mut seen = std::collections::HashSet::new();
-                volumes.retain(|volume| seen.insert(volume.path.clone()));
-                v.volume_capacity_tick = Instant::now();
-                cx.notify(); // Repaint even when capacity is unchanged so drive icon epochs refresh.
-                if v.volumes != volumes {
-                    let anchor = v.navigation_anchor();
-                    for volume in volumes.iter().filter(|volume| volume.kind == 7) {
-                        v.shell_names
-                            .insert(volume.path.clone(), volume.label.clone());
-                    }
-                    v.volumes = volumes;
-                    if v.is_home() {
-                        v.sync_computer_entries();
-                    }
-                    v.restore_navigation_anchor(anchor);
-                    cx.notify();
+                v.volume_updates = None;
+                if let Some(volumes) = result {
+                    v.volume_capacity_tick = started;
+                    v.apply_volume_snapshot(volumes, cx);
+                }
+                if std::mem::take(&mut v.volume_refresh_pending) {
+                    v.force_refresh_volumes(cx);
                 }
             });
         })
         .detach();
+    }
+
+    pub(super) fn apply_pending_volume_updates(&mut self, cx: &mut Context<Self>) {
+        let Some(receiver) = &self.volume_updates else {
+            return;
+        };
+        let mut updates = receiver.try_iter().peekable();
+        if updates.peek().is_none() {
+            return;
+        }
+        let mut volumes = self.volumes.clone();
+        for update in updates {
+            if let Some(slot) = volumes.iter_mut().find(|v| v.path == update.path) {
+                *slot = update;
+            } else {
+                volumes.push(update);
+            }
+        }
+        volumes.sort_by(|a, b| a.path.cmp(&b.path));
+        self.apply_volume_snapshot(volumes, cx);
+    }
+
+    fn apply_volume_snapshot(&mut self, mut volumes: Vec<Volume>, cx: &mut Context<Self>) {
+        volumes::clear_expired_capacity(&mut volumes);
+        if self.volumes != volumes {
+            let anchor = self.navigation_anchor();
+            for volume in volumes.iter().filter(|volume| volume.kind == 7) {
+                self.shell_names
+                    .insert(volume.path.clone(), volume.label.clone());
+            }
+            self.volumes = volumes;
+            if self.is_home() {
+                self.sync_computer_entries();
+            }
+            self.restore_navigation_anchor(anchor);
+        }
+        cx.notify();
     }
     /// Hand the Control Panel to Windows. Its items are Shell virtual folders this
     /// app cannot operate on, so they are never listed here.

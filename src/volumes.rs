@@ -17,6 +17,8 @@ pub struct Volume {
     pub kind: u32,
     pub total: Option<u64>,
     pub free: Option<u64>,
+    #[serde(skip)]
+    pub capacity_read_at: Option<Instant>,
     pub filesystem: String,
     pub remote: Option<String>,
     #[serde(default)]
@@ -66,7 +68,10 @@ pub fn roots() -> Vec<PathBuf> {
 }
 pub fn basic(path: &Path) -> Volume {
     let root = wide(path);
-    let mut kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    let kind = unsafe { GetDriveTypeW(PCWSTR(root.as_ptr())) };
+    basic_with_kind(path, kind)
+}
+fn basic_with_kind(path: &Path, mut kind: u32) -> Volume {
     let letter = path.to_string_lossy().chars().next().unwrap_or('?');
     let remote = windows_registry::CURRENT_USER
         .open(format!("Network\\{letter}"))
@@ -96,6 +101,7 @@ pub fn basic(path: &Path) -> Volume {
         kind,
         total: None,
         free: None,
+        capacity_read_at: None,
         filesystem: String::new(),
         remote,
         read_only: kind == 5,
@@ -295,7 +301,11 @@ const SNAPSHOT_TTL: std::time::Duration = std::time::Duration::from_secs(20);
 pub fn cached_snapshot() -> Option<Vec<Volume>> {
     let guard = SNAPSHOT_CACHE.lock().ok()?;
     let (taken, volumes) = guard.as_ref()?;
-    (taken.elapsed() < SNAPSHOT_TTL).then(|| volumes.clone())
+    (taken.elapsed() < SNAPSHOT_TTL).then(|| {
+        let mut volumes = volumes.clone();
+        clear_expired_capacity(&mut volumes);
+        volumes
+    })
 }
 
 pub fn remember_snapshot(volumes: &[Volume]) {
@@ -339,40 +349,115 @@ fn append_devices(result: &mut Vec<Volume>, devices: &[(String, PathBuf)]) {
             kind: 7,
             total: None,
             free: None,
+            capacity_read_at: None,
             filesystem: "MTP".into(),
             remote: None,
             read_only: false,
         });
     }
 }
-pub fn snapshot() -> Vec<Volume> {
+/// Capacity-only fallback when the full probe stalls in a label or provider query.
+pub fn capacity(path: &Path) -> Option<(u64, u64)> {
+    let _quiet = QuietVolumeErrors::suppress();
+    let root = wide(path);
+    let (mut total, mut free) = (0, 0);
+    unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(root.as_ptr()),
+            None,
+            Some(&mut total),
+            Some(&mut free),
+        )
+    }
+    .ok()
+    .map(|_| (total, free))
+}
+
+const CAPACITY_MAX_AGE: Duration = Duration::from_secs(60);
+
+pub fn clear_expired_capacity(volumes: &mut [Volume]) {
+    for volume in volumes {
+        if volume
+            .capacity_read_at
+            .is_some_and(|at| at.elapsed() >= CAPACITY_MAX_AGE)
+        {
+            volume.total = None;
+            volume.free = None;
+            volume.capacity_read_at = None;
+        }
+    }
+}
+
+pub fn needs_local_capacity_retry(volumes: &[Volume], last_refresh: Instant) -> bool {
+    volumes.iter().any(|v| {
+        matches!(v.kind, 0 | 3 | 6) && v.capacity_read_at.is_none_or(|at| at < last_refresh)
+    })
+}
+
+fn preserve_local_capacity(volume: &mut Volume, previous: &[Volume]) {
+    if matches!(volume.kind, 3 | 6)
+        && volume.total.is_none()
+        && let Some(last) = previous.iter().find(|last| {
+            last.path == volume.path
+                && last.kind == volume.kind
+                && last
+                    .capacity_read_at
+                    .is_some_and(|at| at.elapsed() < CAPACITY_MAX_AGE)
+        })
+    {
+        volume.total = last.total;
+        volume.free = last.free;
+        volume.capacity_read_at = last.capacity_read_at;
+    }
+}
+
+fn probe(path: &Path, previous: &[Volume]) -> Volume {
+    // GetDriveTypeW may touch a disconnected provider. Only the bounded
+    // full helper calls it; fallback metadata comes from the prior scan or HKCU.
+    let old = previous.iter().find(|volume| volume.path == path);
+    let fallback = basic_with_kind(path, old.map_or(0, |volume| volume.kind));
+    let timeout = if matches!(fallback.kind, 0 | 3 | 6) {
+        Duration::from_millis(2500)
+    } else {
+        Duration::from_millis(800)
+    };
+    let request = serde_json::to_string(path).expect("serializable drive root");
+    match bounded::<Volume>("--volume-info", &request, timeout) {
+        Ok(mut volume) => {
+            volume.capacity_read_at = volume.total.map(|_| Instant::now());
+            volume
+        }
+        Err(_) => {
+            let mut volume = fallback;
+            match bounded::<Option<(u64, u64)>>("--volume-capacity", &request, timeout) {
+                Ok(Some((total, free))) => {
+                    volume.total = Some(total);
+                    volume.free = Some(free);
+                    volume.capacity_read_at = Some(Instant::now());
+                }
+                Ok(None) => {}
+                Err(_) => preserve_local_capacity(&mut volume, previous),
+            }
+            volume
+        }
+    }
+}
+
+pub fn snapshot(previous: &[Volume], mut on_volume: impl FnMut(Volume) + Send) -> Vec<Volume> {
     let roots = roots();
     let mut result: Vec<Volume> = std::thread::scope(|scope| {
-        let tasks: Vec<_> = roots
-            .iter()
-            .map(|path| {
-                scope.spawn(move || {
-                    bounded(
-                        "--volume-info",
-                        &serde_json::to_string(path).unwrap(),
-                        Duration::from_millis(800),
-                    )
-                    .unwrap_or_else(|_| basic(path))
-                })
-            })
-            .collect();
-        tasks
-            .into_iter()
-            .zip(&roots)
-            .map(|(task, path)| task.join().unwrap_or_else(|_| basic(path)))
-            .collect()
+        let (send, receive) = std::sync::mpsc::channel();
+        for path in &roots {
+            let send = send.clone();
+            scope.spawn(move || {
+                let _ = send.send(probe(path, previous));
+            });
+        }
+        drop(send);
+        receive.iter().inspect(|v| on_volume(v.clone())).collect()
     });
-    // Publish local capacities before a disconnected phone/network provider is
-    // allowed to consume its own timeout budget. Known portable devices ride
-    // along so this early snapshot never shows a phone-less list to a window
-    // that opens in the meantime.
+    result.sort_by(|a, b| a.path.cmp(&b.path));
     append_devices(&mut result, &cached_devices());
-    remember_snapshot(&result);
     // Portable/MTP devices have no filesystem path; list them through the
     // Shell namespace in an isolated helper.
     match bounded::<Vec<(String, PathBuf)>>("--shell-devices", "", Duration::from_millis(2500)) {
@@ -469,10 +554,43 @@ mod ordering_tests {
             kind: 3,
             total,
             free,
+            capacity_read_at: total.map(|_| Instant::now()),
             filesystem: String::new(),
             remote: None,
             read_only: false,
         }
+    }
+    #[test]
+    fn timed_out_local_probe_keeps_capacity_but_removable_media_does_not() {
+        let old = volume("C:\\", "Local", Some(100), Some(25));
+        let mut next = volume("C:\\", "Local", None, None);
+        assert!(needs_local_capacity_retry(
+            std::slice::from_ref(&next),
+            Instant::now()
+        ));
+        preserve_local_capacity(&mut next, std::slice::from_ref(&old));
+        assert_eq!((next.total, next.free), (Some(100), Some(25)));
+        assert_eq!(next.capacity_read_at, old.capacity_read_at);
+        assert!(needs_local_capacity_retry(
+            std::slice::from_ref(&next),
+            Instant::now()
+        ));
+        let mut expired = old.clone();
+        expired.capacity_read_at = Some(Instant::now() - CAPACITY_MAX_AGE);
+        let mut missing = volume("C:\\", "Local", None, None);
+        preserve_local_capacity(&mut missing, std::slice::from_ref(&expired));
+        assert_eq!(missing.total, None);
+        clear_expired_capacity(std::slice::from_mut(&mut expired));
+        assert_eq!(
+            (expired.total, expired.free, expired.capacity_read_at),
+            (None, None, None)
+        );
+
+        let mut removable = volume("C:\\", "Removable", None, None);
+        removable.kind = 2;
+        preserve_local_capacity(&mut removable, &[old]);
+        assert_eq!((removable.total, removable.free), (None, None));
+        assert!(!needs_local_capacity_retry(&[removable], Instant::now()));
     }
     #[test]
     fn drive_letter_capacity_and_available_space_are_independent() {

@@ -300,7 +300,7 @@
   "暗色": "Dark",
   "标签页与排序": "Tabs and sorting",
   "缓存与维护": "Cache and maintenance",
-  "清空图标、缩略图、文件夹大小和磁盘容量统计缓存；只删除本程序生成的文件。": "Clear icon, thumbnail, folder-size and drive-capacity caches; only app-generated files are removed.",
+  "清空图标和缩略图缓存；只删除本程序生成的文件。": "Clear icon and thumbnail caches; only app-generated files are removed.",
   "清空缓存": "Clear cache",
   "默认文件夹（实验性）": "Default folder browser (experimental)",
   "关联状态读取失败：{e:#}": "Cannot read association status: {e:#}",

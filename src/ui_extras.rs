@@ -2265,6 +2265,29 @@ impl Explorer {
             .into(),
         }
     }
+    pub(super) fn restore_cached_usage(&mut self) -> bool {
+        self.usage_cache_revision = disk_usage::revision();
+        let usage = disk_usage::cached_sizes(
+            self.entries
+                .iter()
+                .filter(|e| e.directory)
+                .map(|e| e.path.as_path()),
+        );
+        let changed = self.usage != usage;
+        self.usage = usage;
+        self.usage_enabled = self.usage_running || !self.usage.is_empty();
+        self.update_usage_expiry();
+        changed
+    }
+
+    pub(super) fn update_usage_expiry(&mut self) {
+        self.usage_expiry = self
+            .usage
+            .values()
+            .filter_map(|usage| usage.expires_at)
+            .min();
+    }
+
     pub(super) fn start_usage(&mut self, cx: &mut Context<Self>) {
         if navigation::is_virtual(&self.dir()) || self.view != ViewMode::Details {
             return;
@@ -2280,11 +2303,11 @@ impl Explorer {
         self.usage_enabled = true;
         self.usage_running = true;
         self.usage.clear();
+        self.usage_expiry = None;
         self.usage_cancel = Arc::new(AtomicBool::new(false));
         self.usage_revision = self.usage_revision.wrapping_add(1);
         let cancel = self.usage_cancel.clone();
         let entries = self.entries.clone();
-        let tx = self.usage_tx.clone();
         let generation = self.usage_revision;
         disk_usage::invalidate_paths(
             entries
@@ -2303,10 +2326,11 @@ impl Explorer {
                 if cancel.load(Ordering::Relaxed) {
                     break;
                 }
-                let (usage, cached) = disk_usage::calculate_cached(&e.path, &cancel);
+                let Some((usage, cached)) = disk_usage::calculate_cached(&e.path, &cancel) else {
+                    continue;
+                };
                 hits += usize::from(cached);
                 skipped += usage.skipped;
-                let _ = tx.send((generation, e.path.clone(), usage));
             }
             (skipped, hits)
         });
@@ -2315,6 +2339,7 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 if v.usage_revision == generation {
                     v.usage_running = false;
+                    v.restore_cached_usage();
                     v.status = rust_explorer::trf!(
                         "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
                     );
@@ -5349,15 +5374,8 @@ impl Explorer {
             .with_priority(10)
             .into_any_element()
     }
-    /// Drop every generated cache (memory, thumbnails, folder sizes, disk).
-    /// Shared by the selection menu and the advanced options page.
+    /// Clear generated visual caches. Folder-size results have their own lifetime.
     pub(super) fn clear_caches(&mut self, cx: &mut Context<Self>) {
-        self.usage_cancel.store(true, Ordering::Relaxed);
-        self.usage_revision += 1;
-        self.usage_running = false;
-        self.usage.clear();
-        self.usage_enabled = false;
-        disk_usage::invalidate_cache();
         visual::clear_cache();
         visual::reset_image_cache(cx);
         self.thumbnails = rust_explorer::thumbnails::Loader::new();
@@ -5906,7 +5924,7 @@ impl Explorer {
                     }
                 }
             }
-            "refresh-devices" => self.refresh_volumes(cx),
+            "refresh-devices" => self.force_refresh_volumes(cx),
             "computer-open" => self.navigate(volumes::computer(), cx),
             "computer-expand" => self.computer_open = !self.computer_open,
             "computer-tab" | "computer-window" | "computer-pin" => {
@@ -6255,11 +6273,16 @@ impl Explorer {
             let answer = unsafe { MessageBoxW(Some(HWND(hwnd as *mut _)), PCWSTR(message.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) };
             if answer != IDYES { return Ok(false); }
             if enable {
-                rust_explorer::default_browser::enable().map_err(|e| format!("{e:#}"))?;
-                if rust_explorer::default_browser::trial_pending() {
+                if rust_explorer::default_browser::enable().map_err(|e| format!("{e:#}"))? {
                     let keep: Vec<u16> = rust_explorer::i18n::text("临时接管已启用。请在 Windows 资源管理器中双击普通文件夹、驱动器，确认 RE 正常打开。\n是否保留此设置？\n选择“否”或 120 秒内未确认，会自动恢复原样。").encode_utf16().chain(Some(0)).collect();
-                    let answer = unsafe { MessageBoxW(None, PCWSTR(keep.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) };
-                    if answer == IDYES { rust_explorer::default_browser::confirm_trial().map_err(|e| format!("{e:#}"))?; }
+                    let answer = unsafe { MessageBoxW(None, PCWSTR(keep.as_ptr()), PCWSTR(title.as_ptr()), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2 | MB_SETFOREGROUND) };
+                    if answer == IDYES {
+                        if let Err(error) = rust_explorer::default_browser::confirm_trial() {
+                            let detail: Vec<u16> = format!("{error:#}").encode_utf16().chain(Some(0)).collect();
+                            unsafe { MessageBoxW(None, PCWSTR(detail.as_ptr()), PCWSTR(title.as_ptr()), MB_OK | MB_ICONERROR | MB_SETFOREGROUND) };
+                            return Err(format!("{error:#}"));
+                        }
+                    }
                     else if rust_explorer::default_browser::trial_pending() { rust_explorer::default_browser::disable().map_err(|e| format!("{e:#}"))?; return Ok(false); }
                     else { return Ok(false); }
                 }
@@ -6673,9 +6696,27 @@ impl Explorer {
                         .text_color(rgb(t.muted))
                         .child(rust_explorer::i18n::text("缓存与维护")),
                 )
-                .child(div().w_full().min_w_0().flex_shrink_0().whitespace_normal().text_color(rgb(t.muted)).child(rust_explorer::i18n::text("清空图标、缩略图、文件夹大小和磁盘容量统计缓存；只删除本程序生成的文件。")))
-                .child(div().flex().flex_wrap().flex_shrink_0().gap_2()
-                    .child(button("options-clear-cache", rust_explorer::i18n::text("清空缓存"), t).on_click(cx.listener(|v, _, _, cx| v.clear_caches(cx)))));
+                .child(
+                    div()
+                        .w_full()
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .whitespace_normal()
+                        .text_color(rgb(t.muted))
+                        .child(rust_explorer::i18n::text(
+                            "清空图标和缩略图缓存；只删除本程序生成的文件。",
+                        )),
+                )
+                .child(
+                    div().flex().flex_wrap().flex_shrink_0().gap_2().child(
+                        button(
+                            "options-clear-cache",
+                            rust_explorer::i18n::text("清空缓存"),
+                            t,
+                        )
+                        .on_click(cx.listener(|v, _, _, cx| v.clear_caches(cx))),
+                    ),
+                );
             body = body.child(
                 div()
                     .py_2()
