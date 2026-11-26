@@ -171,11 +171,16 @@ impl Registry for RegistryStore {
 }
 fn plan(exe: &std::path::Path) -> Result<Vec<Target>> {
     ensure!(exe.is_file(), "Application executable is missing");
+    // The standalone GitHub asset has a versioned filename, and portable
+    // users can rename it. The caller supplies the running executable.
     ensure!(
-        exe.file_name().is_some_and(|n| n
-            .to_string_lossy()
-            .eq_ignore_ascii_case("rust-explorer.exe")),
-        "Unexpected executable name"
+        exe.is_absolute(),
+        "Application executable path must be absolute"
+    );
+    ensure!(
+        exe.extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("exe")),
+        "Application executable must have an .exe extension"
     );
     let text = exe
         .to_str()
@@ -469,11 +474,16 @@ pub fn status() -> Result<String> {
     }
     Ok("已启用普通文件夹和驱动器关联".into())
 }
-pub fn enable() -> Result<()> {
-    begin_trial(120)
+/// Returns whether confirmation is required. An already confirmed association
+/// can be enabled again without opening a second trial.
+pub fn enable() -> Result<bool> {
+    start_trial(120)
 }
 /// Begin a time-limited association trial guarded by an independent process.
 pub fn begin_trial(seconds: u64) -> Result<()> {
+    start_trial(seconds).map(|_| ())
+}
+fn start_trial(seconds: u64) -> Result<bool> {
     ensure!(
         (5..=180).contains(&seconds),
         "Trial duration must be 5..180 seconds"
@@ -521,7 +531,7 @@ pub fn begin_trial(seconds: u64) -> Result<()> {
         || guard::start(&dir, seconds),
     );
     notify_shell();
-    result
+    result.map(|()| dir.join("trial.json").exists())
 }
 fn reusable_verb(path: &str) -> Result<bool> {
     let Some(key) = optional(CURRENT_USER.open(path))? else {
@@ -987,7 +997,7 @@ mod tests {
     fn registered_executable_uses_shell_compatible_path() {
         let dir = std::env::temp_dir().join(format!("re-shell-path-{}", std::process::id()));
         fs::create_dir(&dir).unwrap();
-        let exe = dir.join("rust-explorer.exe");
+        let exe = dir.join("RustExplorer-0.8.11-windows-x64.exe");
         fs::write(&exe, b"fixture").unwrap();
         let values = plan(&exe.canonicalize().unwrap()).unwrap();
         let command = String::from_utf16(

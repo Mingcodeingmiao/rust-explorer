@@ -4,7 +4,7 @@ A native Windows file manager built with **Rust and GPUI**, without a browser or
 
 [中文](README.md) · [Downloads](https://github.com/Mingcodeingmiao/rust-explorer/releases) · [Changelog](CHANGELOG.md) · [Known limitations](KNOWN_ISSUES.md)
 
-Version **0.8.11** adds Open PowerShell here to the toolbar overflow menu, supports typing cmd in the address bar, and fixes drag and drop for MTP devices. [Release notes (Chinese)](docs/v0.8.11.md)
+Version **0.8.12** improves drive-capacity refresh, fixes folder association for standalone EXEs, and synchronizes folder-size results across windows. [Release notes (Chinese)](docs/v0.8.12.md)
 
 > [!WARNING]
 > **Windows native context menus still have known issues and are not fully fixed.** Some Windows 10 environments may still show inconsistent light/dark styling for file menus. Behavior varies with Windows versions and installed Shell extensions. This is an incremental update, not a complete context-menu fix.

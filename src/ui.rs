@@ -322,11 +322,11 @@ struct Explorer {
     collapsed_groups: BTreeSet<String>,
     usage: HashMap<PathBuf, Usage>,
     usage_cancel: Arc<AtomicBool>,
-    usage_rx: mpsc::Receiver<(u64, PathBuf, Usage)>,
-    usage_tx: mpsc::Sender<(u64, PathBuf, Usage)>,
     usage_running: bool,
     usage_revision: u64,
     usage_enabled: bool,
+    usage_expiry: Option<Instant>,
+    usage_cache_revision: u64,
     inline_rename: Option<PathBuf>,
     pending_select: Option<PathBuf>,
     external_reveal: Vec<PathBuf>,
@@ -359,6 +359,8 @@ struct Explorer {
     volumes: Vec<Volume>,
     storage_volumes: Vec<Volume>,
     volume_busy: bool,
+    volume_updates: Option<std::sync::mpsc::Receiver<Volume>>,
+    volume_refresh_pending: bool,
     volume_tick: Instant,
     volume_capacity_tick: Instant,
     system_quick_access: Vec<rust_explorer::quick_access::Item>,
@@ -922,7 +924,6 @@ impl Explorer {
             },
         ));
         let (watch_tx, watch_rx) = mpsc::channel();
-        let (usage_tx, usage_rx) = mpsc::channel();
         let (drag_tx, drag_rx) = mpsc::channel();
         if !settings.quick_access_system_migrated {
             // Earlier releases seeded these six paths. System Quick Access now
@@ -1018,11 +1019,11 @@ impl Explorer {
             group_descending,
             usage: HashMap::new(),
             usage_cancel: Arc::new(AtomicBool::new(false)),
-            usage_rx,
-            usage_tx,
             usage_running: false,
             usage_revision: 0,
             usage_enabled: false,
+            usage_expiry: None,
+            usage_cache_revision: disk_usage::revision(),
             inline_rename: None,
             pending_select: None,
             reveal_pending: launch.as_ref().is_some_and(|r| !r.select.is_empty()),
@@ -1055,6 +1056,8 @@ impl Explorer {
             volumes: Vec::new(),
             storage_volumes: Vec::new(),
             volume_busy: false,
+            volume_updates: None,
+            volume_refresh_pending: false,
             volume_tick: Instant::now() - Duration::from_secs(10),
             volume_capacity_tick: Instant::now() - Duration::from_secs(60),
             system_quick_access: vec![],
@@ -1284,17 +1287,7 @@ impl Explorer {
                         }
                         this.refresh_quick_access(cx);
                         this.refresh_computer_name(cx);
-                        if this.volume_busy {
-                            if let Some(snapshot) = volumes::cached_snapshot() {
-                                if snapshot != this.volumes {
-                                    this.volumes = snapshot;
-                                    if this.is_home() {
-                                        this.sync_computer_entries();
-                                    }
-                                    cx.notify();
-                                }
-                            }
-                        }
+                        this.apply_pending_volume_updates(cx);
                         if !this.volume_busy && this.volume_tick.elapsed() > Duration::from_secs(3)
                         {
                             this.refresh_volumes(cx);
@@ -1314,18 +1307,18 @@ impl Explorer {
                             this.load_tree(path, cx);
                         }
                         let mut usage_changed = false;
-                        for (generation, path, usage) in this.usage_rx.try_iter() {
-                            if generation == this.usage_revision {
-                                this.usage.insert(path, usage);
-                                usage_changed = true;
+                        if this.usage_cache_revision != disk_usage::revision() && !this.loading {
+                            usage_changed |= this.restore_cached_usage();
+                        }
+                        if this.usage_expiry.is_some_and(|at| Instant::now() >= at) {
+                            this.usage.retain(|_, value| !value.expired(Instant::now()));
+                            if !this.usage_running {
+                                this.usage_enabled = !this.usage.is_empty();
                             }
+                            usage_changed = true;
                         }
                         if usage_changed {
-                            this.usage_running = this.usage_running
-                                && this
-                                    .entries
-                                    .iter()
-                                    .any(|e| e.directory && !this.usage.contains_key(&e.path));
+                            this.update_usage_expiry();
                             this.rebuild_rows();
                             cx.notify();
                         }
@@ -1550,8 +1543,7 @@ impl Explorer {
     fn refresh_current(&mut self, cx: &mut Context<Self>) {
         if volumes::is_computer(&self.dir()) || self.dir() == PathBuf::from("::Network") {
             rust_explorer::native_assets::refresh_drive_icons();
-            self.volume_capacity_tick = Instant::now() - Duration::from_secs(60);
-            self.refresh_volumes(cx);
+            self.force_refresh_volumes(cx);
         }
         self.reload(cx);
     }
@@ -1713,6 +1705,7 @@ impl Explorer {
         self.usage_cancel = Arc::new(AtomicBool::new(false));
         self.usage_revision = self.usage_revision.wrapping_add(1);
         self.usage.clear();
+        self.usage_expiry = None;
         self.usage_running = false;
         self.usage_enabled = false;
         self.inline_rename = None;
@@ -1762,6 +1755,7 @@ impl Explorer {
             self.status = listing.status;
             self.watcher = self.tab_watchers.remove(&self.tabs[self.active].id);
             self.entries = listing.entries;
+            self.restore_cached_usage();
             self.loading = false;
             self.rebuild_rows();
             self.restore_listing_state();
@@ -1961,6 +1955,7 @@ impl Explorer {
                                         kind: 8,
                                         total: Some(total),
                                         free: Some(free),
+                                        capacity_read_at: None,
                                         filesystem: "MTP".into(),
                                         remote: None,
                                         read_only: false,
@@ -1982,13 +1977,7 @@ impl Explorer {
                                 },
                             );
                         }
-                        this.usage = disk_usage::cached_sizes(
-                            this.entries
-                                .iter()
-                                .filter(|e| e.directory)
-                                .map(|e| e.path.as_path()),
-                        );
-                        this.usage_enabled = !this.usage.is_empty();
+                        this.restore_cached_usage();
                         this.rebuild_rows();
                         if this.reveal_pending {
                             for target in &this.external_reveal {
@@ -2483,21 +2472,6 @@ impl Explorer {
         history_direction: Option<bool>,
         cx: &mut Context<Self>,
     ) {
-        let invalidates_usage = matches!(
-            &request,
-            shell::Request::EmptyRecycleBin
-                | shell::Request::NewFolder { .. }
-                | shell::Request::History { .. }
-                | shell::Request::RecordCreated { .. }
-                | shell::Request::Copy { .. }
-                | shell::Request::Transfer { .. }
-                | shell::Request::Delete { .. }
-                | shell::Request::PermanentDelete { .. }
-                | shell::Request::Rename { .. }
-                | shell::Request::Shortcut { .. }
-                | shell::Request::Menu { .. }
-                | shell::Request::ThemedMenu { .. }
-        );
         let passive = matches!(
             &request,
             shell::Request::Open { .. }
@@ -2652,9 +2626,6 @@ impl Explorer {
                 rust_explorer::i18n::text("已完成").to_string()
             };
             completion.finish(status);
-            if invalidates_usage {
-                disk_usage::invalidate_cache();
-            }
             (result, history)
         });
         cx.spawn(async move |view, cx| {

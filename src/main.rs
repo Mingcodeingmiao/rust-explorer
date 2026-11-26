@@ -131,6 +131,15 @@ fn main() {
             );
             Ok(())
         })(),
+        Some("--volume-capacity") => (|| -> anyhow::Result<()> {
+            let path: std::path::PathBuf =
+                serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;
+            println!(
+                "{}",
+                serde_json::to_string(&rust_explorer::volumes::capacity(&path))?
+            );
+            Ok(())
+        })(),
         Some("--volume-info") => (|| -> anyhow::Result<()> {
             let path: std::path::PathBuf =
                 serde_json::from_str(args.get(2).ok_or_else(|| anyhow::anyhow!("path missing"))?)?;

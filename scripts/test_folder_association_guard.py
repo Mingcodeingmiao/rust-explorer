@@ -23,7 +23,7 @@ def main():
     env["RUST_EXPLORER_ASSOCIATION_TEST_ROOT"] = registry_root
     app = workspace / "app"
     app.mkdir()
-    exe = app / "rust-explorer.exe"
+    exe = app / "RustExplorer-0.8.11-windows-x64.exe"
     shutil.copy2(args.exe, exe)
     for name in ("libgcc_s_seh-1.dll", "libwinpthread-1.dll", "Everything64.dll"):
         source = args.runtime_dir / name
@@ -90,13 +90,25 @@ def main():
         print("PASS: launching process exited + original EXE unavailable -> automatic recovery")
 
         run("--test-folder-browser", "12")
+        deadline = json.loads((recovery / "trial.json").read_bytes())["deadline"]
         run("--confirm-folder-browser")
         assert not (recovery / "trial.json").exists()
-        time.sleep(1)
-        assert read("Directory")[0] == "RustExplorer.Open"
+        time.sleep(max(0, deadline - time.time()) + 1)
+        diagnostics = json.loads(run("--folder-association-status").stdout)
+        assert not diagnostics["trial"]
+        for class_name in ("Directory", "Drive"):
+            assert read(class_name)[0] == "RustExplorer.Open"
+            command_key = registry_root + "\\" + class_name + "\\shell\\RustExplorer.Open\\command"
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, command_key) as key:
+                command = winreg.QueryValueEx(key, "")[0]
+                assert Path(command.split('"')[1]).resolve() == exe.resolve()
         run("--restore-folder-browser", executable=helper)
         assert_original()
-        print("PASS: confirm + independent restore + re-enable after empty-key restoration")
+        run("--test-folder-browser", "12")
+        run("--confirm-folder-browser")
+        run("--restore-folder-browser", executable=helper)
+        assert_original()
+        print("PASS: versioned EXE stays associated past deadline; independent restore and re-enable")
 
         (recovery / "backup.json").write_bytes(b"broken backup")
         assert run("--test-folder-browser", "8", success=False).returncode != 0
