@@ -23,7 +23,7 @@ encoding_rs = "0.8"
 pinyin = { version = "=0.11.0", default-features = false, features = ["plain"] }
 libloading = "0.8"
 image = { version = "0.25", default-features = false, features = ["png"] }
-sha2 = "0.10"
+sha2 = "0.11"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 zip = { version = "9.8.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
 gpui = { version = "=0.2.2", default-features = false, optional = true }
