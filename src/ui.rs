@@ -1318,6 +1318,7 @@ impl Explorer {
                             usage_changed = true;
                         }
                         if usage_changed {
+                            this.sort_after_usage_change();
                             this.update_usage_expiry();
                             this.rebuild_rows();
                             cx.notify();
@@ -1701,13 +1702,15 @@ impl Explorer {
             self.reveal_pending = false;
         }
         self.ctrl_open_selection = None;
-        self.usage_cancel.store(true, Ordering::Relaxed);
-        self.usage_cancel = Arc::new(AtomicBool::new(false));
-        self.usage_revision = self.usage_revision.wrapping_add(1);
-        self.usage.clear();
-        self.usage_expiry = None;
-        self.usage_running = false;
-        self.usage_enabled = false;
+        if !preserve_viewport {
+            self.usage_cancel.store(true, Ordering::Relaxed);
+            self.usage_cancel = Arc::new(AtomicBool::new(false));
+            self.usage_revision = self.usage_revision.wrapping_add(1);
+            self.usage.clear();
+            self.usage_expiry = None;
+            self.usage_running = false;
+            self.usage_enabled = false;
+        }
         self.inline_rename = None;
         if !preserve_viewport {
             self.content_scroll.set_offset(point(px(0.), px(0.)));
@@ -1756,6 +1759,7 @@ impl Explorer {
             self.watcher = self.tab_watchers.remove(&self.tabs[self.active].id);
             self.entries = listing.entries;
             self.restore_cached_usage();
+            self.sort_after_usage_change();
             self.loading = false;
             self.rebuild_rows();
             self.restore_listing_state();
@@ -1978,6 +1982,7 @@ impl Explorer {
                             );
                         }
                         this.restore_cached_usage();
+                        this.sort_after_usage_change();
                         this.rebuild_rows();
                         if this.reveal_pending {
                             for target in &this.external_reveal {
@@ -3581,7 +3586,10 @@ impl Explorer {
         if self.tabs.len() == 1 {
             if let Some(handle) = self.own_window {
                 cx.defer(move |cx| {
-                    let _ = handle.update(cx, |_, w, _| w.remove_window());
+                    let _ = handle.update(cx, |_, w, cx| {
+                        remember_window_placement(w, cx);
+                        w.remove_window();
+                    });
                 });
             }
             return;
