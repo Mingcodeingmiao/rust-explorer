@@ -204,6 +204,15 @@ enum SettingsWrite {
 }
 static SETTINGS_WRITER: OnceLock<mpsc::Sender<SettingsWrite>> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -230,6 +239,7 @@ pub struct Settings {
     /// Opening a folder in a new tab jumps to a tab that already shows it.
     pub focus_existing_tab: bool,
     pub startup_page: String,
+    pub window_placement: Option<WindowPlacement>,
     pub separate_process: bool,
     pub full_path: bool,
     pub preview: bool,
@@ -281,6 +291,7 @@ impl Default for Settings {
             new_tab_this_pc: false,
             focus_existing_tab: true,
             startup_page: "home".into(),
+            window_placement: None,
             separate_process: false,
             full_path: false,
             preview: true,
@@ -353,6 +364,7 @@ impl Settings {
             new_tab_this_pc,
             focus_existing_tab,
             startup_page,
+            window_placement,
             separate_process,
             full_path,
             preview,

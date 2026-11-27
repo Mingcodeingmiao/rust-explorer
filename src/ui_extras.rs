@@ -288,6 +288,64 @@ impl Render for TabGhost {
     }
 }
 
+fn restored_window_bounds(cx: &App) -> WindowBounds {
+    let saved = cx.try_global::<SharedSettings>().map_or_else(
+        || Settings::load().window_placement,
+        |settings| settings.0.window_placement,
+    );
+    if let Some(saved) = saved
+        && [saved.x, saved.y, saved.width, saved.height]
+            .into_iter()
+            .all(f32::is_finite)
+        && (640. ..=16384.).contains(&saved.width)
+        && (400. ..=16384.).contains(&saved.height)
+    {
+        let bounds = Bounds::new(
+            point(px(saved.x), px(saved.y)),
+            size(px(saved.width), px(saved.height)),
+        );
+        // Require a usable portion of the title bar on an attached display.
+        let visible = cx.displays().iter().any(|display| {
+            let screen = display.bounds();
+            let left = bounds.origin.x.max(screen.origin.x);
+            let right = bounds.right().min(screen.right());
+            right - left >= px(80.)
+                && bounds.origin.y >= screen.origin.y
+                && bounds.origin.y + px(32.) <= screen.bottom()
+        });
+        if visible {
+            return if saved.maximized {
+                WindowBounds::Maximized(bounds)
+            } else {
+                WindowBounds::Windowed(bounds)
+            };
+        }
+    }
+    WindowBounds::Windowed(Bounds::centered(None, size(px(1280.), px(800.)), cx))
+}
+
+pub(super) fn remember_window_placement(window: &Window, cx: &mut App) {
+    let (bounds, maximized) = match window.window_bounds() {
+        WindowBounds::Windowed(bounds) => (bounds, false),
+        WindowBounds::Maximized(bounds) => (bounds, true),
+        WindowBounds::Fullscreen(_) => return,
+    };
+    let placement = rust_explorer::settings::WindowPlacement {
+        x: f32::from(bounds.origin.x),
+        y: f32::from(bounds.origin.y),
+        width: f32::from(bounds.size.width),
+        height: f32::from(bounds.size.height),
+        maximized,
+    };
+    let before = cx.global::<SharedSettings>().0.clone();
+    if before.window_placement != Some(placement) {
+        let mut updated = before.clone();
+        updated.window_placement = Some(placement);
+        updated.enqueue_changes(before);
+        cx.global_mut::<SharedSettings>().0 = updated;
+    }
+}
+
 pub(super) fn open_explorer(
     tab: Option<Tab>,
     cx: &mut App,
@@ -299,11 +357,11 @@ pub(super) fn open_explorer_request(
     launch: Option<rust_explorer::launch_request::LaunchRequest>,
     cx: &mut App,
 ) -> anyhow::Result<WindowHandle<Explorer>> {
-    let bounds = Bounds::centered(None, size(px(1280.), px(800.)), cx);
+    let bounds = restored_window_bounds(cx);
     let external = launch.is_some();
     let handle = cx.open_window(
         WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(bounds)),
+            window_bounds: Some(bounds),
             window_min_size: Some(size(px(640.), px(400.))),
             titlebar: Some(TitlebarOptions {
                 title: Some(format!("Rust Explorer {}", env!("CARGO_PKG_VERSION")).into()),
@@ -314,6 +372,10 @@ pub(super) fn open_explorer_request(
         },
         move |w, cx| {
             let view = cx.new(|cx| Explorer::new(w, launch, cx));
+            w.on_window_should_close(cx, |window, cx| {
+                remember_window_placement(window, cx);
+                true
+            });
             if let Some(hwnd) = native_hwnd(w) {
                 set_application_icon(hwnd);
                 if let Err(error) = rust_explorer::window_frame::install(hwnd) {
@@ -2280,6 +2342,12 @@ impl Explorer {
         changed
     }
 
+    pub(super) fn sort_after_usage_change(&mut self) {
+        if self.sort == Sort::Size && !navigation::is_virtual(&self.dir()) {
+            self.sort_listing();
+        }
+    }
+
     pub(super) fn update_usage_expiry(&mut self) {
         self.usage_expiry = self
             .usage
@@ -2304,6 +2372,8 @@ impl Explorer {
         self.usage_running = true;
         self.usage.clear();
         self.usage_expiry = None;
+        self.sort_after_usage_change();
+        self.rebuild_rows();
         self.usage_cancel = Arc::new(AtomicBool::new(false));
         self.usage_revision = self.usage_revision.wrapping_add(1);
         let cancel = self.usage_cancel.clone();
@@ -2339,7 +2409,9 @@ impl Explorer {
             let _ = view.update(cx, |v, cx| {
                 if v.usage_revision == generation {
                     v.usage_running = false;
-                    v.restore_cached_usage();
+                    if v.restore_cached_usage() {
+                        v.sort_after_usage_change();
+                    }
                     v.status = rust_explorer::trf!(
                         "大小统计结束 · 缓存命中 {hits} 项（有效期 1 小时） · 跳过 {skipped} 项"
                     );
@@ -2373,7 +2445,22 @@ impl Explorer {
             self.reload(cx);
             return;
         }
-        let selected = self.paths();
+        self.sort_listing();
+        self.rebuild_rows();
+    }
+    fn sort_listing(&mut self) {
+        let column = self.sort;
+        let descending = self.descending;
+        let selected: std::collections::HashSet<_> = self
+            .selected
+            .iter()
+            .filter_map(|index| self.entries.get(*index))
+            .map(|entry| entry.path.clone())
+            .collect();
+        let anchor = self
+            .entries
+            .get(self.anchor)
+            .map(|entry| entry.path.clone());
         let usage = &self.usage;
         let folders_first = self.settings.folders_first;
         Arc::make_mut(&mut self.entries).sort_by(|a, b| {
@@ -2408,7 +2495,11 @@ impl Explorer {
             .enumerate()
             .filter_map(|(i, e)| selected.contains(&e.path).then_some(i))
             .collect();
-        self.rebuild_rows();
+        if let Some(index) =
+            anchor.and_then(|path| self.entries.iter().position(|entry| entry.path == path))
+        {
+            self.anchor = index;
+        }
     }
     pub(super) fn detach_tab(&mut self, id: u64, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|t| t.id == id) else {
@@ -2504,7 +2595,10 @@ impl Explorer {
         if self.tabs.len() == 1 {
             if let Some(handle) = self.own_window {
                 cx.defer(move |cx| {
-                    let _ = handle.update(cx, |_, w, _| w.remove_window());
+                    let _ = handle.update(cx, |_, w, cx| {
+                        remember_window_placement(w, cx);
+                        w.remove_window();
+                    });
                 });
             }
             return;
